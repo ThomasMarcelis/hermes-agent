@@ -21,6 +21,7 @@ import os
 import random
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -321,11 +322,10 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
         docker_image = self._parse_docker_image_from_def(container_def)
 
         # Try to load description from instruction.md or task.json
-        description = task.get("description", "")
-
-        # First try instruction.md
+        # Always prefer instruction.md on disk over dataset placeholder descriptions
+        description = ""
         instruction_md = task_dir_path / "instruction.md"
-        if not description and instruction_md.exists():
+        if instruction_md.exists():
             try:
                 description = instruction_md.read_text().strip()
             except Exception as e:
@@ -361,31 +361,190 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
 
     def _parse_docker_image_from_def(self, container_def_path: Path) -> str:
         """
-        Parse container.def file to extract the Docker base image.
+        Extract the Docker base image for a task.
 
-        Apptainer definition files typically look like:
-            Bootstrap: docker
-            From: ubuntu:22.04
+        Tries sources in order:
+        1. Dockerfile in the same directory (or parent environment/ dir)
+           → parse "FROM <image>" line
+        2. container.def with "Bootstrap: docker" → parse "From: <image>"
+        3. Falls back to default_docker_image
 
-        Returns the image from the "From:" line, or falls back to default.
+        Singularity defs with "Bootstrap: localimage" / "From: ./foo.sif"
+        are skipped since those aren't valid Docker image names.
         """
-        if not container_def_path.exists():
-            logger.warning(f"container.def not found at {container_def_path}, using default image")
+        task_dir = container_def_path.parent
+
+        # --- Try Dockerfile first (most reliable for Docker backend) ---
+        for dockerfile_path in [
+            task_dir / "Dockerfile",
+            task_dir.parent / "Dockerfile",   # task_dir might be environment/
+        ]:
+            if dockerfile_path.exists():
+                try:
+                    content = dockerfile_path.read_text()
+                    match = re.search(
+                        r'^FROM\s+(\S+)', content, re.MULTILINE | re.IGNORECASE
+                    )
+                    if match:
+                        image = match.group(1).strip()
+                        logger.info(f"Extracted Docker image from Dockerfile: {image}")
+                        return image
+                except Exception as e:
+                    logger.warning(f"Failed to parse {dockerfile_path}: {e}")
+
+        # --- Fallback: container.def with Bootstrap: docker ---
+        if container_def_path.exists():
+            try:
+                content = container_def_path.read_text()
+                # Only use From: line if it's a docker-based def (not localimage/sif)
+                bootstrap_match = re.search(
+                    r'^Bootstrap:\s*(\S+)', content, re.MULTILINE | re.IGNORECASE
+                )
+                bootstrap = bootstrap_match.group(1).lower() if bootstrap_match else ""
+
+                if bootstrap == "docker":
+                    from_match = re.search(
+                        r'^From:\s*(.+)$', content, re.MULTILINE | re.IGNORECASE
+                    )
+                    if from_match:
+                        image = from_match.group(1).strip()
+                        logger.info(f"Extracted Docker image from container.def: {image}")
+                        return image
+                else:
+                    logger.debug(
+                        f"Skipping container.def (Bootstrap: {bootstrap}), not a Docker source"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to parse {container_def_path}: {e}")
+
+        logger.warning(f"Could not extract Docker image from {task_dir}, using default")
+        return self.config.default_docker_image
+
+    # Per-task lock to prevent parallel builds of the same image
+    _build_locks: Dict[str, threading.Lock] = {}
+    _build_locks_lock = threading.Lock()
+
+    def _build_task_docker_image(self, item: Item) -> str:
+        """
+        Build a Docker image from the task's Dockerfile.
+
+        Each task has a custom Dockerfile that installs dependencies (pytest, etc.)
+        and sets up the initial filesystem state. We build it once and cache by
+        task name so repeated runs reuse the image.
+
+        Thread-safe: uses per-task locks so parallel collect_trajectory() calls
+        for the same task (group_size > 1) don't race on docker build.
+
+        Returns the built image tag, or falls back to default_docker_image.
+        """
+        import subprocess
+
+        task_name = item.get("task_name", "unknown")
+        task_dir = item.get("task_dir", "")
+
+        # Look for Dockerfile
+        dockerfile_paths = [
+            Path(task_dir) / "environment" / "Dockerfile",
+            Path(task_dir) / "Dockerfile",
+        ]
+        dockerfile = None
+        for p in dockerfile_paths:
+            if p.exists():
+                dockerfile = p
+                break
+
+        if not dockerfile:
+            logger.debug(f"Task {task_name}: no Dockerfile found, using default image")
             return self.config.default_docker_image
 
-        try:
-            content = container_def_path.read_text()
-            # Look for "From: <image>" line (case-insensitive)
-            match = re.search(r'^From:\s*(.+)$', content, re.MULTILINE | re.IGNORECASE)
-            if match:
-                image = match.group(1).strip()
-                logger.info(f"Extracted Docker image from container.def: {image}")
-                return image
-        except Exception as e:
-            logger.warning(f"Failed to parse {container_def_path}: {e}")
+        # Build with a deterministic tag so we cache across runs
+        image_tag = f"hermes-et:{task_name}"
 
-        logger.warning(f"Could not extract image from {container_def_path}, using default")
-        return self.config.default_docker_image
+        # Acquire per-task lock so only one thread builds, others wait
+        with self._build_locks_lock:
+            if task_name not in self._build_locks:
+                self._build_locks[task_name] = threading.Lock()
+            build_lock = self._build_locks[task_name]
+
+        with build_lock:
+            # Check if image already exists (another thread may have built it)
+            try:
+                result = subprocess.run(
+                    ["docker", "image", "inspect", image_tag],
+                    capture_output=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    logger.debug(f"Task {task_name}: reusing cached image {image_tag}")
+                    return image_tag
+            except Exception:
+                pass
+
+            # Build the image with BuildKit (required for --mount in Dockerfiles)
+            logger.info(f"Task {task_name}: building Docker image from {dockerfile}...")
+            build_env = {**os.environ, "DOCKER_BUILDKIT": "1"}
+            try:
+                result = subprocess.run(
+                    ["docker", "build", "-t", image_tag, "-f", str(dockerfile), str(dockerfile.parent)],
+                    capture_output=True, text=True, timeout=300, env=build_env,
+                )
+                if result.returncode == 0:
+                    logger.info(f"Task {task_name}: built image {image_tag}")
+                    return image_tag
+                else:
+                    logger.error(
+                        f"Task {task_name}: docker build failed (exit {result.returncode}): "
+                        f"{result.stderr[-500:]}"
+                    )
+                    return self.config.default_docker_image
+            except subprocess.TimeoutExpired:
+                logger.error(f"Task {task_name}: docker build timed out")
+                return self.config.default_docker_image
+            except Exception as e:
+                logger.error(f"Task {task_name}: docker build error: {e}")
+                return self.config.default_docker_image
+
+    async def collect_trajectories(self, item: Item):
+        """
+        Override to aggregate inference_logprobs into the ScoredDataGroup.
+
+        The base atropos collect_trajectories aggregates tokens/masks/scores but
+        silently drops inference_logprobs. Tinker-atropos needs inference_logprobs
+        for importance-sampling loss. We call collect_trajectory group_size times
+        ourselves and build the ScoredDataGroup directly.
+        """
+        # Resolve toolsets once for the whole group
+        self._current_group_tools = self._resolve_tools_for_group()
+
+        tasks = [self.collect_trajectory(item) for _ in range(self.config.group_size)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        group = ScoredDataGroup()
+        group["tokens"] = []
+        group["masks"] = []
+        group["scores"] = []
+        group["inference_logprobs"] = []
+        group["messages"] = []
+
+        backlog = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error("collect_trajectory failed: %s", result)
+                continue
+            scored_item, item_backlog = result
+            if scored_item is None:
+                continue
+            group["tokens"].append(scored_item["tokens"])
+            group["masks"].append(scored_item["masks"])
+            group["scores"].append(scored_item["scores"])
+            group["inference_logprobs"].append(scored_item.get("inference_logprobs", [1.0] * len(scored_item["tokens"])))
+            if scored_item.get("messages"):
+                group["messages"].append(scored_item["messages"])
+            backlog.extend(item_backlog)
+
+        if not group["tokens"]:
+            return None, backlog
+
+        return group, backlog
 
     async def collect_trajectory(
         self, item: Item
@@ -393,25 +552,29 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
         """
         Override to register per-task Docker image before running the agent.
 
-        Follows Terminal Bench 2 pattern: register_task_env_overrides() tells
-        the hermes-agent terminal backend to use a specific Docker image for
-        this task_id.
-
-        This is a copy of HermesAgentBaseEnv.collect_trajectory with Docker
-        image registration added after task_id generation.
+        Builds the task's Dockerfile into a Docker image (cached by task name),
+        then registers it as the container for this rollout's task_id.
         """
         import uuid
         from environments.agent_loop import HermesAgentLoop
 
         task_id = str(uuid.uuid4())
         task_name = item.get("task_name", "unknown")
-        docker_image = item.get("docker_image", self.config.default_docker_image)
+
+        # Build task-specific Docker image (cached across runs)
+        docker_image = await asyncio.get_event_loop().run_in_executor(
+            None, self._build_task_docker_image, item
+        )
 
         logger.debug(f"collect_trajectory START for {task_name}")
 
-        # Register Docker image override for this task_id
+        # Register image override for this task_id (set both docker_image and
+        # modal_image so the correct one is used regardless of backend)
         logger.debug(f"Registering Docker image: {docker_image}")
-        register_task_env_overrides(task_id, {"modal_image": docker_image})
+        register_task_env_overrides(task_id, {
+            "docker_image": docker_image,
+            "modal_image": docker_image,
+        })
         logger.info(
             f"Task {task_name}: registered Docker image {docker_image} for task_id {task_id[:8]}"
         )
@@ -478,7 +641,6 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
                         # Get state directly from managed server while still in context
                         managed_state = managed.get_state()
                 except NotImplementedError:
-                    # DummyManagedServer not allowed
                     logger.warning("ManagedServer not available. Falling back to direct server mode.")
                     agent = HermesAgentLoop(
                         server=self.server,
@@ -527,6 +689,7 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
                 finally:
                     ctx.cleanup()
 
+
             # Track metrics for wandb logging
             task_metrics = {
                 "test_passed": 1.0 if reward > 0.5 else 0.0,
@@ -551,46 +714,29 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
             self._metrics_buffer.append(task_metrics)
 
             # ============================================================================
-            # Build ScoredDataGroup from ManagedServer state
+            # Build ScoredDataItem from result
             # ============================================================================
-            # Phase 2: Extract pre-computed data from SequenceNodes
-            # We may have multiple trajectories in the nodes due to how interesting
-            # agents can be, so iterate through all nodes and return multiple sequences.
-            #
-            # Each SequenceNode contains:
-            # - tokens: Full unmasked token sequence [1, 2, 3, ..., N]
-            # - masked_tokens: Training format [-100, -100, ..., -100, actual, actual, ...]
-            # - logprobs: Training format [1.0, 1.0, ..., 1.0, -0.5, -0.3, ...]
-            # - full_text: Complete text (prompt + all completions)
-            #
+            # Phase 2: Extract tokens/masks/logprobs from first SequenceNode
             # Phase 1: Create placeholder tokens for OpenAI-style servers
             # ============================================================================
+            # Build return value.
+            # The base collect_trajectories() calls this group_size times and
+            # aggregates using .append(), so we must return a ScoredDataItem
+            # (scalar scores, single token list, etc.) -- NOT a ScoredDataGroup
+            # with list-valued fields, which would cause double-wrapping and
+            # "unhashable type: list" errors in handle_send_to_api.
             nodes = (managed_state or {}).get("nodes", []) if managed_state else []
 
-            # Create ScoredDataGroup with lists for multiple trajectories
-            scored_group = ScoredDataGroup()
-            scored_group["tokens"] = []
-            scored_group["masks"] = []
-            scored_group["scores"] = []
-            scored_group["messages"] = []
-            scored_group["inference_logprobs"] = []
-
             if nodes:
-                # Phase 2: iterate through all nodes (may have multiple trajectories)
-                for i, node in enumerate(nodes):
-                    scored_group["tokens"].append(node.tokens)
-                    scored_group["masks"].append(node.masked_tokens)
-                    scored_group["scores"].append(reward)
-                    scored_group["messages"].append(result.messages)
-
-                    if hasattr(node, "logprobs") and node.logprobs:
-                        scored_group["inference_logprobs"].append(node.logprobs)
-                    else:
-                        # Placeholder logprobs if not available
-                        scored_group["inference_logprobs"].append([1.0] * len(node.tokens))
-
-                    logger.debug(f"Added trajectory {i+1}/{len(nodes)} with {len(node.tokens)} tokens")
-
+                # Phase 2: Use last node's real tokens/masks/logprobs (full trajectory)
+                node = nodes[-1]
+                tokens = node.tokens
+                masks = node.masked_tokens
+                if hasattr(node, "logprobs") and node.logprobs:
+                    inference_logprobs = node.logprobs
+                else:
+                    inference_logprobs = [1.0] * len(tokens)
+                logger.debug(f"Phase 2: returning trajectory with {len(tokens)} tokens from node")
             else:
                 # Phase 1: create placeholder tokens for OpenAI-style servers
                 full_text = "\n".join(
@@ -600,19 +746,24 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
                     tokens = self.tokenizer.encode(full_text, add_special_tokens=True)
                 else:
                     tokens = list(range(min(len(full_text) // 4, 128)))
+                masks = [-100] + tokens[1:]
+                inference_logprobs = [1.0] * len(tokens)
+                logger.debug(f"Phase 1: returning placeholder trajectory with {len(tokens)} tokens")
 
-                scored_group["tokens"].append(tokens)
-                scored_group["masks"].append([-100] + tokens[1:])
-                scored_group["scores"].append(reward)
-                scored_group["messages"].append(result.messages)
-                scored_group["inference_logprobs"].append([1.0] * len(tokens))
-
-            # Return None if no trajectories collected
-            if len(scored_group["tokens"]) == 0:
+            if not tokens:
                 return None, []
+            
+            print(reward)
 
-            logger.debug(f"Returning ScoredDataGroup with {len(scored_group['tokens'])} trajectories")
-            return scored_group, []
+            scored_item: ScoredDataItem = {
+                "tokens": tokens,
+                "masks": masks,
+                "scores": reward,
+                "messages": result.messages,
+                "inference_logprobs": inference_logprobs,
+            }
+
+            return scored_item, []
 
         finally:
             # Clean up task overrides and sandbox
@@ -672,10 +823,18 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
         task_name: str,
     ) -> float:
         """
-        Upload test file to sandbox and execute pytest.
+        Upload test file to sandbox and execute pytest with granular scoring.
 
         Runs in thread pool (via run_in_executor) to avoid blocking the event loop
         with synchronous ToolContext calls.
+
+        Scoring (0.0 to 1.0):
+          - Base: fraction of tests passed (e.g., 3/5 = 0.6)
+          - All tests pass: 1.0
+
+        This granular approach ensures score variance within GRPO groups,
+        avoiding the "Scores are the same in a group, skipping..." problem
+        that occurs with binary 0/1 rewards.
 
         Args:
             test_file_path: Local path to test_final_state.py
@@ -683,17 +842,20 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
             task_name: For logging
 
         Returns:
-            1.0 if tests pass, 0.0 otherwise
+            Float between 0.0 and 1.0 based on test pass ratio
         """
         try:
-            # Upload test file to sandbox
+            # Upload test file to a writable temp directory
+            # (Using /workspace fails on macOS local backend because / is read-only)
             test_content = test_file_path.read_text()
-            ctx.write_file("/workspace/test_final_state.py", test_content)
-            logger.debug(f"Task {task_name}: uploaded test file to /workspace/test_final_state.py")
+            test_dir = f"/tmp/_hermes_test_{os.getpid()}"
+            test_path = f"{test_dir}/test_final_state.py"
+            ctx.write_file(test_path, test_content)
+            logger.debug(f"Task {task_name}: uploaded test file to {test_path}")
 
-            # Run pytest in the sandbox
+            # Run pytest -v for per-test pass/fail details
             result = ctx.terminal(
-                "cd /workspace && python -m pytest -q test_final_state.py",
+                f"cd {test_dir} && python3 -m pytest -v test_final_state.py 2>&1",
                 timeout=self.config.test_timeout_s,
             )
 
@@ -701,13 +863,47 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
             output = result.get("output", "")
 
             if exit_code == 0:
-                logger.debug(f"Task {task_name}: tests passed")
+                logger.debug(f"Task {task_name}: all tests passed")
                 return 1.0
+
+            # Parse pytest -v output for granular scoring
+            # Lines like: "test_final_state.py::test_name PASSED"
+            # or:         "test_final_state.py::test_name FAILED"
+            passed = len(re.findall(r" PASSED", output))
+            failed = len(re.findall(r" FAILED", output))
+            errored = len(re.findall(r" ERROR", output))
+            total = passed + failed + errored
+
+            if total > 0:
+                # Score is fraction of tests passed
+                reward = passed / total
+                logger.info(
+                    f"Task {task_name}: {passed}/{total} tests passed "
+                    f"(reward={reward:.3f})"
+                )
+                return reward
             else:
-                # Log failure output (last 500 chars for debugging)
+                # Couldn't parse output — fall back to binary
+                # Also try the summary line: "X passed, Y failed"
+                summary_match = re.search(
+                    r"(\d+) passed(?:.*?(\d+) failed)?", output
+                )
+                if summary_match:
+                    p = int(summary_match.group(1))
+                    f = int(summary_match.group(2) or 0)
+                    total = p + f
+                    if total > 0:
+                        reward = p / total
+                        logger.info(
+                            f"Task {task_name}: {p}/{total} tests passed "
+                            f"from summary (reward={reward:.3f})"
+                        )
+                        return reward
+
                 output_preview = output[-500:] if output else "(no output)"
                 logger.info(
-                    f"Task {task_name}: tests failed (exit_code={exit_code})\n{output_preview}"
+                    f"Task {task_name}: tests failed, couldn't parse counts "
+                    f"(exit_code={exit_code})\n{output_preview}"
                 )
                 return 0.0
 
@@ -878,7 +1074,9 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
         if self._metrics_buffer:
             # Test pass rate
             test_passes = [m["test_passed"] for m in self._metrics_buffer]
-            wandb_metrics["endless_terminals/test_pass_rate"] = sum(test_passes) / len(test_passes)
+            accuracy = sum(test_passes) / len(test_passes)
+            wandb_metrics["train/accuracy"] = accuracy
+            wandb_metrics["endless_terminals/test_pass_rate"] = accuracy
             wandb_metrics["endless_terminals/num_tests_passed"] = sum(test_passes)
             wandb_metrics["endless_terminals/num_tests_total"] = len(test_passes)
 
