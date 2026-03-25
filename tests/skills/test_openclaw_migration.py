@@ -665,11 +665,12 @@ def test_skill_installs_cleanly_under_skills_guard():
         source="official/migration/openclaw-migration",
     )
 
-    # The migration script legitimately references AGENTS.md (migrating
-    # workspace instructions), which triggers a false-positive
-    # agent_config_mod finding.  Accept "caution" or "safe" — just not
-    # "dangerous" from a *real* threat.
+    # The migration script has two known false-positive findings:
+    # 1. agent_config_mod — references AGENTS.md to migrate workspace instructions
+    # 2. python_os_environ — reads MIGRATION_JSON_OUTPUT to enable JSON output mode,
+    #    not an env dump; it's a legitimate CLI feature flag
+    # Accept "caution" or "safe" — just not "dangerous" from a *real* threat.
     assert result.verdict in ("safe", "caution", "dangerous"), f"Unexpected verdict: {result.verdict}"
-    # All findings should be the known false-positive for AGENTS.md
+    KNOWN_FALSE_POSITIVES = {"agent_config_mod", "python_os_environ"}
     for f in result.findings:
-        assert f.pattern_id == "agent_config_mod", f"Unexpected finding: {f}"
+        assert f.pattern_id in KNOWN_FALSE_POSITIVES, f"Unexpected finding: {f}"
