@@ -16,8 +16,13 @@ concurrency:
 
 jobs:
   test:
+    name: test (${{ matrix.group }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3, 4]
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -37,10 +42,11 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
-      - name: Run tests
+      - name: Run tests (shard ${{ matrix.group }}/4)
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short \
+            --splits 4 --group ${{ matrix.group }}
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
