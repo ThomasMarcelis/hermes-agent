@@ -670,3 +670,53 @@ def test_get_platform_tools_feishu_tools_not_on_other_platforms():
         enabled = _get_platform_tools({}, plat)
         assert "feishu_doc" not in enabled, f"feishu_doc leaked onto {plat}"
         assert "feishu_drive" not in enabled, f"feishu_drive leaked onto {plat}"
+
+
+def test_save_platform_tools_normalizes_numeric_entries():
+    """YAML may parse bare numeric toolset names as int. They should be
+    normalized to str so they survive the save round-trip.
+    """
+    config = {
+        "platform_toolsets": {
+            "cli": ["web", "terminal", 12306, "custom-mcp"]
+        }
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _save_platform_tools(config, "cli", {"web", "browser"})
+
+    saved = config["platform_toolsets"]["cli"]
+    assert "12306" in saved
+    assert 12306 not in saved
+
+
+def test_save_platform_tools_clears_stale_no_mcp():
+    """When the new selection doesn't include no_mcp, the sentinel should
+    be stripped from preserved entries so MCP servers are re-enabled.
+    """
+    config = {
+        "platform_toolsets": {
+            "cli": ["web", "terminal", "no_mcp"]
+        }
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _save_platform_tools(config, "cli", {"web", "browser"})
+
+    saved = config["platform_toolsets"]["cli"]
+    assert "no_mcp" not in saved
+
+
+def test_save_platform_tools_preserves_explicit_no_mcp():
+    """When the new selection explicitly includes no_mcp, it should be kept."""
+    config = {
+        "platform_toolsets": {
+            "cli": ["web", "no_mcp"]
+        }
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _save_platform_tools(config, "cli", {"web", "no_mcp"})
+
+    saved = config["platform_toolsets"]["cli"]
+    assert "no_mcp" in saved
