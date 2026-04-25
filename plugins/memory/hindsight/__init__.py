@@ -627,7 +627,9 @@ class HindsightMemoryProvider(MemoryProvider):
         provider_config["recall_budget"] = "mid"
         # Read existing timeout from config if present, otherwise use default
         existing_timeout = self._config.get("timeout") if self._config else None
-        timeout_val = existing_timeout if existing_timeout else _DEFAULT_TIMEOUT
+        if not existing_timeout:
+            existing_timeout = _load_simple_env(Path(hermes_home) / ".env").get("HINDSIGHT_TIMEOUT")
+        timeout_val = int(existing_timeout) if existing_timeout else _DEFAULT_TIMEOUT
         provider_config["timeout"] = timeout_val
         env_writes["HINDSIGHT_TIMEOUT"] = str(timeout_val)
         config["memory"]["provider"] = "hindsight"

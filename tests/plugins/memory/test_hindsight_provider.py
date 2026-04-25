@@ -388,6 +388,30 @@ class TestPostSetup:
         assert (hermes_home / ".env").read_text() == "HINDSIGHT_LLM_API_KEY=existing-key\nHINDSIGHT_TIMEOUT=120\n"
         assert "HINDSIGHT_API_LLM_API_KEY=existing-key\n" in profile_env.read_text()
 
+    def test_local_embedded_setup_preserves_existing_timeout(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes-home"
+        user_home = tmp_path / "user-home"
+        user_home.mkdir()
+        monkeypatch.setenv("HOME", str(user_home))
+
+        selections = iter([1, 0])  # local_embedded, openai
+        monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: next(selections))
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "sk-test")
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+
+        env_path = hermes_home / ".env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("HINDSIGHT_LLM_API_KEY=sk-test\nHINDSIGHT_TIMEOUT=300\n")
+
+        provider = HindsightMemoryProvider()
+        provider.post_setup(str(hermes_home), {"memory": {}})
+
+        env_content = (hermes_home / ".env").read_text()
+        assert "HINDSIGHT_TIMEOUT=300" in env_content
+
 
 # ---------------------------------------------------------------------------
 # Tool handler tests
