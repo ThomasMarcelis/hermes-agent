@@ -2473,10 +2473,10 @@ class GatewayRunner:
 
         For each subscription row, fetches ``task_events`` newer than the
         stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``spawn_auto_blocked``, ``crashed``). Sends one message
-        per new event to ``(platform, chat_id, thread_id)``, then advances
-        the cursor. When a task reaches a terminal state (``completed`` /
-        ``archived``), the subscription is removed.
+        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
+        message per new event to ``(platform, chat_id, thread_id)``,
+        then advances the cursor. When a task reaches a terminal state
+        (``completed`` / ``archived``), the subscription is removed.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -2547,13 +2547,24 @@ class GatewayRunner:
                     for ev in d["events"]:
                         kind = ev.kind
                         if kind == "completed":
-                            result_preview = ""
-                            if task and task.result:
+                            # Prefer the run's summary (the worker's
+                            # intentional human-facing handoff, carried
+                            # in the event payload), then fall back to
+                            # task.result for legacy rows written before
+                            # runs shipped.
+                            handoff = ""
+                            payload_summary = None
+                            if ev.payload and ev.payload.get("summary"):
+                                payload_summary = str(ev.payload["summary"])
+                            if payload_summary:
+                                h = payload_summary.strip().splitlines()[0][:200]
+                                handoff = f"\n{h}"
+                            elif task and task.result:
                                 r = task.result.strip().splitlines()[0][:160]
-                                result_preview = f"\n{r}"
+                                handoff = f"\n{r}"
                             msg = (
                                 f"✔ Kanban {sub['task_id']} done"
-                                f" — {title}{result_preview}"
+                                f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""

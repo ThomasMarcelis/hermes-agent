@@ -672,3 +672,88 @@ def test_task_detail_runs_empty_before_claim(client):
     r = client.post("/api/plugins/kanban/tasks", json={"title": "fresh"}).json()
     d = client.get(f"/api/plugins/kanban/tasks/{r['task']['id']}").json()
     assert d["runs"] == []
+
+
+def test_patch_status_done_with_summary_and_metadata(client):
+    """PATCH /tasks/:id with status=done + summary + metadata must
+    reach complete_task, so the dashboard has CLI parity."""
+    # Create + claim.
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "x", "assignee": "worker"})
+    tid = r.json()["task"]["id"]
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={
+            "status": "done",
+            "summary": "shipped the thing",
+            "metadata": {"changed_files": ["a.py", "b.py"], "tests_run": 7},
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    # The run must have the summary + metadata attached.
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, tid)
+        assert run.outcome == "completed"
+        assert run.summary == "shipped the thing"
+        assert run.metadata == {"changed_files": ["a.py", "b.py"], "tests_run": 7}
+    finally:
+        conn.close()
+
+
+def test_patch_status_done_without_summary_still_works(client):
+    """Back-compat: PATCH without the new fields still completes."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "y", "assignee": "worker"})
+    tid = r.json()["task"]["id"]
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "done", "result": "legacy shape"},
+    )
+    assert r.status_code == 200, r.text
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, tid)
+        assert run.outcome == "completed"
+        assert run.summary == "legacy shape"  # falls back to result
+    finally:
+        conn.close()
+
+
+def test_patch_status_archive_closes_running_run(client):
+    """PATCH to archived while running must close the in-flight run."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "z", "assignee": "worker"})
+    tid = r.json()["task"]["id"]
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, tid)
+        open_run = kb.latest_run(conn, tid)
+        assert open_run.ended_at is None
+    finally:
+        conn.close()
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "archived"},
+    )
+    assert r.status_code == 200, r.text
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "archived"
+        assert task.current_run_id is None
+        assert kb.latest_run(conn, tid).outcome == "reclaimed"
+    finally:
+        conn.close()

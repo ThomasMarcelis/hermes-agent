@@ -710,8 +710,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     if not ids:
         print("at least one task_id is required", file=sys.stderr)
         return 1
-    metadata = None
+    summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    # Guard: structured handoff fields are per-run, so they'd be
+    # copy-pasted identically across N runs — almost always a footgun.
+    # Refuse instead of silently doing the wrong thing.
+    if len(ids) > 1 and (summary or raw_meta):
+        print(
+            "kanban: --summary / --metadata are per-task and can't be used "
+            "with multiple ids (would apply the same handoff to every task). "
+            "Complete tasks one at a time, or drop the flags for the bulk close.",
+            file=sys.stderr,
+        )
+        return 2
+    metadata = None
     if raw_meta:
         try:
             metadata = json.loads(raw_meta)
@@ -726,7 +738,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
-                summary=getattr(args, "summary", None),
+                summary=summary,
                 metadata=metadata,
             ):
                 failed.append(tid)

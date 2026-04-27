@@ -1364,3 +1364,165 @@ def test_cli_complete_bad_metadata_exits_nonzero(kanban_home):
         conn.close()
     out = run_slash(f"complete {tid} --metadata not-json")
     assert "metadata" in out.lower()
+
+
+# -------------------------------------------------------------------------
+# Integration hardening (Apr 2026 audit fixes)
+# -------------------------------------------------------------------------
+
+def test_archive_of_running_task_closes_run(kanban_home):
+    """Archiving a claimed task must close the in-flight run with
+    outcome='reclaimed', not orphan it."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run.ended_at is None
+        open_run_id = run.id
+
+        assert kb.archive_task(conn, tid) is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "archived"
+        assert task.current_run_id is None
+        # The previously-active run must now be closed.
+        closed = kb.get_run(conn, open_run_id)
+        assert closed.ended_at is not None
+        assert closed.outcome == "reclaimed"
+    finally:
+        conn.close()
+
+
+def test_archive_of_ready_task_does_not_create_spurious_run(kanban_home):
+    """No active run → archive shouldn't synthesize one."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        # Never claimed. Move to ready (task starts in 'ready' here).
+        assert kb.archive_task(conn, tid) is True
+        runs = kb.list_runs(conn, tid)
+        assert runs == []  # No run was ever opened; archive didn't fabricate one.
+    finally:
+        conn.close()
+
+
+def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
+    """Dashboard drag-drop running->ready must close the active run.
+
+    Importing _set_status_direct directly to simulate the PATCH handler
+    without spinning up FastAPI.
+    """
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        open_run = kb.latest_run(conn, tid)
+        assert open_run.ended_at is None
+        prev_run_id = open_run.id
+
+        # Simulate yanking the worker back to the queue.
+        assert _set_status_direct(conn, tid, "ready") is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        closed = kb.get_run(conn, prev_run_id)
+        assert closed.ended_at is not None
+        assert closed.outcome == "reclaimed"
+    finally:
+        conn.close()
+
+
+def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanban_home):
+    """todo -> ready on an unclaimed task must not create any run rows."""
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x")
+        # Force to todo for the sake of the test.
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+        conn.commit()
+        assert _set_status_direct(conn, tid, "ready") is True
+        assert kb.list_runs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+def test_cli_bulk_complete_with_summary_rejects(kanban_home):
+    conn = kb.connect()
+    try:
+        a = kb.create_task(conn, title="a", assignee="worker")
+        b = kb.create_task(conn, title="b", assignee="worker")
+        kb.claim_task(conn, a); kb.claim_task(conn, b)
+    finally:
+        conn.close()
+    # Bulk + summary is refused (stderr message, no mutation).
+    # Note: hermes_cli.main doesn't propagate sub-command exit codes
+    # (args.func(args) discards the return value), so we check the side
+    # effects instead.
+    from subprocess import run as _run
+    import os, sys
+    env = os.environ.copy()
+    r = _run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban",
+         "complete", a, b, "--summary", "oops"],
+        capture_output=True, text=True, env=env,
+    )
+    assert "per-task" in r.stderr, r.stderr
+    # The tasks must still be running (no partial apply).
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, a).status == "running"
+        assert kb.get_task(conn, b).status == "running"
+    finally:
+        conn.close()
+
+
+def test_cli_bulk_complete_without_summary_still_works(kanban_home):
+    """Bulk close with no per-task handoff is allowed — the common case."""
+    conn = kb.connect()
+    try:
+        a = kb.create_task(conn, title="a", assignee="worker")
+        b = kb.create_task(conn, title="b", assignee="worker")
+        kb.claim_task(conn, a); kb.claim_task(conn, b)
+    finally:
+        conn.close()
+    out = run_slash(f"complete {a} {b}")
+    assert f"Completed {a}" in out
+    assert f"Completed {b}" in out
+
+
+def test_completed_event_payload_carries_summary(kanban_home):
+    """The 'completed' event must embed the run summary so gateway
+    notifiers render structured handoffs without a second SQL hit."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="handoff line 1\nextra",
+                         metadata={"n": 3})
+        events = kb.list_events(conn, tid)
+        comp = [e for e in events if e.kind == "completed"]
+        assert len(comp) == 1
+        # First-line-only, within the 400-char cap, preserved verbatim.
+        assert comp[0].payload["summary"] == "handoff line 1"
+    finally:
+        conn.close()
+
+
+def test_completed_event_payload_summary_none_when_missing(kanban_home):
+    """If the caller passes no summary AND no result, payload.summary is None."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid)  # no summary, no result
+        events = kb.list_events(conn, tid)
+        comp = [e for e in events if e.kind == "completed"][0]
+        assert comp.payload.get("summary") is None
+    finally:
+        conn.close()

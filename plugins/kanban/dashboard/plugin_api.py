@@ -347,6 +347,11 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    # Structured handoff fields — forwarded to complete_task when status
+    # transitions to 'done'. Dashboard parity with ``hermes kanban
+    # complete --summary ... --metadata ...``.
+    summary: Optional[str] = None
+    metadata: Optional[dict] = None
 
 
 @router.patch("/tasks/{task_id}")
@@ -373,7 +378,12 @@ def update_task(task_id: str, payload: UpdateTaskBody):
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(conn, task_id, result=payload.result)
+                ok = kanban_db.complete_task(
+                    conn, task_id,
+                    result=payload.result,
+                    summary=payload.summary,
+                    metadata=payload.metadata,
+                )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
@@ -443,21 +453,45 @@ def _set_status_direct(
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed."""
+    running<->ready). Appends a ``status`` event row for the live feed.
+
+    When this transitions OFF ``running`` to anything other than the
+    terminal verbs above (which own their own run closing), we close the
+    active run with outcome='reclaimed' so attempt history isn't
+    orphaned. ``running -> ready`` via drag-drop is the common case
+    (user yanking a stuck worker back to the queue).
+    """
     with kanban_db.write_txn(conn):
+        # Snapshot current state so we know whether to close a run.
+        prev = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if prev is None:
+            return False
+        was_running = prev["status"] == "running"
+
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
-            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END "
+            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
+            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
             "WHERE id = ?",
-            (new_status, new_status, new_status, task_id),
+            (new_status, new_status, new_status, new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
+        run_id = None
+        if was_running and new_status != "running" and prev["current_run_id"]:
+            run_id = kanban_db._end_run(
+                conn, task_id,
+                outcome="reclaimed", status="reclaimed",
+                summary=f"status changed to {new_status} (dashboard/direct)",
+            )
         conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'status', ?, ?)",
-            (task_id, json.dumps({"status": new_status}), int(time.time())),
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'status', ?, ?)",
+            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
         )
     # If we re-opened something, children may have gone stale.
     if new_status in ("done", "ready"):
