@@ -45,6 +45,18 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
 
+# Worker-context caps so build_worker_context() stays bounded on
+# pathological boards (retry-heavy tasks, comment storms, giant
+# summaries). Values chosen to fit a typical 100k-char LLM prompt with
+# plenty of headroom. Each constant is tuned independently so users
+# who need to relax one don't have to relax all of them.
+_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
+_CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
+_CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
+_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -1445,7 +1457,12 @@ def resolve_workspace(task: Task) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     - ``scratch``: a fresh dir under ``$HERMES_HOME/kanban/workspaces/<id>/``.
-    - ``dir:<path>``: the path stored in ``workspace_path``.  Created if missing.
+    - ``dir:<path>``: the path stored in ``workspace_path``.  Created
+      if missing.  MUST be absolute — relative paths are rejected to
+      prevent confused-deputy traversal where ``../../../tmp/attacker``
+      resolves against the dispatcher's CWD instead of a meaningful
+      root.  Users who want a HERMES_HOME-relative workspace should
+      compute the absolute path themselves.
     - ``worktree``: a git worktree at ``workspace_path``.  Not created
       automatically in v1 -- the kanban-worker skill documents
       ``git worktree add`` as a worker-side step.  Returns the intended path.
@@ -1456,7 +1473,15 @@ def resolve_workspace(task: Task) -> Path:
     kind = task.workspace_kind or "scratch"
     if kind == "scratch":
         if task.workspace_path:
+            # Legacy scratch tasks that were set to an explicit path get the
+            # same absolute-path guard as dir: — consistent with the
+            # threat model.
             p = Path(task.workspace_path).expanduser()
+            if not p.is_absolute():
+                raise ValueError(
+                    f"task {task.id} has non-absolute workspace_path "
+                    f"{task.workspace_path!r}; workspace paths must be absolute"
+                )
         else:
             p = workspaces_root() / task.id
         p.mkdir(parents=True, exist_ok=True)
@@ -1467,13 +1492,25 @@ def resolve_workspace(task: Task) -> Path:
                 f"task {task.id} has workspace_kind=dir but no workspace_path"
             )
         p = Path(task.workspace_path).expanduser()
+        if not p.is_absolute():
+            raise ValueError(
+                f"task {task.id} has non-absolute workspace_path "
+                f"{task.workspace_path!r}; use an absolute path "
+                f"(relative paths are ambiguous against the dispatcher's CWD)"
+            )
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
         if not task.workspace_path:
             # Default: .worktrees/<id>/ under CWD.  Worker skill creates it.
             return Path.cwd() / ".worktrees" / task.id
-        return Path(task.workspace_path).expanduser()
+        p = Path(task.workspace_path).expanduser()
+        if not p.is_absolute():
+            raise ValueError(
+                f"task {task.id} has non-absolute worktree path "
+                f"{task.workspace_path!r}; use an absolute path"
+            )
+        return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
@@ -2081,18 +2118,36 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
     Order:
       1. Task title (mandatory).
-      2. Task body (optional opening post).
-      3. Prior attempts on THIS task (if any) — their outcome + summary
-         + error. Lets a retrying worker see why earlier attempts failed
-         and skip that path.
+      2. Task body (optional opening post, capped at 8 KB).
+      3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
+         shown; older attempts collapsed into a one-line summary).
+         Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
+         ``_CTX_MAX_FIELD_BYTES`` each.
       4. Structured handoff results of every done parent task. Prefers
          ``run.summary`` / ``run.metadata`` when the parent was executed
-         via a run; falls back to ``task.result`` for older data.
-      5. Every comment on the task, chronologically, with authors.
+         via a run; falls back to ``task.result`` for older data. Same
+         per-field cap.
+      5. Cross-task role history for the assignee (most recent 5
+         completed runs on other tasks).
+      6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
+         collapsed).
+
+    All caps exist so worker prompts stay bounded even on pathological
+    boards (retry-heavy tasks, comment storms). The per-field char cap
+    prevents a single 1 MB summary from dominating context.
     """
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
+
+    def _cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+        """Truncate a string to `limit` chars with a visible ellipsis."""
+        if not s:
+            return ""
+        s = s.strip()
+        if len(s) <= limit:
+            return s
+        return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
 
     lines: list[str] = []
     lines.append(f"# Kanban task {task.id}: {task.title}")
@@ -2106,27 +2161,45 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
     if task.body and task.body.strip():
         lines.append("## Body")
-        lines.append(task.body.strip())
+        lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
 
     # Prior attempts — show closed runs so a retrying worker sees the
     # history. Skip the currently-active run (that's this worker).
-    prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
-    if prior:
+    # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
+    # attempts get collapsed into a one-line marker so the worker knows
+    # more exist without bloating the prompt.
+    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    # list_runs returns ascending by started_at; "most recent" = last N
+    if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
+        omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
+        shown = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
+        first_shown_idx = omitted + 1
+    else:
+        omitted = 0
+        shown = all_prior
+        first_shown_idx = 1
+    if shown:
         lines.append("## Prior attempts on this task")
-        for idx, run in enumerate(prior, start=1):
+        if omitted:
+            lines.append(
+                f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} "
+                f"omitted; showing most recent {len(shown)})_"
+            )
+        for offset, run in enumerate(shown):
+            idx = first_shown_idx + offset
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
             profile = run.profile or "(unknown)"
             outcome = run.outcome or run.status
             lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts})")
             if run.summary and run.summary.strip():
-                lines.append(run.summary.strip())
+                lines.append(_cap(run.summary))
             if run.error and run.error.strip():
-                lines.append(f"_error_: {run.error.strip()}")
+                lines.append(f"_error_: {_cap(run.error)}")
             if run.metadata:
                 try:
                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-                    lines.append(f"_metadata_: `{meta_str}`")
+                    lines.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
                     pass
             lines.append("")
@@ -2157,16 +2230,16 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
-                body_lines.append(run.summary.strip())
+                body_lines.append(_cap(run.summary))
             elif pt.result:
-                body_lines.append(pt.result.strip())
+                body_lines.append(_cap(pt.result))
             else:
                 body_lines.append("(no result recorded)")
 
             if run is not None and run.metadata:
                 try:
                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-                    body_lines.append(f"_metadata_: `{meta_str}`")
+                    body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
                     pass
             lines.extend(body_lines)
@@ -2198,13 +2271,27 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 lines.append(f"- {row['id']} — {row['title']} ({ts}): {first}")
             lines.append("")
 
-    comments = list_comments(conn, task_id)
-    if comments:
+    # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
+    # comment-storm tasks don't blow out the worker's prompt. Older
+    # comments summarised in a one-line marker like prior attempts.
+    all_comments = list_comments(conn, task_id)
+    if len(all_comments) > _CTX_MAX_COMMENTS:
+        omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
+        shown_c = all_comments[-_CTX_MAX_COMMENTS:]
+    else:
+        omitted_c = 0
+        shown_c = all_comments
+    if shown_c:
         lines.append("## Comment thread")
-        for c in comments:
+        if omitted_c:
+            lines.append(
+                f"_({omitted_c} earlier comment{'s' if omitted_c != 1 else ''} "
+                f"omitted; showing most recent {len(shown_c)})_"
+            )
+        for c in shown_c:
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.created_at))
             lines.append(f"**{c.author}** ({ts}):")
-            lines.append(c.body.strip())
+            lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

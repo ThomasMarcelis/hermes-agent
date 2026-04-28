@@ -2024,3 +2024,148 @@ def test_cli_show_clamps_negative_elapsed(kanban_home):
     )
     # Should show "0s" for the clamped elapsed
     assert "0s" in out_show or "0s" in out_runs
+
+
+def test_resolve_workspace_rejects_relative_dir_path(kanban_home):
+    """dir: workspace_path must be absolute. A relative path like
+    '../../../tmp/attacker' would be resolved against the dispatcher's
+    CWD — a confused-deputy escape vector."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="path-trav", assignee="worker",
+            workspace_kind="dir",
+            workspace_path="../../../tmp/attacker",
+        )
+        task = kb.get_task(conn, tid)
+        # Storage is verbatim — that's fine.
+        assert task.workspace_path == "../../../tmp/attacker"
+        # But resolution must refuse.
+        with pytest.raises(ValueError, match=r"non-absolute"):
+            kb.resolve_workspace(task)
+    finally:
+        conn.close()
+
+
+def test_resolve_workspace_accepts_absolute_dir_path(kanban_home, tmp_path):
+    """Legitimate absolute paths are accepted and created."""
+    conn = kb.connect()
+    try:
+        abs_path = str(tmp_path / "my-workspace")
+        tid = kb.create_task(
+            conn, title="legit", assignee="worker",
+            workspace_kind="dir",
+            workspace_path=abs_path,
+        )
+        task = kb.get_task(conn, tid)
+        resolved = kb.resolve_workspace(task)
+        assert str(resolved) == abs_path
+        assert resolved.exists()
+    finally:
+        conn.close()
+
+
+def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
+    """Worktree paths also must be absolute when explicitly set."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="wt", assignee="worker",
+            workspace_kind="worktree",
+            workspace_path="../escape",
+        )
+        with pytest.raises(ValueError, match=r"non-absolute"):
+            kb.resolve_workspace(kb.get_task(conn, tid))
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_caps_prior_attempts(kanban_home):
+    """When a task has more than _CTX_MAX_PRIOR_ATTEMPTS runs, only
+    the most recent N are shown in full; earlier attempts are summarised
+    in a one-line marker so the worker knows more exist without
+    blowing the prompt."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="retry", assignee="worker")
+        # Force 25 closed runs
+        for i in range(25):
+            kb.claim_task(conn, tid)
+            kb._end_run(conn, tid, outcome="reclaimed",
+                        summary=f"attempt {i} summary")
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (tid,),
+            )
+            conn.commit()
+
+        ctx = kb.build_worker_context(conn, tid)
+        # Check: only _CTX_MAX_PRIOR_ATTEMPTS attempt headers present
+        attempt_count = ctx.count("### Attempt ")
+        assert attempt_count == kb._CTX_MAX_PRIOR_ATTEMPTS, (
+            f"expected {kb._CTX_MAX_PRIOR_ATTEMPTS} attempts shown, got {attempt_count}"
+        )
+        # And the "omitted" marker appears with the right count
+        omitted_count = 25 - kb._CTX_MAX_PRIOR_ATTEMPTS
+        assert f"{omitted_count} earlier attempt" in ctx, (
+            f"expected omitted-count marker, got ctx=\n{ctx[:2000]}"
+        )
+        # Total size is bounded — empirically we expect << 100KB even
+        # for 1000 attempts (capped to N * ~500 chars)
+        assert len(ctx) < 20_000, (
+            f"context should be bounded even at 25 runs, got {len(ctx)} chars"
+        )
+        # Attempt numbering starts at the real index (not renumbered)
+        assert "Attempt 16 " in ctx, (
+            "first-shown attempt should be numbered 16 (25 - 10 + 1)"
+        )
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_caps_comments(kanban_home):
+    """Same cap for comments — comment-storm tasks stay bounded."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="chatty", assignee="worker")
+        for i in range(100):
+            kb.add_comment(conn, tid, author=f"u{i % 3}", body=f"comment {i}")
+        ctx = kb.build_worker_context(conn, tid)
+        # Only _CTX_MAX_COMMENTS most-recent shown in full
+        comment_count = ctx.count("**u")
+        # 3 distinct authors u0/u1/u2 so the count is trickier; use the
+        # "comment N" body text to count.
+        body_count = sum(1 for line in ctx.splitlines() if line.startswith("comment "))
+        assert body_count == kb._CTX_MAX_COMMENTS, (
+            f"expected {kb._CTX_MAX_COMMENTS} comments shown, got {body_count}"
+        )
+        omitted = 100 - kb._CTX_MAX_COMMENTS
+        assert f"{omitted} earlier comment" in ctx
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_caps_huge_summary(kanban_home):
+    """A 1 MB summary on a single prior run must not dominate the
+    worker prompt. Per-field cap truncates with a visible ellipsis."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="giant", assignee="worker")
+        kb.claim_task(conn, tid)
+        huge = "X" * (1024 * 1024)  # 1 MB
+        kb._end_run(conn, tid, outcome="reclaimed", summary=huge)
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        ctx = kb.build_worker_context(conn, tid)
+        # Much smaller than 1 MB
+        assert len(ctx) < 10_000, (
+            f"1 MB summary should be capped, got {len(ctx)} chars"
+        )
+        # Truncation marker present
+        assert "truncated" in ctx
+    finally:
+        conn.close()
