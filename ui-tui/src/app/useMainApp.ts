@@ -607,12 +607,17 @@ export function useMainApp(gw: GatewayClient) {
     () =>
       createSlashHandler({
         composer: {
+          cycleStash: composerActions.cycleStash,
           enqueue: composerActions.enqueue,
+          getStashList: composerActions.getStashList,
           hasSelection,
           paste,
+          popStashAt: composerActions.popStashAt,
+          pushStash: composerActions.pushStash,
           queueRef: composerRefs.queueRef,
           selection,
-          setInput: composerActions.setInput
+          setInput: composerActions.setInput,
+          stashRef: composerRefs.stashRef
         },
         gateway,
         local: {
@@ -648,6 +653,8 @@ export function useMainApp(gw: GatewayClient) {
       selection,
       send,
       session,
+      setSessionStartedAt,
+      setVoiceEnabled,
       sys
     ]
   )
@@ -771,6 +778,7 @@ export function useMainApp(gw: GatewayClient) {
       pagerPageSize,
       queueEditIdx: composerState.queueEditIdx,
       queuedDisplay: composerState.queuedDisplay,
+      stashCount: composerState.stashCount,
       submit,
       updateInput: composerActions.setInput
     }),

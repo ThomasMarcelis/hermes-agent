@@ -562,5 +562,57 @@ export const coreCommands: SlashCommand[] = [
         })
       )
     }
+  },
+
+  {
+    help: 'list stashed drafts. /stash pop [N] to restore.',
+    name: 'stash',
+    run: (arg, ctx) => {
+      // /stash pop [N]
+      if (arg && arg.toLowerCase().startsWith('pop')) {
+        const rest = arg.slice(3).trim()
+        const n = rest ? parseInt(rest, 10) : 1
+
+        if (isNaN(n) || n < 1) {
+          return ctx.transcript.sys('usage: /stash pop [N]')
+        }
+
+        const list = ctx.composer.getStashList()
+
+        if (n > list.length) {
+          return ctx.transcript.sys(
+            `stash empty (only ${list.length} item${list.length === 1 ? '' : 's'})`
+          )
+        }
+
+        const popped = ctx.composer.popStashAt(n - 1)
+
+        if (!popped) {
+          return ctx.transcript.sys('stash empty')
+        }
+
+        ctx.composer.setInput(popped)
+
+        return ctx.transcript.sys(`popped draft #${n}`)
+      }
+
+      // /stash (no arg) — show list
+      const list = ctx.composer.getStashList()
+
+      if (list.length === 0) {
+        return ctx.transcript.sys('stash empty')
+      }
+
+      const lines = list.map((text, i) => {
+        const preview = text.split('\n')[0]!.slice(0, 40)
+        const suffix = text.length > 40 || text.includes('\n') ? '…' : ''
+
+        return `[${i + 1}] ${preview}${suffix}`
+      })
+
+      ctx.transcript.sys(
+        `${lines.join('  ')}  · ${list.length} draft${list.length === 1 ? '' : 's'}`
+      )
+    }
   }
 ]

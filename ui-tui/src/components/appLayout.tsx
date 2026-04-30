@@ -25,6 +25,7 @@ import { FpsOverlay } from './fpsOverlay.js'
 import { HelpHint } from './helpHint.js'
 import { MessageLine } from './messageLine.js'
 import { QueuedMessages } from './queuedMessages.js'
+import { StashIndicator } from './stashIndicator.js'
 import { LiveTodoPanel, StreamingAssistant } from './streamingAssistant.js'
 import { TextInput, type TextInputMouseApi } from './textInput.js'
 
@@ -214,6 +215,8 @@ const ComposerPane = memo(function ComposerPane({
         queueEditIdx={composer.queueEditIdx}
         t={ui.theme}
       />
+
+      <StashIndicator count={composer.stashCount} t={ui.theme} textInPrompt={!!composer.input.length || !!composer.inputBuf.length}/>
 
       {ui.bgTasks.size > 0 && (
         <Text color={ui.theme.color.muted}>

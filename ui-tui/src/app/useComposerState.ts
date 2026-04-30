@@ -12,6 +12,7 @@ import { LARGE_PASTE } from '../config/limits.js'
 import type { ImageAttachResponse, InputDetectDropResponse } from '../gatewayTypes.js'
 import { useCompletion } from '../hooks/useCompletion.js'
 import { useInputHistory } from '../hooks/useInputHistory.js'
+import { useStash } from '../hooks/useStash.js'
 import { useQueue } from '../hooks/useQueue.js'
 import { isUsableClipboardText, readClipboardText } from '../lib/clipboard.js'
 import { resolveEditor } from '../lib/editor.js'
@@ -122,6 +123,8 @@ export function useComposerState({
     setQueueEdit,
     syncQueue
   } = useQueue()
+
+  const { cycleStash, getStashList, popStashAt, pushStash, stashCount, stashRef } = useStash()
 
   const { historyRef, historyIdx, setHistoryIdx, historyDraftRef, pushHistory } = useInputHistory()
   const { completions, compIdx, setCompIdx, compReplace } = useCompletion(input, isBlocked, gw)
@@ -299,11 +302,15 @@ export function useComposerState({
   const actions = useMemo(
     () => ({
       clearIn,
+      cycleStash,
       dequeue,
       enqueue,
+      getStashList,
       handleTextPaste,
       openEditor,
+      popStashAt,
       pushHistory,
+      pushStash,
       removeQueue: removeQ,
       replaceQueue: replaceQ,
       setCompIdx,
@@ -316,10 +323,13 @@ export function useComposerState({
     }),
     [
       clearIn,
+      cycleStash,
       dequeue,
       enqueue,
+      getStashList,
       handleTextPaste,
       openEditor,
+      popStashAt,
       pushHistory,
       removeQ,
       replaceQ,
@@ -336,9 +346,10 @@ export function useComposerState({
       historyRef,
       queueEditRef,
       queueRef,
+      stashRef,
       submitRef
     }),
-    [historyDraftRef, historyRef, queueEditRef, queueRef, submitRef]
+    [historyDraftRef, historyRef, queueEditRef, queueRef, stashRef, submitRef]
   )
 
   const state = useMemo(
@@ -351,7 +362,8 @@ export function useComposerState({
       inputBuf,
       pasteSnips,
       queueEditIdx,
-      queuedDisplay
+      queuedDisplay,
+      stashCount
     }),
     [compIdx, compReplace, completions, historyIdx, input, inputBuf, pasteSnips, queueEditIdx, queuedDisplay]
   )

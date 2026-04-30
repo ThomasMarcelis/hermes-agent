@@ -439,6 +439,32 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return
     }
 
+    if (isAction(key, ch, 's')) {
+      const full = [...cState.inputBuf, cState.input].join('\n')
+
+      if (full) {
+        cActions.pushStash(full)
+        cActions.clearIn()
+        actions.sys('stashed')
+      }
+
+      return
+    }
+
+    if (isAction(key, ch, 'p')) {
+      const full = [...cState.inputBuf, cState.input].join('\n')
+      const popped = cActions.cycleStash(full)
+
+      if (popped) {
+        cActions.clearIn()
+        cActions.setInput(popped)
+      } else {
+        actions.sys('stash empty')
+      }
+
+      return
+    }
+
     if (isVoiceToggleKey(key, ch)) {
       return voiceRecordToggle()
     }

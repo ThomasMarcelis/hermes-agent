@@ -134,11 +134,15 @@ export type MaybePromise<T> = Promise<T> | T
 
 export interface ComposerActions {
   clearIn: () => void
+  cycleStash: (currentText: string) => string
   dequeue: () => string | undefined
   enqueue: (text: string) => void
+  getStashList: () => string[]
   handleTextPaste: (event: PasteEvent) => MaybePromise<ComposerPasteResult | null>
   openEditor: () => Promise<void>
+  popStashAt: (index: number) => string
   pushHistory: (text: string) => void
+  pushStash: (text: string) => boolean
   removeQueue: (index: number) => void
   replaceQueue: (index: number, text: string) => void
   setCompIdx: StateSetter<number>
@@ -155,6 +159,7 @@ export interface ComposerRefs {
   historyRef: MutableRefObject<string[]>
   queueEditRef: MutableRefObject<null | number>
   queueRef: MutableRefObject<string[]>
+  stashRef: MutableRefObject<string[]>
   submitRef: MutableRefObject<(value: string) => void>
 }
 
@@ -168,6 +173,7 @@ export interface ComposerState {
   pasteSnips: PasteSnippet[]
   queueEditIdx: null | number
   queuedDisplay: string[]
+  stashCount: number
 }
 
 export interface UseComposerStateOptions {
@@ -257,12 +263,17 @@ export interface GatewayEventHandlerContext {
 
 export interface SlashHandlerContext {
   composer: {
+    cycleStash: (currentText: string) => string
     enqueue: (text: string) => void
+    getStashList: () => string[]
     hasSelection: boolean
     paste: (quiet?: boolean) => void
+    popStashAt: (index: number) => string
+    pushStash: (text: string) => boolean
     queueRef: MutableRefObject<string[]>
     selection: SelectionApi
     setInput: StateSetter<string>
+    stashRef: MutableRefObject<string[]>
   }
   gateway: GatewayServices
   local: {
@@ -316,6 +327,7 @@ export interface AppLayoutComposerProps {
   pagerPageSize: number
   queueEditIdx: null | number
   queuedDisplay: string[]
+  stashCount: number
   submit: (value: string) => void
   updateInput: StateSetter<string>
 }
