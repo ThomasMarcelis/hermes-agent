@@ -435,7 +435,7 @@ def _matches_tag_filter(item: Any, tags: list[str] | None, tags_match: str) -> b
         return True
     item_tags = _item_tags(item)
     if not item_tags:
-        return tags_match in {"any", "all"}
+        return False
     if tags_match in {"all", "all_strict"}:
         return all(tag in item_tags for tag in tags)
     return any(tag in item_tags for tag in tags)
@@ -445,7 +445,7 @@ def _matches_metadata_filter(item: Any, metadata_filter: dict[str, str] | None) 
     if not metadata_filter:
         return True
     metadata = _item_metadata(item)
-    return all(str(metadata.get(key)) == expected for key, expected in metadata_filter.items())
+    return all(key in metadata and str(metadata[key]) == expected for key, expected in metadata_filter.items())
 
 
 def _filter_memory_items(

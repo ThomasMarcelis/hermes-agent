@@ -614,6 +614,28 @@ class TestToolHandlers:
         assert "Keyword Memory 2" not in result["result"]
         assert result["returned"] == 1
 
+    def test_recall_list_method_excludes_untagged_items_when_filtering_tags(self, provider_with_config):
+        p = provider_with_config(recall_tags=["tag1"])
+        p._client.memory.list_memories.return_value = SimpleNamespace(
+            items=[
+                {"text": "Tagged memory", "fact_type": "world", "tags": ["tag1"]},
+                {"text": "Wrong-tag memory", "fact_type": "world", "tags": ["tag2"]},
+                {"text": "Untagged memory", "fact_type": "world"},
+            ],
+            total=3,
+            limit=50,
+            offset=0,
+        )
+
+        result = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "keyword", "method": "list"}
+        ))
+
+        assert "Tagged memory" in result["result"]
+        assert "Wrong-tag memory" not in result["result"]
+        assert "Untagged memory" not in result["result"]
+        assert result["returned"] == 1
+
     def test_recall_list_method_applies_metadata_filter(self, provider):
         result = json.loads(provider.handle_tool_call(
             "hindsight_recall",
@@ -623,6 +645,35 @@ class TestToolHandlers:
         assert "Keyword Memory 1" not in result["result"]
         assert "Keyword Memory 2" in result["result"]
         assert result["returned"] == 1
+
+    def test_recall_list_method_metadata_filter_requires_present_key(self, provider):
+        provider._client.memory.list_memories.return_value = SimpleNamespace(
+            items=[
+                {"text": "Missing tenant", "metadata": {}},
+                {"text": "Matching tenant", "metadata": {"tenant": "alpha"}},
+            ],
+            total=2,
+            limit=50,
+            offset=0,
+        )
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall",
+            {"query": "keyword", "method": "list", "metadata": {"tenant": "alpha"}},
+        ))
+
+        assert "Matching tenant" in result["result"]
+        assert "Missing tenant" not in result["result"]
+        assert result["returned"] == 1
+
+    def test_recall_list_method_ignores_invalid_metadata_filter(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall",
+            {"query": "keyword", "method": "list", "metadata": "not-json"},
+        ))
+
+        assert "Keyword Memory 1" in result["result"]
+        assert "Keyword Memory 2" in result["result"]
 
     def test_recall_list_method_passes_pagination_controls(self, provider):
         provider.handle_tool_call(
@@ -754,16 +805,12 @@ class TestToolHandlers:
         assert "Beta Entity" not in result["result"]
         assert "Beta observation" not in result["result"]
 
-    def test_recall_entity_method_handles_current_client_models(self, provider):
-        from hindsight_client_api.models.entity_observation_response import (
-            EntityObservationResponse,
-        )
-        from hindsight_client_api.models.entity_state_response import EntityStateResponse
-        from hindsight_client_api.models.recall_result import RecallResult
-
+    def test_recall_entity_method_handles_current_client_model_shape(self, provider):
+        # Mirrors the fields exposed by current hindsight_client_api models without
+        # importing the optional Hindsight client package in the repo test suite.
         provider._client.arecall.return_value = SimpleNamespace(
             results=[
-                RecallResult(
+                SimpleNamespace(
                     id="r1",
                     text="Model-backed memory",
                     type="world",
@@ -772,12 +819,10 @@ class TestToolHandlers:
                 )
             ],
             entities={
-                "ent-model": EntityStateResponse(
+                "ent-model": SimpleNamespace(
                     entity_id="ent-model",
                     canonical_name="Model Entity",
-                    observations=[
-                        EntityObservationResponse(text="Model observation", mentioned_at=None)
-                    ],
+                    observations=[SimpleNamespace(text="Model observation", mentioned_at=None)],
                 )
             },
         )
