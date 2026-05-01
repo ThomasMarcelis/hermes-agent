@@ -1770,9 +1770,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: query")
             method = str(args.get("method") or "recall").strip()
             if method not in _VALID_RECALL_METHODS:
-                return tool_error(
-                    "Invalid recall method. Expected one of: recall, list, entity"
+                logger.debug(
+                    "Tool hindsight_recall: invalid method %r; falling back to recall",
+                    method,
                 )
+                method = "recall"
             try:
                 if method == "list":
                     return self._handle_recall_list(args, query)

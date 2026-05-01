@@ -368,7 +368,7 @@ The setup wizard installs dependencies automatically and only installs what's ne
 | `recall_tags_match` | `any` | Tag matching mode: `any`, `all`, `any_strict`, or `all_strict` |
 | `recall_max_tokens` | `4096` | Default token cap for recall results |
 
-`hindsight_recall` also accepts per-call `budget`, `max_tokens`, `types`, `tags`, `tags_match`, `metadata`, and `tag_groups` controls. `method="list"` uses Hindsight's public memory-list API and supports `limit`/`offset`; because that list API does not accept tag groups, `tag_groups` only applies to the default recall/entity paths.
+`hindsight_recall` defaults to semantic/entity-graph recall and accepts `method="recall"`, `method="list"`, or `method="entity"`. Unknown method values fall back to the default recall path. Per-call controls include `budget`, `max_tokens`, `types`, `tags`, `tags_match`, exact-match `metadata`, and `tag_groups`. `method="list"` uses Hindsight's public memory-list API, supports `limit`/`offset`, and filters returned items by type, tag, and metadata. Because the public list API does not accept tag groups, `tag_groups` applies only to the default recall/entity paths. `method="entity"` formats entity names and observations from Hindsight's current entity response shape and supports `max_entity_tokens`.
 
 See [plugin README](https://github.com/NousResearch/hermes-agent/blob/main/plugins/memory/hindsight/README.md) for the full configuration reference.
 

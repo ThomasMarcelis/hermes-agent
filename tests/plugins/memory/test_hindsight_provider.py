@@ -570,12 +570,14 @@ class TestToolHandlers:
         assert call_kwargs["tags"] == ["configured"]
         assert call_kwargs["tags_match"] == "all"
 
-    def test_recall_rejects_unknown_method(self, provider):
+    def test_recall_invalid_method_falls_back_to_default_recall(self, provider):
         result = json.loads(provider.handle_tool_call(
             "hindsight_recall", {"query": "test", "method": "unknown"}
         ))
-        assert "error" in result
-        provider._client.arecall.assert_not_called()
+        assert "Memory 1" in result["result"]
+        assert "Memory 2" in result["result"]
+        provider._client.arecall.assert_called_once()
+        provider._client.memory.list_memories.assert_not_called()
 
     def test_recall_list_method_uses_public_memory_api_and_formats_items(self, provider):
         result = json.loads(provider.handle_tool_call(
@@ -697,6 +699,38 @@ class TestToolHandlers:
         assert "Keyword Memory 1" in result["result"]
         assert "Keyword Memory 2" not in result["result"]
 
+    def test_recall_list_method_filters_type_field_variants(self, provider_with_config):
+        p = provider_with_config(recall_types=["observation"])
+        p._client.memory.list_memories.return_value = SimpleNamespace(
+            items=[
+                {"text": "World-only memory", "type": "world"},
+                {"text": "Experience-only memory", "fact_type": "experience"},
+                {"text": "Observation-only memory", "factType": "observation"},
+            ],
+            total=3,
+            limit=50,
+            offset=0,
+        )
+
+        result = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "keyword", "method": "list"}
+        ))
+
+        assert "Observation-only memory" in result["result"]
+        assert "World-only memory" not in result["result"]
+        assert "Experience-only memory" not in result["result"]
+        assert result["returned"] == 1
+
+    def test_recall_list_method_bounds_invalid_pagination_controls(self, provider):
+        provider.handle_tool_call(
+            "hindsight_recall",
+            {"query": "keyword", "method": "list", "limit": 500, "offset": -10},
+        )
+
+        call_kwargs = provider._client.memory.list_memories.call_args.kwargs
+        assert call_kwargs["limit"] == 200
+        assert call_kwargs["offset"] == 0
+
     def test_recall_method_applies_metadata_filter_to_returned_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(
             results=[
@@ -760,6 +794,15 @@ class TestToolHandlers:
         assert call_kwargs["max_tokens"] == 512
         assert call_kwargs["types"] == ["observation"]
         assert call_kwargs["max_entity_tokens"] == 512
+
+    def test_recall_entity_method_invalid_entity_budget_falls_back_to_default(self, provider):
+        provider.handle_tool_call(
+            "hindsight_recall",
+            {"query": "relationship", "method": "entity", "max_entity_tokens": -1},
+        )
+
+        call_kwargs = provider._client.arecall.call_args.kwargs
+        assert call_kwargs["max_entity_tokens"] == 2000
 
     def test_recall_entity_method_filters_entities_to_metadata_scoped_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(
@@ -1795,4 +1838,3 @@ class TestShutdown:
         embedded.close.assert_called_once()
         assert embedded._client is None
         assert provider._client is None
-
