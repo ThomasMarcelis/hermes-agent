@@ -168,6 +168,51 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
+_PATH_PREVIEW_TOOLS = frozenset({"read_file", "write_file", "patch"})
+
+
+def _should_preserve_preview_end(tool_name: str, key: str | None = None) -> bool:
+    """Return true for previews where the suffix is more useful than the prefix."""
+    return key == "path" or tool_name in _PATH_PREVIEW_TOOLS
+
+
+def _truncate_with_ellipsis(text: str, max_len: int, *, preserve_end: bool = False) -> str:
+    """Truncate text to *max_len*, optionally keeping the end instead of start."""
+    try:
+        limit = int(max_len)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if limit <= 3:
+        return "." * limit
+    if preserve_end:
+        return "..." + text[-(limit - 3):]
+    return text[:limit - 3] + "..."
+
+
+def truncate_tool_preview(
+    tool_name: str,
+    preview: str,
+    max_len: int,
+    *,
+    key: str | None = None,
+) -> str:
+    """Truncate a tool preview with path-aware suffix preservation.
+
+    Generic previews keep their beginning (commands, queries, prompts). Path
+    previews keep their end so chat surfaces with narrow/persistent progress
+    bubbles still show the actual file name instead of only the common home
+    directory prefix.
+    """
+    text = str(preview)
+    return _truncate_with_ellipsis(
+        text,
+        max_len,
+        preserve_end=_should_preserve_preview_end(tool_name, key),
+    )
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -273,7 +318,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     if not preview:
         return None
     if max_len > 0 and len(preview) > max_len:
-        preview = preview[:max_len - 3] + "..."
+        preview = truncate_tool_preview(tool_name, preview, max_len, key=key)
     return preview
 
 

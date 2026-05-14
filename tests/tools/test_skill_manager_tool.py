@@ -280,6 +280,26 @@ class TestPatchSkill:
         content = (tmp_path / "my-skill" / "SKILL.md").read_text()
         assert "Do the new thing." in content
 
+    @pytest.mark.parametrize("file_path_alias", ["SKILL.md", "./SKILL.md"])
+    def test_patch_skill_md_file_path_aliases_target_primary_doc(self, tmp_path, file_path_alias):
+        """Agents often pass file_path='SKILL.md' when patching the main file.
+
+        Treat that as equivalent to omitting file_path rather than rejecting it
+        as an invalid supporting-file path.
+        """
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _patch_skill(
+                "my-skill",
+                "Do the thing.",
+                "Do the aliased thing.",
+                file_path=file_path_alias,
+            )
+        assert result["success"] is True, result
+        content = (tmp_path / "my-skill" / "SKILL.md").read_text()
+        assert "Do the aliased thing." in content
+        assert "SKILL.md" in result["message"]
+
     def test_patch_nonexistent_string(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
@@ -529,6 +549,22 @@ class TestSkillManageDispatcher:
             raw = skill_manage(action="patch", name="test")
         result = json.loads(raw)
         assert result["success"] is False
+
+    def test_patch_via_dispatcher_accepts_skill_md_file_path_alias(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+            raw = skill_manage(
+                action="patch",
+                name="test-skill",
+                old_string="Do the thing.",
+                new_string="Do the dispatched thing.",
+                file_path="SKILL.md",
+            )
+        result = json.loads(raw)
+        assert result["success"] is True, result
+        assert "Do the dispatched thing." in (
+            tmp_path / "test-skill" / "SKILL.md"
+        ).read_text()
 
     def test_full_create_via_dispatcher(self, tmp_path):
         """Foreground create does NOT mark the skill as agent-created.

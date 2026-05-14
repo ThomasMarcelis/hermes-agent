@@ -334,6 +334,22 @@ def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Pat
     return target, None
 
 
+def _normalize_patch_file_path(file_path: Optional[str]) -> Optional[str]:
+    """Normalize patch target aliases.
+
+    ``skill_manage(action='patch')`` defaults to SKILL.md when ``file_path`` is
+    omitted. Agents commonly pass ``file_path='SKILL.md'`` or ``'./SKILL.md'``
+    for that same intent; treat those as omitted while keeping supporting-file
+    validation unchanged for every other path.
+    """
+    if not isinstance(file_path, str):
+        return file_path
+
+    if file_path.strip() in {"SKILL.md", "./SKILL.md"}:
+        return None
+    return file_path
+
+
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
     """
     Atomically write text content to a file.
@@ -482,6 +498,7 @@ def _patch_skill(
         return {"success": False, "error": f"Skill '{name}' not found."}
 
     skill_dir = existing["path"]
+    file_path = _normalize_patch_file_path(file_path)
 
     if file_path:
         # Patching a supporting file

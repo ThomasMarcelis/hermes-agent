@@ -11,6 +11,7 @@ from agent.display import (
     extract_edit_diff,
     get_cute_tool_message,
     set_tool_preview_max_len,
+    truncate_tool_preview,
     _render_inline_unified_diff,
     _summarize_rendered_diff_sections,
     render_edit_diff_with_delta,
@@ -68,6 +69,34 @@ class TestBuildToolPreview:
         result = build_tool_preview("terminal", {"command": long_cmd}, max_len=40)
         assert result is not None
         assert len(result) <= 43  # max_len + "..."
+
+    def test_path_preview_preserves_filename_when_truncated(self):
+        path = "/home/example/.hermes/knowledge/default/projects/deeply/nested/important-target-file.md"
+
+        result = build_tool_preview("read_file", {"path": path}, max_len=40)
+
+        assert result is not None
+        assert result.startswith("...")
+        assert result.endswith("important-target-file.md")
+        assert "/home/example" not in result
+
+    def test_gateway_cap_preserves_path_end_for_file_tools(self):
+        path = "/home/example/workspace/some/project/with/a/deep/path/final-report.md"
+
+        result = truncate_tool_preview("write_file", path, 40)
+
+        assert result.startswith("...")
+        assert result.endswith("final-report.md")
+        assert "/home/example" not in result
+
+    def test_gateway_cap_keeps_front_for_non_path_previews(self):
+        command = "python scripts/really-long-command-name.py --with --many --flags"
+
+        result = truncate_tool_preview("terminal", command, 40)
+
+        assert result.startswith("python scripts/")
+        assert result.endswith("...")
+        assert "--many --flags" not in result
 
     def test_process_tool_with_none_args(self):
         """Process tool special case should also handle None args."""
