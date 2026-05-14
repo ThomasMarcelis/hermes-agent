@@ -40,6 +40,7 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
+        "HINDSIGHT_RECALL_TAGS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -980,6 +981,19 @@ class TestSessionSwitchBufferFlush:
         provider._client.aretain_batch.assert_not_called()
         assert provider._session_id == "new-sid"
 
+    def test_parent_session_cleared_when_switching_to_root_session(self, provider):
+        """A later root/fresh session must not inherit stale parent tags."""
+        provider._parent_session_id = "old-parent"
+
+        provider.on_session_switch("root-sid", parent_session_id="")
+        provider.sync_turn("hello", "hi")
+        provider._retain_queue.join()
+
+        item = provider._client.aretain_batch.call_args.kwargs["items"][0]
+        assert provider._parent_session_id == ""
+        assert "session:root-sid" in item["tags"]
+        assert "parent:old-parent" not in item["tags"]
+
     def test_prefetch_result_cleared_on_switch(self, provider):
         """Stale recall text from the old session must not leak into the
         next session's first prefetch read."""
@@ -1219,8 +1233,8 @@ class TestConfigSchema:
             "recall_tags", "recall_tags_match",
             "auto_recall", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
-            "recall_max_tokens", "recall_max_input_chars",
-            "recall_prompt_preamble",
+            "recall_max_tokens", "reflect_budget", "reflect_max_tokens",
+            "recall_max_input_chars", "recall_prompt_preamble",
         }
         assert expected_keys.issubset(keys), f"Missing: {expected_keys - keys}"
 

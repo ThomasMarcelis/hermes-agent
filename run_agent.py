@@ -5673,6 +5673,23 @@ class AIAgent:
             except Exception:
                 pass
 
+    def release_memory_provider_resources(self) -> None:
+        """Shut down memory-provider resources without ending the session.
+
+        Gateway cache eviction/replacement is a Python-object lifecycle
+        boundary, not a logical conversation boundary: the user may resume
+        the same session later with the same task_id.  We therefore close
+        provider-owned clients, queues, and background threads so aiohttp
+        sessions do not leak, but deliberately skip ``on_session_end()`` and
+        context-engine finalization to avoid premature extraction/pollution.
+        """
+        if not self._memory_manager:
+            return
+        try:
+            self._memory_manager.shutdown_all()
+        except Exception:
+            pass
+
     def commit_memory_session(self, messages: list = None) -> None:
         """Trigger end-of-session extraction without tearing providers down.
         Called when session_id rotates (e.g. /new, context compression);
@@ -5750,23 +5767,25 @@ class AIAgent:
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
-        Used by the gateway when evicting this agent from _agent_cache for
-        memory-management reasons (LRU cap or idle TTL) — the session may
-        resume at any time with a freshly-built AIAgent that reuses the
-        same task_id / session_id, so we must NOT kill:
+        Used by the gateway after it has handled memory-provider resource
+        shutdown for _agent_cache eviction/replacement (LRU cap or idle TTL).
+        The session may resume at any time with a freshly-built AIAgent that
+        reuses the same task_id / session_id, so this method must NOT kill:
           - process_registry entries for task_id (user's bg shells)
           - terminal sandbox for task_id (cwd, env, shell state)
           - browser daemon for task_id (open tabs, cookies)
-          - memory provider (has its own lifecycle; keeps running)
 
         We DO close:
           - OpenAI/httpx client pool (big chunk of held memory + sockets;
             the rebuilt agent gets a fresh client anyway)
           - Active child subagents (per-turn artefacts; safe to drop)
 
-        Safe to call multiple times.  Distinct from close() — which is the
-        hard teardown for actual session boundaries (/new, /reset, session
-        expiry).
+        Memory-provider clients/queues are handled by
+        release_memory_provider_resources(), which intentionally skips
+        on_session_end() because cache eviction is not a logical session
+        boundary.  Safe to call multiple times.  Distinct from close() —
+        which is the hard teardown for actual session boundaries (/new,
+        /reset, session expiry).
         """
         # Close active child agents (per-turn; no cross-turn persistence).
         try:
@@ -10621,7 +10640,11 @@ class AIAgent:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=tool_call_id or "",
                 )
             except Exception:
                 pass
@@ -10674,7 +10697,19 @@ class AIAgent:
                     pass
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
-            return self._memory_manager.handle_tool_call(function_name, function_args)
+            start = time.monotonic()
+            result = self._memory_manager.handle_tool_call(function_name, function_args)
+            duration_ms = int((time.monotonic() - start) * 1000)
+            self._emit_post_tool_call_hook(
+                function_name,
+                function_args,
+                result,
+                task_id=effective_task_id or "",
+                session_id=self.session_id or "",
+                tool_call_id=tool_call_id or "",
+                duration_ms=duration_ms,
+            )
+            return result
         elif function_name == "clarify":
             from tools.clarify_tool import clarify_tool as _clarify_tool
             return _clarify_tool(
@@ -10692,6 +10727,33 @@ class AIAgent:
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
             )
+
+    def _emit_post_tool_call_hook(
+        self,
+        function_name: str,
+        function_args: dict,
+        result: str,
+        *,
+        task_id: str = "",
+        session_id: str = "",
+        tool_call_id: str = "",
+        duration_ms: int = 0,
+    ) -> None:
+        """Emit the observational post-tool hook for non-registry tool paths."""
+        try:
+            from hermes_cli.plugins import invoke_hook
+            invoke_hook(
+                "post_tool_call",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                duration_ms=max(0, int(duration_ms)),
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
@@ -10784,7 +10846,11 @@ class AIAgent:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=getattr(tool_call, "id", "") or "",
                 )
             except Exception:
                 block_message = None
@@ -11166,7 +11232,11 @@ class AIAgent:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=getattr(tool_call, "id", "") or "",
                 )
             except Exception:
                 pass
@@ -11391,6 +11461,15 @@ class AIAgent:
                     logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 finally:
                     tool_duration = time.time() - tool_start_time
+                    self._emit_post_tool_call_hook(
+                        function_name,
+                        function_args,
+                        function_result,
+                        task_id=effective_task_id or "",
+                        session_id=self.session_id or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        duration_ms=int(tool_duration * 1000),
+                    )
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
                     if spinner:
                         spinner.stop(cute_msg)

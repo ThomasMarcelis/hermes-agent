@@ -435,6 +435,7 @@ def _reset_module_state():
             _sc_mod._CRON_AUTO_DELIVER_PLATFORM,
             _sc_mod._CRON_AUTO_DELIVER_CHAT_ID,
             _sc_mod._CRON_AUTO_DELIVER_THREAD_ID,
+            _sc_mod._CRON_AUTO_DELIVER_TARGETS,
         ):
             _cv.set(_sc_mod._UNSET)
     except Exception:

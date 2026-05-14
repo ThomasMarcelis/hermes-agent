@@ -1299,20 +1299,30 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
-        # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
-        # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
-        # Per-chat overrides live in two sets populated from ``_voice_mode``:
+        # Auto-TTS on assistant replies: ``_auto_tts_default`` is the global
+        # master switch (``voice.auto_tts`` in config.yaml, pushed by
+        # GatewayRunner on connect). ``_auto_tts_default_mode`` controls whether
+        # that global switch is voice-input scoped (``voice_only``; legacy safe
+        # default) or applies to every message type (``all``; useful for
+        # dedicated voice+narration profiles).
+        # Per-chat overrides live in sets populated from ``_voice_mode``:
         #   - ``_auto_tts_enabled_chats``: chat explicitly opted in via ``/voice on``
         #     or ``/voice tts`` (mode is ``voice_only`` or ``all``). Fires even when
-        #     the global default is False.
+        #     the global default is False for voice-message replies. A chat in this
+        #     set but not in ``_auto_tts_all_chats`` is an explicit voice-only opt-in.
+        #   - ``_auto_tts_all_chats``: chat explicitly opted in via ``/voice tts``
+        #     (mode is ``all``). Fires for text-message replies too.
         #   - ``_auto_tts_disabled_chats``: chat explicitly opted out via
         #     ``/voice off`` (mode is ``off``). Suppresses auto-TTS even when the
         #     global default is True.
         # The gate in _process_message() is:
-        #   fire if chat in _auto_tts_enabled_chats
-        #     OR (_auto_tts_default and chat not in _auto_tts_disabled_chats)
+        #   text event: explicit all chat, else global all mode when enabled
+        #   voice event: explicit voice/all chat, else global default when enabled
+        #   explicit off always suppresses both.
         self._auto_tts_default: bool = False
+        self._auto_tts_default_mode: str = "voice_only"
         self._auto_tts_enabled_chats: set = set()
+        self._auto_tts_all_chats: set = set()
         self._auto_tts_disabled_chats: set = set()
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
@@ -1389,20 +1399,100 @@ class BasePlatformAdapter(ABC):
     def fatal_error_retryable(self) -> bool:
         return self._fatal_error_retryable
 
+    @staticmethod
+    def _normalize_auto_tts_default_mode(mode: Any) -> str:
+        """Normalize ``voice.auto_tts_mode`` to a supported default scope.
+
+        ``voice_only`` preserves the historical safe behavior: global auto-TTS
+        speaks replies to voice input only. ``all`` is profile-wide narration for
+        every message type, including future text chats/threads. Unknown values
+        fall back to ``voice_only`` so a typo cannot unexpectedly make every
+        chat noisy or expensive.
+        """
+        value = str(mode or "voice_only").strip().lower().replace("-", "_")
+        if value in {"all", "always", "all_messages", "text_and_voice"}:
+            return "all"
+        if value in {"voice", "voice_only", "voice_input", "voice_input_only"}:
+            return "voice_only"
+        return "voice_only"
+
+    @staticmethod
+    def _should_auto_tts_for_state(
+        *,
+        chat_id: str,
+        message_type: MessageType,
+        auto_tts_default: bool,
+        auto_tts_default_mode: Any = "voice_only",
+        enabled_chats: Optional[set] = None,
+        all_chats: Optional[set] = None,
+        disabled_chats: Optional[set] = None,
+    ) -> bool:
+        """Pure auto-TTS decision used by adapter and runner paths.
+
+        The base adapter owns non-streamed post-processing, while
+        ``GatewayRunner`` owns streamed responses because the base adapter never
+        receives a final body there. Keeping the precedence here prevents those
+        paths from drifting apart.
+        """
+        disabled_chats = disabled_chats or set()
+        enabled_chats = enabled_chats or set()
+        all_chats = all_chats or set()
+
+        if chat_id in disabled_chats:
+            return False
+        if chat_id in all_chats:
+            return True
+        if chat_id in enabled_chats:
+            return message_type == MessageType.VOICE
+
+        if not bool(auto_tts_default):
+            return False
+        if message_type == MessageType.VOICE:
+            return True
+        default_mode = BasePlatformAdapter._normalize_auto_tts_default_mode(
+            auto_tts_default_mode
+        )
+        return default_mode == "all"
+
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
         """Whether auto-TTS on voice input should fire for ``chat_id``.
 
-        Decision layers (Issue #16007):
-          1. Explicit ``/voice on`` or ``/voice tts`` → always fire (even if
-             ``voice.auto_tts`` is False).
-          2. Explicit ``/voice off`` → never fire.
+        Decision layers:
+          1. Explicit ``/voice off`` → never fire.
+          2. Explicit ``/voice on`` or ``/voice tts`` → fire for voice input
+             (even if ``voice.auto_tts`` is False).
           3. Fall back to the global ``voice.auto_tts`` config default.
         """
-        if chat_id in self._auto_tts_enabled_chats:
-            return True
-        if chat_id in self._auto_tts_disabled_chats:
-            return False
-        return bool(self._auto_tts_default)
+        return BasePlatformAdapter._should_auto_tts_for_state(
+            chat_id=chat_id,
+            message_type=MessageType.VOICE,
+            auto_tts_default=bool(getattr(self, "_auto_tts_default", False)),
+            auto_tts_default_mode=getattr(self, "_auto_tts_default_mode", "voice_only"),
+            enabled_chats=getattr(self, "_auto_tts_enabled_chats", set()),
+            all_chats=getattr(self, "_auto_tts_all_chats", set()),
+            disabled_chats=getattr(self, "_auto_tts_disabled_chats", set()),
+        )
+
+    def _should_auto_tts_for_event(self, chat_id: str, message_type: MessageType) -> bool:
+        """Whether an assistant reply to this event should include TTS audio.
+
+        Precedence is deliberately explicit and profile-friendly:
+          1. ``/voice off`` suppresses all speech for this chat.
+          2. ``/voice tts`` speaks replies to all message types for this chat.
+          3. ``/voice on`` speaks voice-input replies only for this chat, even
+             under a profile-wide ``voice.auto_tts_mode=all`` default.
+          4. Otherwise, fall back to the profile global ``voice.auto_tts`` and
+             ``voice.auto_tts_mode`` defaults.
+        """
+        return BasePlatformAdapter._should_auto_tts_for_state(
+            chat_id=chat_id,
+            message_type=message_type,
+            auto_tts_default=bool(getattr(self, "_auto_tts_default", False)),
+            auto_tts_default_mode=getattr(self, "_auto_tts_default_mode", "voice_only"),
+            enabled_chats=getattr(self, "_auto_tts_enabled_chats", set()),
+            all_chats=getattr(self, "_auto_tts_all_chats", set()),
+            disabled_chats=getattr(self, "_auto_tts_disabled_chats", set()),
+        )
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
@@ -2356,15 +2446,51 @@ class BasePlatformAdapter(ABC):
                 _prev = existing_cb
                 _new = callback
 
-                def _chained() -> None:
+                def _chained() -> Any:
+                    """Run chained callbacks in order, preserving awaitables.
+
+                    Some callback producers are synchronous (e.g. release a
+                    busy/background-review latch) while others are async (e.g.
+                    send a deferred /goal status message).  Callers may execute
+                    purely-sync chains without awaiting, but BasePlatformAdapter's
+                    processing lifecycle awaits any coroutine returned here.
+                    """
                     try:
-                        _prev()
+                        prev_result = _prev()
                     except Exception:
                         logger.debug("Post-delivery callback failed", exc_info=True)
+                        prev_result = None
+
+                    if inspect.isawaitable(prev_result):
+                        async def _await_prev_then_new() -> None:
+                            try:
+                                await prev_result
+                            except Exception:
+                                logger.debug("Post-delivery callback failed", exc_info=True)
+                            try:
+                                new_result = _new()
+                                if inspect.isawaitable(new_result):
+                                    await new_result
+                            except Exception:
+                                logger.debug("Post-delivery callback failed", exc_info=True)
+
+                        return _await_prev_then_new()
+
                     try:
-                        _new()
+                        new_result = _new()
                     except Exception:
                         logger.debug("Post-delivery callback failed", exc_info=True)
+                        return None
+
+                    if inspect.isawaitable(new_result):
+                        async def _await_new() -> None:
+                            try:
+                                await new_result
+                            except Exception:
+                                logger.debug("Post-delivery callback failed", exc_info=True)
+
+                        return _await_new()
+                    return None
 
                 callback = _chained
 
@@ -3106,20 +3232,30 @@ class BasePlatformAdapter(ABC):
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
                 
-                # Auto-TTS: if voice message, generate audio FIRST (before sending text)
-                # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
-                # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
-                # True globally and no ``/voice off`` has been issued.
+                # Auto-TTS: generate audio FIRST (before sending text) when this
+                # chat is explicitly in all-message narration mode, or when a
+                # voice-input reply should get spoken audio.
                 _tts_path = None
-                if (self._should_auto_tts_for_chat(event.source.chat_id)
-                        and event.message_type == MessageType.VOICE
+                if (self._should_auto_tts_for_event(event.source.chat_id, event.message_type)
                         and text_content
                         and not media_files):
                     try:
-                        from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+                        from tools.tts_tool import (
+                            text_to_speech_tool,
+                            check_tts_requirements,
+                            _strip_markdown_for_tts,
+                        )
                         if check_tts_requirements():
                             import json as _json
-                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+                            # Preserve ElevenLabs v3-style audio tags such as
+                            # ``[whispers]`` / ``[sighs]`` for narration while
+                            # still removing normal Markdown noise.  Do not
+                            # pre-truncate here: ``text_to_speech_tool`` owns
+                            # provider/model-aware limits, so a Discord reply
+                            # that later splits into multiple text messages
+                            # still gets one coherent TTS request from the
+                            # full pre-split response.
+                            speech_text = _strip_markdown_for_tts(text_content).strip()
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
                             tts_result_str = await asyncio.to_thread(

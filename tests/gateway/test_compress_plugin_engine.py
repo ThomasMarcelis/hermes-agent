@@ -15,6 +15,7 @@ The fix promotes the preflight into an optional ABC method
 """
 
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
@@ -80,6 +81,19 @@ def _make_history() -> list[dict[str, str]]:
     ]
 
 
+@pytest.fixture
+def hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import goals
+
+    goals._DB_CACHE.clear()
+    yield home
+    goals._DB_CACHE.clear()
+
+
 def _make_runner(history: list[dict[str, str]]):
     from gateway.run import GatewayRunner
 
@@ -87,8 +101,9 @@ def _make_runner(history: list[dict[str, str]]):
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
+    source = _make_source()
     session_entry = SessionEntry(
-        session_key=build_session_key(_make_source()),
+        session_key=build_session_key(source),
         session_id="sess-1",
         created_at=datetime.now(),
         updated_at=datetime.now(),
@@ -131,7 +146,7 @@ async def test_compress_works_with_plugin_context_engine():
         patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
         patch("gateway.run._resolve_gateway_model", return_value="test-model"),
         patch("run_agent.AIAgent", return_value=agent_instance),
-        patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
     ):
         result = await runner._handle_compress_command(_make_event("/compress"))
 
@@ -165,9 +180,51 @@ async def test_compress_respects_plugin_has_content_to_compress_false():
         patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
         patch("gateway.run._resolve_gateway_model", return_value="test-model"),
         patch("run_agent.AIAgent", return_value=agent_instance),
-        patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
     ):
         result = await runner._handle_compress_command(_make_event("/compress"))
 
     assert "Nothing to compress" in result
     agent_instance._compress_context.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_compress_moves_active_goal_to_rotated_session(hermes_home):
+    """Gateway /compress observes a session split and moves standing /goal state."""
+    from hermes_cli.goals import GoalManager, load_goal
+
+    history = _make_history()
+    compressed = [history[0], history[-1]]
+    runner = _make_runner(history)
+    GoalManager("sess-1").set("keep working after gateway compression")
+
+    plugin_engine = _FakePluginEngine()
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance.context_compressor = plugin_engine
+    agent_instance.session_id = "sess-1"
+
+    def _compress_context(*_args, **_kwargs):
+        agent_instance.session_id = "sess-2"
+        return compressed, ""
+
+    agent_instance._compress_context.side_effect = _compress_context
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        result = await runner._handle_compress_command(_make_event("/compress"))
+
+    assert "Compression failed" not in result
+    moved = load_goal("sess-2")
+    old = load_goal("sess-1")
+    assert moved is not None
+    assert moved.status == "active"
+    assert moved.goal == "keep working after gateway compression"
+    assert old is not None
+    assert old.status == "cleared"
+    assert "compression" in (old.last_reason or "")

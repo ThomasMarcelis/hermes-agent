@@ -866,6 +866,122 @@ class TestAgentCacheActiveSafety:
         )
 
 
+class TestAgentCacheSoftMemoryCleanup:
+    """Soft cache eviction must close per-agent memory clients without
+    destroying resumable terminal/browser/background-process state.
+    """
+
+    def _runner(self):
+        from collections import OrderedDict
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._agent_cache = OrderedDict()
+        runner._agent_cache_lock = threading.Lock()
+        runner._running_agents = {}
+        return runner
+
+    def test_release_evicted_agent_soft_closes_memory_resources_before_llm_clients(self):
+        """Hindsight owns aiohttp sessions, so soft cache eviction must close
+        memory-provider resources, not only the LLM/httpx client pool.
+        """
+        runner = self._runner()
+        calls: list[str] = []
+
+        class FakeAgent:
+            def release_memory_provider_resources(self):
+                calls.append("memory-resources")
+
+            def release_clients(self):
+                calls.append("llm-clients")
+
+            def shutdown_memory_provider(self, messages=None):  # pragma: no cover - must not be used here
+                calls.append("session-end")
+
+            def close(self):  # pragma: no cover - must not be used here
+                calls.append("full-close")
+
+        runner._release_evicted_agent_soft(FakeAgent())
+
+        assert calls == ["memory-resources", "llm-clients"]
+
+    def test_release_memory_provider_resources_does_not_fire_session_end_hooks(self):
+        """Soft eviction is not a logical session boundary: close provider
+        clients/queues, but do not run on_session_end extraction.
+        """
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        manager = MagicMock()
+        agent._memory_manager = manager
+
+        agent.release_memory_provider_resources()
+
+        manager.shutdown_all.assert_called_once_with()
+        manager.on_session_end.assert_not_called()
+
+    def test_store_cached_agent_soft_releases_replaced_signature_mismatch(self):
+        """When config/cache signature changes for the same session_key, the
+        old cached agent is otherwise overwritten and loses its last owner.
+        """
+        runner = self._runner()
+        old_agent = MagicMock(spec=["release_memory_provider_resources", "release_clients"])
+        new_agent = MagicMock(spec=["release_memory_provider_resources", "release_clients"])
+        released: list = []
+        runner._release_evicted_agent_soft = lambda agent: released.append(agent)
+        runner._agent_cache["session-key"] = (old_agent, "old-sig")
+
+        runner._store_cached_agent("session-key", new_agent, "new-sig")
+
+        import time as _t
+        deadline = _t.time() + 2.0
+        while _t.time() < deadline and not released:
+            _t.sleep(0.02)
+
+        assert runner._agent_cache["session-key"] == (new_agent, "new-sig")
+        assert released == [old_agent]
+        new_agent.release_memory_provider_resources.assert_not_called()
+        new_agent.release_clients.assert_not_called()
+
+    def test_store_cached_agent_does_not_release_active_replaced_agent(self):
+        """Defensive guard: never soft-release an agent still marked mid-turn."""
+        runner = self._runner()
+        active_agent = MagicMock(spec=["release_memory_provider_resources", "release_clients"])
+        new_agent = MagicMock(spec=["release_memory_provider_resources", "release_clients"])
+        released: list = []
+        runner._release_evicted_agent_soft = lambda agent: released.append(agent)
+        runner._agent_cache["session-key"] = (active_agent, "old-sig")
+        runner._running_agents["session-key"] = active_agent
+
+        runner._store_cached_agent("session-key", new_agent, "new-sig")
+
+        assert runner._agent_cache["session-key"] == (new_agent, "new-sig")
+        assert released == []
+
+    def test_store_cached_agent_marks_replacement_mru_before_cap_enforcement(self, monkeypatch):
+        """A newly built replacement is the active/current session and must not
+        inherit the old cache entry's LRU position before cap enforcement.
+        """
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 2)
+        runner = self._runner()
+        old_agent = MagicMock(spec=["release_memory_provider_resources", "release_clients"])
+        other_a = MagicMock(spec=["release_memory_provider_resources", "release_clients"])
+        other_b = MagicMock(spec=["release_memory_provider_resources", "release_clients"])
+        new_agent = MagicMock(spec=["release_memory_provider_resources", "release_clients"])
+        runner._agent_cache["session-key"] = (old_agent, "old-sig")
+        runner._agent_cache["other-a"] = (other_a, "sig")
+        runner._agent_cache["other-b"] = (other_b, "sig")
+        runner._release_evicted_agent_soft = lambda agent: None
+
+        runner._store_cached_agent("session-key", new_agent, "new-sig")
+
+        assert "session-key" in runner._agent_cache
+        assert runner._agent_cache["session-key"] == (new_agent, "new-sig")
+        assert list(runner._agent_cache.keys()) == ["other-b", "session-key"]
+
+
 class TestAgentCacheSpilloverLive:
     """Live E2E: fill cache with real AIAgent instances and stress it."""
 
