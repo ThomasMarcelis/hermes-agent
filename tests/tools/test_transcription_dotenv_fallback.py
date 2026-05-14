@@ -22,6 +22,7 @@ def isolate_env(monkeypatch):
     for key in (
         "GROQ_API_KEY",
         "MISTRAL_API_KEY",
+        "ELEVENLABS_API_KEY",
         "XAI_API_KEY",
         "XAI_STT_BASE_URL",
     ):
@@ -83,6 +84,16 @@ class TestProviderSelectionGate:
              patch("hermes_cli.config.load_env",
                    return_value={"MISTRAL_API_KEY": "dotenv-secret"}):
             assert tt._get_provider({"enabled": True, "provider": "mistral"}) == "none"
+
+    def test_explicit_elevenlabs_sees_dotenv(self):
+        from tools import transcription_tools as tt
+
+        with patch.object(tt, "_HAS_FASTER_WHISPER", False), \
+             patch.object(tt, "_HAS_ELEVENLABS", True), \
+             patch.object(tt, "_has_local_command", return_value=False), \
+             patch("hermes_cli.config.load_env",
+                   return_value={"ELEVENLABS_API_KEY": "dotenv-secret"}):
+            assert tt._get_provider({"enabled": True, "provider": "elevenlabs"}) == "elevenlabs"
 
     def test_explicit_xai_sees_dotenv(self):
         from tools import transcription_tools as tt
@@ -168,6 +179,31 @@ class TestTranscribeCallSitesReadDotenv:
 
         assert result["success"] is True
         assert seen_keys == ["mistral-dotenv-key"]
+
+    def test_transcribe_elevenlabs_forwards_dotenv_key(self):
+        from tools import transcription_tools as tt
+
+        seen_keys: list = []
+
+        class FakeSpeechToText:
+            def convert(self, **kwargs):
+                result = MagicMock()
+                result.text = "hello"
+                return result
+
+        class FakeElevenLabs:
+            def __init__(self, *, api_key=None):
+                seen_keys.append(api_key)
+                self.speech_to_text = FakeSpeechToText()
+
+        with patch.object(tt, "get_env_value", return_value="elevenlabs-dotenv-key"), \
+             patch.object(tt, "_import_elevenlabs_client", return_value=FakeElevenLabs), \
+             patch.object(tt, "_load_stt_config", return_value={}), \
+             patch("builtins.open", MagicMock()):
+            result = tt._transcribe_elevenlabs("/tmp/fake.mp3", "scribe_v2")
+
+        assert result["success"] is True
+        assert seen_keys == ["elevenlabs-dotenv-key"]
 
     def test_transcribe_xai_forwards_dotenv_key(self):
         from tools import transcription_tools as tt

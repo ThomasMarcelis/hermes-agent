@@ -49,6 +49,7 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
 
@@ -119,6 +120,32 @@ class TestGetProviderFallbackPriority:
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
             from tools.transcription_tools import _get_provider
             assert _get_provider({}) == "local"
+
+
+class TestGetProviderElevenLabs:
+    """ElevenLabs Scribe provider selection tests."""
+
+    def test_elevenlabs_when_key_set(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "el-test")
+        with patch("tools.transcription_tools._HAS_ELEVENLABS", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "elevenlabs"}) == "elevenlabs"
+
+    def test_elevenlabs_explicit_no_key_returns_none(self, monkeypatch):
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+        with patch("tools.transcription_tools._HAS_ELEVENLABS", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "elevenlabs"}) == "none"
+
+    def test_auto_detect_can_use_elevenlabs_after_free_local_groq_options(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "el-test")
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._has_local_command", return_value=False), \
+             patch("tools.transcription_tools._HAS_OPENAI", False), \
+             patch("tools.transcription_tools._HAS_MISTRAL", False), \
+             patch("tools.transcription_tools._HAS_ELEVENLABS", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({}) == "elevenlabs"
 
 
 # ============================================================================
@@ -907,6 +934,168 @@ class TestTranscribeAudioDispatch:
             transcribe_audio(sample_ogg, model=None)
 
         assert mock_openai.call_args[0][1] == "gpt-4o-transcribe"
+
+    def test_dispatches_to_elevenlabs(self, sample_ogg):
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "elevenlabs"}), \
+             patch("tools.transcription_tools._get_provider", return_value="elevenlabs"), \
+             patch("tools.transcription_tools._transcribe_elevenlabs",
+                   return_value={"success": True, "transcript": "hi", "provider": "elevenlabs"}) as mock_elevenlabs:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is True
+        assert result["provider"] == "elevenlabs"
+        mock_elevenlabs.assert_called_once()
+
+    def test_config_elevenlabs_model_used(self, sample_ogg):
+        config = {"elevenlabs": {"model": "scribe_v2"}}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="elevenlabs"), \
+             patch("tools.transcription_tools._transcribe_elevenlabs",
+                   return_value={"success": True, "transcript": "hi"}) as mock_elevenlabs:
+            from tools.transcription_tools import transcribe_audio
+            transcribe_audio(sample_ogg, model=None)
+
+        assert mock_elevenlabs.call_args[0][1] == "scribe_v2"
+
+
+# ============================================================================
+# _transcribe_elevenlabs
+# ============================================================================
+
+
+class TestTranscribeElevenLabs:
+    def test_no_key(self, monkeypatch):
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+        from tools.transcription_tools import _transcribe_elevenlabs
+        result = _transcribe_elevenlabs("/tmp/test.ogg", "scribe_v2")
+        assert result["success"] is False
+        assert "ELEVENLABS_API_KEY" in result["error"]
+
+    def test_successful_transcription_uses_scribe_v2(self, monkeypatch, sample_ogg):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        captured = {}
+
+        class FakeSpeechToText:
+            def convert(
+                self,
+                *,
+                file,
+                model_id,
+                language_code=None,
+                tag_audio_events=None,
+                num_speakers=None,
+                timestamps_granularity=None,
+                diarize=None,
+                enable_logging=None,
+                file_format=None,
+            ):
+                captured.update({
+                    "file": file,
+                    "model_id": model_id,
+                    "language_code": language_code,
+                    "tag_audio_events": tag_audio_events,
+                    "num_speakers": num_speakers,
+                    "timestamps_granularity": timestamps_granularity,
+                    "diarize": diarize,
+                    "enable_logging": enable_logging,
+                    "file_format": file_format,
+                })
+                result = MagicMock()
+                result.text = "hello from scribe"
+                result.language_code = "eng"
+                return result
+
+        class FakeElevenLabs:
+            def __init__(self, *, api_key):
+                captured["api_key"] = api_key
+                self.speech_to_text = FakeSpeechToText()
+
+        with patch("tools.transcription_tools._import_elevenlabs_client", return_value=FakeElevenLabs), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"elevenlabs": {}}):
+            from tools.transcription_tools import _transcribe_elevenlabs
+            result = _transcribe_elevenlabs(sample_ogg, "scribe_v2")
+
+        assert result["success"] is True
+        assert result["transcript"] == "hello from scribe"
+        assert result["provider"] == "elevenlabs"
+        assert result["model"] == "scribe_v2"
+        assert captured["api_key"] == "test-key"
+        assert captured["model_id"] == "scribe_v2"
+        assert captured["file"].name == sample_ogg
+
+    def test_forwards_optional_scribe_parameters(self, monkeypatch, sample_ogg):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        captured = {}
+
+        class FakeSpeechToText:
+            def convert(
+                self,
+                *,
+                file,
+                model_id,
+                language_code=None,
+                tag_audio_events=None,
+                num_speakers=None,
+                timestamps_granularity=None,
+                diarize=None,
+                enable_logging=None,
+                file_format=None,
+            ):
+                captured.update({
+                    "file": file,
+                    "model_id": model_id,
+                    "language_code": language_code,
+                    "tag_audio_events": tag_audio_events,
+                    "num_speakers": num_speakers,
+                    "timestamps_granularity": timestamps_granularity,
+                    "diarize": diarize,
+                    "enable_logging": enable_logging,
+                    "file_format": file_format,
+                })
+                return {"text": "hola"}
+
+        class FakeElevenLabs:
+            def __init__(self, *, api_key):
+                self.speech_to_text = FakeSpeechToText()
+
+        config = {
+            "elevenlabs": {
+                "language_code": "nl",
+                "diarize": True,
+                "tag_audio_events": False,
+                "timestamps_granularity": "word",
+                "num_speakers": 2,
+            }
+        }
+        with patch("tools.transcription_tools._import_elevenlabs_client", return_value=FakeElevenLabs), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config):
+            from tools.transcription_tools import _transcribe_elevenlabs
+            result = _transcribe_elevenlabs(sample_ogg, "scribe_v2")
+
+        assert result["success"] is True
+        assert captured["language_code"] == "nl"
+        assert captured["diarize"] is True
+        assert captured["tag_audio_events"] is False
+        assert captured["timestamps_granularity"] == "word"
+        assert captured["num_speakers"] == 2
+
+    def test_invalid_num_speakers_returns_failure(self, monkeypatch, sample_ogg):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+
+        class FakeElevenLabs:
+            def __init__(self, *, api_key):
+                raise AssertionError("Client should not be constructed with invalid config")
+
+        config = {"elevenlabs": {"num_speakers": "many"}}
+        with patch("tools.transcription_tools._import_elevenlabs_client", return_value=FakeElevenLabs), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config):
+            from tools.transcription_tools import _transcribe_elevenlabs
+            result = _transcribe_elevenlabs(sample_ogg, "scribe_v2")
+
+        assert result["success"] is False
+        assert "ElevenLabs Scribe transcription failed" in result["error"]
+        assert "test-key" not in result["error"]
 
 
 # ============================================================================
