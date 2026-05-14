@@ -32,13 +32,18 @@ from agent.auxiliary_client import (
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    """Strip provider env vars so each test starts clean."""
+    """Strip provider env vars and provider-health cache so each test starts clean."""
+    from agent.auxiliary_client import _reset_aux_unhealthy_cache
+
+    _reset_aux_unhealthy_cache()
     for key in (
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
     ):
         monkeypatch.delenv(key, raising=False)
+    yield
+    _reset_aux_unhealthy_cache()
 
 
 @pytest.fixture
@@ -277,21 +282,20 @@ class TestAnthropicOAuthFlag:
 
 
 class TestBuildCodexClient:
-    def test_pool_without_selected_entry_falls_back_to_auth_store(self):
+    def test_pool_without_selected_entry_does_not_fall_back_to_auth_store(self):
         with (
             patch("agent.auxiliary_client._select_pool_entry", return_value=(True, None)),
-            patch("agent.auxiliary_client._read_codex_access_token", return_value="codex-auth-token"),
+            patch("agent.auxiliary_client._read_codex_access_token", side_effect=AssertionError("exhausted pool must not reuse auth store")),
             patch("agent.auxiliary_client.OpenAI") as mock_openai,
         ):
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import _build_codex_client
 
-            client, model = _build_codex_client("gpt-5.4")
+            client, model = _build_codex_client("codex-test-model")
 
-        assert client is not None
-        assert model == "gpt-5.4"
-        assert mock_openai.call_args.kwargs["api_key"] == "codex-auth-token"
-        assert mock_openai.call_args.kwargs["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
 
     def test_rejects_missing_model(self):
         """Callers must pass an explicit model; no hardcoded default."""
@@ -336,15 +340,15 @@ class TestBuildCodexClient:
         ):
             aux.shutdown_cached_clients()
             try:
-                first_client, first_model = aux._get_cached_client("openai-codex", "gpt-5.4")
+                first_client, first_model = aux._get_cached_client("openai-codex", "codex-test-model")
                 pool.entry = _Entry("cred-b", "tok-b")
-                second_client, second_model = aux._get_cached_client("openai-codex", "gpt-5.4")
+                second_client, second_model = aux._get_cached_client("openai-codex", "codex-test-model")
             finally:
                 aux.shutdown_cached_clients()
 
         assert first_client is not second_client
-        assert first_model == "gpt-5.4"
-        assert second_model == "gpt-5.4"
+        assert first_model == "codex-test-model"
+        assert second_model == "codex-test-model"
         assert mock_openai.call_count == 2
 
 
@@ -580,12 +584,12 @@ class TestGetTextAuxiliaryClient:
         ):
             from agent.auxiliary_client import _build_codex_client
 
-            client, model = _build_codex_client("gpt-5.4")
+            client, model = _build_codex_client("codex-test-model")
 
         from agent.auxiliary_client import CodexAuxiliaryClient
 
         assert isinstance(client, CodexAuxiliaryClient)
-        assert model == "gpt-5.4"
+        assert model == "codex-test-model"
 
     def test_returns_none_when_nothing_available(self, monkeypatch):
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
@@ -1231,7 +1235,7 @@ class TestKimiTemperatureOmitted:
         "model",
         [
             "anthropic/claude-sonnet-4-6",
-            "gpt-5.4",
+            "codex-test-model",
             "deepseek-chat",
         ],
     )
@@ -1528,14 +1532,14 @@ class TestAuxiliaryAuthRefreshRetry:
         with (
             patch(
                 "agent.auxiliary_client.resolve_vision_provider_client",
-                side_effect=[("openai-codex", failing_client, "gpt-5.4"), ("openai-codex", fresh_client, "gpt-5.4")],
+                side_effect=[("openai-codex", failing_client, "codex-test-model"), ("openai-codex", fresh_client, "codex-test-model")],
             ),
             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True) as mock_refresh,
         ):
             resp = call_llm(
                 task="vision",
                 provider="openai-codex",
-                model="gpt-5.4",
+                model="codex-test-model",
                 messages=[{"role": "user", "content": "hi"}],
             )
 
@@ -1552,14 +1556,14 @@ class TestAuxiliaryAuthRefreshRetry:
         fresh_client.chat.completions.create.return_value = _DummyResponse("fresh-non-vision")
 
         with (
-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
-            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")]),
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "codex-test-model", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "codex-test-model"), (fresh_client, "codex-test-model")]),
             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True) as mock_refresh,
         ):
             resp = call_llm(
                 task="compression",
                 provider="openai-codex",
-                model="gpt-5.4",
+                model="codex-test-model",
                 messages=[{"role": "user", "content": "hi"}],
             )
 
@@ -1607,14 +1611,14 @@ class TestAuxiliaryAuthRefreshRetry:
         with (
             patch(
                 "agent.auxiliary_client.resolve_vision_provider_client",
-                side_effect=[("openai-codex", failing_client, "gpt-5.4"), ("openai-codex", fresh_client, "gpt-5.4")],
+                side_effect=[("openai-codex", failing_client, "codex-test-model"), ("openai-codex", fresh_client, "codex-test-model")],
             ),
             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True) as mock_refresh,
         ):
             resp = await async_call_llm(
                 task="vision",
                 provider="openai-codex",
-                model="gpt-5.4",
+                model="codex-test-model",
                 messages=[{"role": "user", "content": "hi"}],
             )
 
@@ -1709,8 +1713,8 @@ class TestAuxiliaryPoolRotationRetry:
         pool = _Pool()
 
         with (
-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
-            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")]),
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "codex-test-model", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "codex-test-model"), (fresh_client, "codex-test-model")]),
             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
             patch("agent.auxiliary_client.load_pool", return_value=pool),
             patch("agent.auxiliary_client._try_payment_fallback") as mock_fallback,
@@ -1718,12 +1722,12 @@ class TestAuxiliaryPoolRotationRetry:
             resp = call_llm(
                 task="compression",
                 provider="openai-codex",
-                model="gpt-5.4",
+                model="codex-test-model",
                 messages=[{"role": "user", "content": "hi"}],
             )
 
         assert resp.choices[0].message.content == "rotated-sync"
-        assert stale_client.chat.completions.create.call_count == 2
+        assert stale_client.chat.completions.create.call_count == 1
         assert fresh_client.chat.completions.create.call_count == 1
         assert len(pool.rotate_calls) == 1
         assert pool.rotate_calls[0]["status_code"] == 429
@@ -1759,8 +1763,8 @@ class TestAuxiliaryPoolRotationRetry:
         pool = _Pool()
 
         with (
-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
-            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")]),
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "codex-test-model", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "codex-test-model"), (fresh_client, "codex-test-model")]),
             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
             patch("agent.auxiliary_client.load_pool", return_value=pool),
             patch("agent.auxiliary_client._try_payment_fallback") as mock_fallback,
@@ -1768,12 +1772,12 @@ class TestAuxiliaryPoolRotationRetry:
             resp = await async_call_llm(
                 task="compression",
                 provider="openai-codex",
-                model="gpt-5.4",
+                model="codex-test-model",
                 messages=[{"role": "user", "content": "hi"}],
             )
 
         assert resp.choices[0].message.content == "rotated-async"
-        assert stale_client.chat.completions.create.await_count == 2
+        assert stale_client.chat.completions.create.await_count == 1
         assert fresh_client.chat.completions.create.await_count == 1
         assert len(pool.rotate_calls) == 1
         assert pool.rotate_calls[0]["status_code"] == 429
@@ -2075,7 +2079,7 @@ class TestCodexAuxiliaryAdapterTimeout:
                 return FakeStream()
 
         fake_client = SimpleNamespace(responses=FakeResponses())
-        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+        adapter = _CodexCompletionsAdapter(fake_client, "aux-model")
 
         response = adapter.create(
             messages=[{"role": "user", "content": "summarize this"}],
@@ -2112,7 +2116,7 @@ class TestCodexAuxiliaryAdapterTimeout:
                 return SlowAliveStream()
 
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
-        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+        adapter = _CodexCompletionsAdapter(fake_client, "aux-model")
 
         started = time.monotonic()
         with pytest.raises(TimeoutError):
@@ -2166,10 +2170,10 @@ class TestAuxiliaryClientPoisonedCacheEviction:
         real = SimpleNamespace(api_key="k", base_url="https://chatgpt.com/backend-api/codex",
                                responses=SimpleNamespace(stream=lambda **k: None),
                                close=lambda: None)
-        wrapper = CodexAuxiliaryClient(real, "gpt-5.5")
+        wrapper = CodexAuxiliaryClient(real, "aux-model")
         with _client_cache_lock:
             _client_cache.clear()
-            _client_cache[("openai-codex", False, None, None, None)] = (wrapper, "gpt-5.5", None)
+            _client_cache[("openai-codex", False, None, None, None)] = (wrapper, "aux-model", None)
         try:
             # Eviction by the inner OpenAI client must remove the wrapper entry.
             assert _evict_cached_client_instance(real) is True
@@ -2204,12 +2208,12 @@ class TestAuxiliaryClientPoisonedCacheEviction:
         real = SimpleNamespace(api_key="k", base_url="https://chatgpt.com/backend-api/codex",
                                responses=SimpleNamespace(stream=lambda **k: None),
                                close=lambda: None)
-        sync_wrapper = CodexAuxiliaryClient(real, "gpt-5.5")
+        sync_wrapper = CodexAuxiliaryClient(real, "aux-model")
         async_wrapper = AsyncCodexAuxiliaryClient(sync_wrapper)
         with _client_cache_lock:
             _client_cache.clear()
-            _client_cache[("openai-codex", False, None, None, None)] = (sync_wrapper, "gpt-5.5", None)
-            _client_cache[("openai-codex", True, None, None, None)] = (async_wrapper, "gpt-5.5", None)
+            _client_cache[("openai-codex", False, None, None, None)] = (sync_wrapper, "aux-model", None)
+            _client_cache[("openai-codex", True, None, None, None)] = (async_wrapper, "aux-model", None)
         try:
             assert _evict_cached_client_instance(real) is True
             assert ("openai-codex", False, None, None, None) not in _client_cache
@@ -2254,13 +2258,13 @@ class TestAuxiliaryClientPoisonedCacheEviction:
                 closed["flag"] = True
 
         fake_real = FakeClient()
-        wrapper = CodexAuxiliaryClient(fake_real, "gpt-5.5")
+        wrapper = CodexAuxiliaryClient(fake_real, "aux-model")
         cache_key = ("openai-codex", False, None, None, None)
         with _client_cache_lock:
             _client_cache.clear()
-            _client_cache[cache_key] = (wrapper, "gpt-5.5", None)
+            _client_cache[cache_key] = (wrapper, "aux-model", None)
         try:
-            adapter = _CodexCompletionsAdapter(fake_real, "gpt-5.5")
+            adapter = _CodexCompletionsAdapter(fake_real, "aux-model")
             with pytest.raises(TimeoutError):
                 adapter.create(
                     messages=[{"role": "user", "content": "x"}],
@@ -2291,15 +2295,15 @@ class TestAuxiliaryClientPoisonedCacheEviction:
         cache_key = ("openai-codex", False, None, None, None)
         with _client_cache_lock:
             _client_cache.clear()
-            _client_cache[cache_key] = (poisoned, "gpt-5.5", None)
+            _client_cache[cache_key] = (poisoned, "aux-model", None)
 
         try:
             with patch(
                 "agent.auxiliary_client._resolve_task_provider_model",
-                return_value=("openai-codex", "gpt-5.5", None, None, None),
+                return_value=("openai-codex", "aux-model", None, None, None),
             ), patch(
                 "agent.auxiliary_client._get_cached_client",
-                return_value=(poisoned, "gpt-5.5"),
+                return_value=(poisoned, "aux-model"),
             ):
                 with pytest.raises(ConnectionError):
                     call_llm(
@@ -2324,15 +2328,15 @@ class TestAuxiliaryClientPoisonedCacheEviction:
         cache_key = ("openai-codex", True, None, None, None)
         with _client_cache_lock:
             _client_cache.clear()
-            _client_cache[cache_key] = (poisoned, "gpt-5.5", None)
+            _client_cache[cache_key] = (poisoned, "aux-model", None)
 
         try:
             with patch(
                 "agent.auxiliary_client._resolve_task_provider_model",
-                return_value=("openai-codex", "gpt-5.5", None, None, None),
+                return_value=("openai-codex", "aux-model", None, None, None),
             ), patch(
                 "agent.auxiliary_client._get_cached_client",
-                return_value=(poisoned, "gpt-5.5"),
+                return_value=(poisoned, "aux-model"),
             ):
                 with pytest.raises(ConnectionError):
                     await async_call_llm(
@@ -2632,6 +2636,74 @@ class TestAuxUnhealthyCache:
         # Step-2 also skipped openrouter and landed on nous
         or_try.assert_not_called()
         assert client is nous_client
+
+    def test_codex_pool_retry_failure_does_not_enter_generic_pool_recovery(self):
+        class _RateLimit429(Exception):
+            status_code = 429
+            body = {"error": {"type": "usage_limit_reached", "message": "Usage limit has been reached"}}
+
+        class _EntryA:
+            id = "entry-a"
+            label = "codex-primary"
+            last_status = None
+
+        class _EntryB:
+            id = "entry-b"
+            label = "codex-secondary"
+            last_status = None
+
+        class _Pool:
+            _current_id = "entry-a"
+
+            def __init__(self):
+                self.marked_ids = []
+                self._select_calls = 0
+
+            def has_credentials(self):
+                return True
+
+            def entries(self):
+                return [_EntryA(), _EntryB()]
+
+            def _mark_exhausted(self, entry, status_code, error_context):
+                self.marked_ids.append(entry.id)
+
+            def select(self):
+                self._select_calls += 1
+                if self._select_calls == 1:
+                    return _EntryB()
+                return None
+
+        stale_client = MagicMock()
+        stale_client.base_url = "https://chatgpt.com/backend-api/codex"
+        stale_client._hermes_pool_provider = "openai-codex"
+        stale_client._hermes_pool_entry_id = "entry-a"
+        stale_client.chat.completions.create.side_effect = _RateLimit429("entry-a exhausted")
+
+        retry_client = MagicMock()
+        retry_client.base_url = "https://chatgpt.com/backend-api/codex"
+        retry_client._hermes_pool_provider = "openai-codex"
+        retry_client._hermes_pool_entry_id = "entry-b"
+        retry_client.chat.completions.create.side_effect = _RateLimit429("entry-b exhausted")
+
+        pool = _Pool()
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "aux-model", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "aux-model"), (retry_client, "aux-model")]) as get_client,
+            patch("agent.auxiliary_client.load_pool", return_value=pool),
+            patch("agent.auxiliary_client._recover_provider_pool", side_effect=AssertionError("generic pool recovery must not run")),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            with pytest.raises(_RateLimit429):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+
+        assert pool.marked_ids == ["entry-a", "entry-b"]
+        assert stale_client.chat.completions.create.call_count == 1
+        assert retry_client.chat.completions.create.call_count == 1
+        assert get_client.call_count == 2
 
     def test_payment_fallback_skips_unhealthy(self):
         """_try_payment_fallback also consults the unhealthy cache so a 402

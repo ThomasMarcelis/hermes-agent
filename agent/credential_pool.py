@@ -924,10 +924,13 @@ class CredentialPool:
 
         if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
             entry = min(available, key=lambda e: e.request_count)
-            # Increment usage counter so subsequent selections distribute load
+            # Increment and persist usage counter so fresh pool loads in other
+            # sessions/processes continue to distribute load, instead of every
+            # new resolver seeing stale on-disk counts and choosing the same key.
             updated = replace(entry, request_count=entry.request_count + 1)
             self._replace_entry(entry, updated)
-            self._current_id = entry.id
+            self._persist()
+            self._current_id = updated.id
             return updated
 
         if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
@@ -960,18 +963,61 @@ class CredentialPool:
             entry = self.current() or self._select_unlocked()
             if entry is None:
                 return None
-            _label = entry.label or entry.id[:8]
+            return self._mark_entry_exhausted_and_rotate_unlocked(
+                entry,
+                status_code=status_code,
+                error_context=error_context,
+            )
+
+    def mark_entry_exhausted_and_rotate(
+        self,
+        entry_id: str,
+        *,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[PooledCredential]:
+        """Mark a specific credential entry exhausted, then select another entry.
+
+        Auxiliary clients can outlive the pool's current selection.  When such a
+        cached client reports rate-limit/exhaustion, callers must mark the exact
+        entry that created that client rather than whichever entry happens to be
+        current now.
+        """
+        normalized_id = str(entry_id or "").strip()
+        if not normalized_id:
+            return None
+        with self._lock:
+            entry = next((candidate for candidate in self._entries if candidate.id == normalized_id), None)
+            if entry is None:
+                return None
+            return self._mark_entry_exhausted_and_rotate_unlocked(
+                entry,
+                status_code=status_code,
+                error_context=error_context,
+            )
+
+    def _mark_entry_exhausted_and_rotate_unlocked(
+        self,
+        entry: PooledCredential,
+        *,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[PooledCredential]:
+        _label = entry.label or entry.id[:8]
+        if entry.last_status != STATUS_EXHAUSTED:
             logger.info(
                 "credential pool: marking %s exhausted (status=%s), rotating",
                 _label, status_code,
             )
             self._mark_exhausted(entry, status_code, error_context)
-            self._current_id = None
-            next_entry = self._select_unlocked()
-            if next_entry:
-                _next_label = next_entry.label or next_entry.id[:8]
-                logger.info("credential pool: rotated to %s", _next_label)
-            return next_entry
+        else:
+            logger.info("credential pool: %s is already exhausted; rotating", _label)
+        self._current_id = None
+        next_entry = self._select_unlocked()
+        if next_entry:
+            _next_label = next_entry.label or next_entry.id[:8]
+            logger.info("credential pool: rotated to %s", _next_label)
+        return next_entry
 
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.

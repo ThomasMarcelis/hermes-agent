@@ -59,6 +59,52 @@ def test_fill_first_selection_skips_recently_exhausted_entry(tmp_path, monkeypat
     assert pool.current().id == "cred-2"
 
 
+def test_mark_entry_exhausted_and_rotate_marks_exact_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "current",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "cached-client-entry",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "***",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    current = pool.select()
+    assert current is not None
+    assert current.id == "cred-1"
+
+    next_entry = pool.mark_entry_exhausted_and_rotate("cred-2", status_code=429)
+
+    assert next_entry is not None
+    assert next_entry.id == "cred-1"
+    by_id = {entry.id: entry for entry in pool.entries()}
+    assert by_id["cred-2"].last_status == "exhausted"
+    assert by_id["cred-2"].last_error_code == 429
+    assert by_id["cred-1"].last_status in (None, "ok")
+
+
 def test_select_clears_expired_exhaustion(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
@@ -740,6 +786,70 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     assert entry is not None
     assert entry.id == "key-b"
     assert entry.access_token == "sk-or-light"
+
+
+def test_least_used_strategy_persists_incremented_request_count(tmp_path, monkeypatch):
+    """least_used should persist request_count so fresh pool loads spread work."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "agent.credential_pool.get_pool_strategy",
+        lambda _provider: "least_used",
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_env",
+        lambda provider, entries: (False, set()),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "key-a",
+                        "label": "a",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-a",
+                        "request_count": 0,
+                    },
+                    {
+                        "id": "key-b",
+                        "label": "b",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-or-b",
+                        "request_count": 0,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    first_pool = load_pool("openrouter")
+    first = first_pool.select()
+    assert first is not None
+    assert first.id == "key-a"
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = persisted["credential_pool"]["openrouter"]
+    assert {entry["id"]: entry.get("request_count", 0) for entry in entries} == {
+        "key-a": 1,
+        "key-b": 0,
+    }
+
+    second_pool = load_pool("openrouter")
+    second = second_pool.select()
+    assert second is not None
+    assert second.id == "key-b"
 
 
 def test_thread_safety_concurrent_select(tmp_path, monkeypatch):

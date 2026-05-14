@@ -43,6 +43,7 @@ Payment / credit exhaustion fallback:
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
@@ -881,12 +882,22 @@ class CodexAuxiliaryClient:
     Also exposes .api_key and .base_url for introspection by async wrappers.
     """
 
-    def __init__(self, real_client: OpenAI, model: str):
+    def __init__(
+        self,
+        real_client: OpenAI,
+        model: str,
+        *,
+        pool_entry_id: Optional[str] = None,
+        pool_entry_label: Optional[str] = None,
+    ):
         self._real_client = real_client
         adapter = _CodexCompletionsAdapter(real_client, model)
         self.chat = _CodexChatShim(adapter)
         self.api_key = real_client.api_key
         self.base_url = real_client.base_url
+        self._hermes_pool_provider = "openai-codex" if pool_entry_id else None
+        self._hermes_pool_entry_id = pool_entry_id
+        self._hermes_pool_entry_label = pool_entry_label
 
     def close(self):
         self._real_client.close()
@@ -929,6 +940,9 @@ class AsyncCodexAuxiliaryClient:
         # subsequent async aux call with 'Connection error' until the
         # gateway restarts.
         self._real_client = sync_wrapper._real_client
+        self._hermes_pool_provider = getattr(sync_wrapper, "_hermes_pool_provider", None)
+        self._hermes_pool_entry_id = getattr(sync_wrapper, "_hermes_pool_entry_id", None)
+        self._hermes_pool_entry_label = getattr(sync_wrapper, "_hermes_pool_entry_label", None)
 
 
 class _AnthropicCompletionsAdapter:
@@ -1407,7 +1421,6 @@ def _try_openrouter(explicit_api_key: str = None) -> Tuple[Optional[OpenAI], Opt
     if pool_present:
         or_key = explicit_api_key or _pool_runtime_api_key(entry)
         if not or_key:
-            _mark_provider_unhealthy("openrouter", ttl=60)
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
         logger.debug("Auxiliary client: OpenRouter via pool")
@@ -1416,7 +1429,6 @@ def _try_openrouter(explicit_api_key: str = None) -> Tuple[Optional[OpenAI], Opt
 
     or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
-        _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
@@ -1456,7 +1468,6 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     nous = _read_nous_auth()
     runtime = _resolve_nous_runtime_api(force_refresh=False)
     if runtime is None and not nous:
-        _mark_provider_unhealthy("nous", ttl=60)
         return None, None
     global auxiliary_is_nous
     auxiliary_is_nous = True
@@ -1748,16 +1759,23 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
+    pool_entry_id = None
+    pool_entry_label = None
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
+        if entry is None:
+            logger.info("Auxiliary client: openai-codex pool has no available entries")
+            return None, None
         codex_token = _pool_runtime_api_key(entry)
-        if codex_token:
-            base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
-        else:
-            codex_token = _read_codex_access_token()
-            if not codex_token:
-                return None, None
-            base_url = _CODEX_AUX_BASE_URL
+        if not codex_token:
+            logger.info(
+                "Auxiliary client: selected openai-codex pool entry %s has no runtime token",
+                getattr(entry, "label", None) or getattr(entry, "id", "")[:8],
+            )
+            return None, None
+        pool_entry_id = getattr(entry, "id", None)
+        pool_entry_label = getattr(entry, "label", None)
+        base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
     else:
         codex_token = _read_codex_access_token()
         if not codex_token:
@@ -1769,7 +1787,12 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
         base_url=base_url,
         default_headers=_codex_cloudflare_headers(codex_token),
     )
-    return CodexAuxiliaryClient(real_client, model), model
+    return CodexAuxiliaryClient(
+        real_client,
+        model,
+        pool_entry_id=pool_entry_id,
+        pool_entry_label=pool_entry_label,
+    ), model
 
 
 def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
@@ -2117,13 +2140,22 @@ def _is_unsupported_temperature_error(exc: Exception) -> bool:
 
 
 def _evict_cached_clients(provider: str) -> None:
-    """Drop cached auxiliary clients for a provider so fresh creds are used."""
+    """Drop cached auxiliary clients for a provider so fresh creds are used.
+
+    Cache keys may be `auto` even when auto resolved to a concrete backend
+    (notably openai-codex when it is the main provider). Also inspect client
+    metadata so evicting `openai-codex` removes auto-cached Codex clients.
+    """
     normalized = _normalize_aux_provider(provider)
     with _client_cache_lock:
-        stale_keys = [
-            key for key in _client_cache
-            if _normalize_aux_provider(str(key[0])) == normalized
-        ]
+        stale_keys = []
+        for key, (client, _default_model, _bound_loop) in _client_cache.items():
+            key_provider = _normalize_aux_provider(str(key[0]))
+            client_provider = _normalize_aux_provider(
+                str(getattr(client, "_hermes_pool_provider", "") or "")
+            )
+            if key_provider == normalized or client_provider == normalized:
+                stale_keys.append(key)
         for key in stale_keys:
             client = _client_cache.get(key, (None, None, None))[0]
             if client is not None:
@@ -4089,6 +4121,304 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+def _extract_aux_api_error_context(error: Exception) -> Dict[str, Any]:
+    """Extract reset/message details from auxiliary provider errors."""
+    context: Dict[str, Any] = {}
+    body = getattr(error, "body", None)
+    payload = None
+    if isinstance(body, dict):
+        payload = body.get("error") if isinstance(body.get("error"), dict) else body
+    if isinstance(payload, dict):
+        reason = payload.get("type") or payload.get("code") or payload.get("error")
+        if isinstance(reason, str) and reason.strip():
+            context["reason"] = reason.strip()
+        message = payload.get("message") or payload.get("error_description")
+        if isinstance(message, str) and message.strip():
+            context["message"] = message.strip()
+        for key in ("resets_at", "reset_at"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                context["reset_at"] = value
+                break
+        retry_after = payload.get("retry_after")
+        if retry_after not in (None, "") and "reset_at" not in context:
+            try:
+                context["reset_at"] = time.time() + float(retry_after)
+            except (TypeError, ValueError):
+                pass
+
+    if "message" not in context:
+        raw_message = str(error).strip()
+        if raw_message:
+            context["message"] = raw_message[:500]
+
+    if "reset_at" not in context:
+        message = context.get("message") or ""
+        if isinstance(message, str):
+            reset_match = re.search(r"resets_at['\"]?:\s*(\d+)", message)
+            if reset_match:
+                context["reset_at"] = reset_match.group(1)
+            else:
+                delay_match = re.search(
+                    r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)",
+                    message,
+                    re.IGNORECASE,
+                )
+                if delay_match:
+                    value = float(delay_match.group(1))
+                    seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
+                    context["reset_at"] = time.time() + seconds
+                else:
+                    sec_match = re.search(
+                        r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
+                        message,
+                        re.IGNORECASE,
+                    )
+                    if sec_match:
+                        context["reset_at"] = time.time() + float(sec_match.group(1))
+    return context
+
+
+def _is_codex_pool_recoverable_error(provider: str, client: Any, exc: Exception) -> bool:
+    """True when a Codex OAuth auxiliary error should rotate the same-provider pool."""
+    client_provider = getattr(client, "_hermes_pool_provider", None)
+    if _normalize_aux_provider(provider) != "openai-codex" and client_provider != "openai-codex":
+        return False
+    status = getattr(exc, "status_code", None)
+    err_lower = str(exc).lower()
+    if status in (401, 402, 429):
+        return True
+    if type(exc).__name__ == "RateLimitError":
+        return True
+    return any(marker in err_lower for marker in (
+        "usage_limit_reached",
+        "usage limit has been reached",
+        "insufficient_quota",
+        "quota exceeded",
+    ))
+
+
+def _mark_codex_aux_pool_entry_exhausted(
+    client: Any,
+    exc: Exception,
+    *,
+    status_code: Optional[int] = None,
+) -> bool:
+    """Mark the exact Codex pool entry bound to an auxiliary client exhausted.
+
+    Auxiliary clients are cached independently from the main AIAgent runtime. If
+    the main model rotates away from an exhausted Codex account, a previously
+    cached auxiliary client can otherwise keep using the old token. The metadata
+    attached in _build_codex_client lets us mark and evict the precise entry
+    instead of accidentally exhausting whatever the pool currently selected.
+    """
+    entry_id = getattr(client, "_hermes_pool_entry_id", None)
+    if not entry_id:
+        logger.debug("Auxiliary Codex pool rotation skipped: client has no pool entry metadata")
+        return False
+    try:
+        pool = load_pool("openai-codex")
+    except Exception as load_err:
+        logger.debug("Auxiliary Codex pool rotation skipped: could not load pool: %s", load_err)
+        return False
+    if not pool or not pool.has_credentials():
+        return False
+
+    if not hasattr(pool, "entries") and hasattr(pool, "mark_exhausted_and_rotate"):
+        # Backward-compatible path for older/test pool doubles that expose only
+        # mark-and-rotate. Real CredentialPool instances expose entries(), which
+        # lets us mark the exact cached entry below.
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=status_code or getattr(exc, "status_code", None) or 429,
+            error_context=_extract_aux_api_error_context(exc),
+        )
+        _evict_cached_clients("openai-codex")
+        return bool(next_entry)
+
+    entry = next((candidate for candidate in pool.entries() if candidate.id == entry_id), None)
+    if entry is None:
+        logger.debug("Auxiliary Codex pool rotation skipped: pool entry %s no longer exists", entry_id)
+        return False
+
+    effective_status = status_code or getattr(exc, "status_code", None) or 429
+    label = getattr(entry, "label", None) or entry_id[:8]
+    if hasattr(pool, "mark_entry_exhausted_and_rotate"):
+        next_entry = pool.mark_entry_exhausted_and_rotate(
+            entry_id,
+            status_code=effective_status,
+            error_context=_extract_aux_api_error_context(exc),
+        )
+        _evict_cached_clients("openai-codex")
+        if next_entry:
+            next_label = getattr(next_entry, "label", None) or getattr(next_entry, "id", "")[:8]
+            logger.info("Auxiliary Codex pool: rotated to %s", next_label)
+            return True
+        logger.info("Auxiliary Codex pool: no alternate entry available after exhausting %s", label)
+        return False
+
+    if getattr(entry, "last_status", None) != "exhausted":
+        pool._mark_exhausted(  # compatibility for older pool doubles without mark-by-id API
+            entry,
+            effective_status,
+            _extract_aux_api_error_context(exc),
+        )
+        logger.info(
+            "Auxiliary Codex pool: marking %s exhausted (status=%s), rotating",
+            label,
+            effective_status,
+        )
+    else:
+        logger.info(
+            "Auxiliary Codex pool: %s is already exhausted; selecting next entry",
+            label,
+        )
+
+    try:
+        pool._current_id = None  # ensure select() does not reuse the exhausted entry
+        next_entry = pool.select()
+    finally:
+        _evict_cached_clients("openai-codex")
+    if next_entry:
+        next_label = getattr(next_entry, "label", None) or getattr(next_entry, "id", "")[:8]
+        logger.info("Auxiliary Codex pool: rotated to %s", next_label)
+        return True
+    logger.info("Auxiliary Codex pool: no alternate entry available after exhausting %s", label)
+    return False
+
+
+def _retry_codex_pool_once_sync(
+    *,
+    task: Optional[str],
+    resolved_provider: str,
+    resolved_model: Optional[str],
+    resolved_base_url: Optional[str],
+    resolved_api_key: Optional[str],
+    resolved_api_mode: Optional[str],
+    main_runtime: Optional[Dict[str, Any]],
+    client: Any,
+    first_err: Exception,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    timeout: float,
+    extra_body: dict,
+) -> Tuple[bool, Optional[Any], Optional[Exception]]:
+    if not _is_codex_pool_recoverable_error(resolved_provider, client, first_err):
+        return False, None, None
+    if not _mark_codex_aux_pool_entry_exhausted(client, first_err):
+        return False, None, None
+
+    retry_client = None
+    retry_model = None
+    try:
+        if task == "vision":
+            _, retry_client, retry_model = resolve_vision_provider_client(
+                provider=resolved_provider,
+                model=resolved_model,
+                async_mode=False,
+            )
+        else:
+            retry_client, retry_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
+                is_vision=False,
+            )
+        if retry_client is None:
+            return False, None, None
+        retry_base = str(getattr(retry_client, "base_url", "") or "")
+        retry_kwargs = _build_call_kwargs(
+            resolved_provider,
+            retry_model or resolved_model,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=timeout,
+            extra_body=extra_body,
+            base_url=retry_base or resolved_base_url,
+        )
+        if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
+            retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+        return True, _validate_llm_response(
+            retry_client.chat.completions.create(**retry_kwargs), task
+        ), None
+    except Exception as retry_err:
+        if retry_client is not None and _is_codex_pool_recoverable_error(resolved_provider, retry_client, retry_err):
+            _mark_codex_aux_pool_entry_exhausted(retry_client, retry_err)
+        return True, None, retry_err
+
+
+async def _retry_codex_pool_once_async(
+    *,
+    task: Optional[str],
+    resolved_provider: str,
+    resolved_model: Optional[str],
+    resolved_base_url: Optional[str],
+    resolved_api_key: Optional[str],
+    resolved_api_mode: Optional[str],
+    client: Any,
+    first_err: Exception,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    timeout: float,
+    extra_body: dict,
+) -> Tuple[bool, Optional[Any], Optional[Exception]]:
+    if not _is_codex_pool_recoverable_error(resolved_provider, client, first_err):
+        return False, None, None
+    if not _mark_codex_aux_pool_entry_exhausted(client, first_err):
+        return False, None, None
+
+    retry_client = None
+    retry_model = None
+    try:
+        if task == "vision":
+            _, retry_client, retry_model = resolve_vision_provider_client(
+                provider=resolved_provider,
+                model=resolved_model,
+                async_mode=True,
+            )
+        else:
+            retry_client, retry_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                async_mode=True,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                is_vision=False,
+            )
+        if retry_client is None:
+            return False, None, None
+        retry_base = str(getattr(retry_client, "base_url", "") or "")
+        retry_kwargs = _build_call_kwargs(
+            resolved_provider,
+            retry_model or resolved_model,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=timeout,
+            extra_body=extra_body,
+            base_url=retry_base or resolved_base_url,
+        )
+        if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
+            retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+        return True, _validate_llm_response(
+            await retry_client.chat.completions.create(**retry_kwargs), task
+        ), None
+    except Exception as retry_err:
+        if retry_client is not None and _is_codex_pool_recoverable_error(resolved_provider, retry_client, retry_err):
+            _mark_codex_aux_pool_entry_exhausted(retry_client, retry_err)
+        return True, None, retry_err
+
+
 def call_llm(
     task: str = None,
     *,
@@ -4275,6 +4605,40 @@ def call_llm(
                     raise
                 first_err = retry_err
 
+        # ── Codex OAuth credential-pool rotation for auxiliary clients ─────
+        # Main AIAgent calls already rotate the pool on 429/402/401. Auxiliary
+        # calls keep their own cached clients, so explicitly evict/rebuild them
+        # when the exact Codex pool entry backing the cached client is exhausted.
+        handled_codex_pool, codex_pool_response, codex_pool_err = _retry_codex_pool_once_sync(
+            task=task,
+            resolved_provider=resolved_provider,
+            resolved_model=resolved_model,
+            resolved_base_url=resolved_base_url,
+            resolved_api_key=resolved_api_key,
+            resolved_api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
+            client=client,
+            first_err=first_err,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=effective_timeout,
+            extra_body=effective_extra_body,
+        )
+        codex_pool_retry_failed = False
+        if handled_codex_pool:
+            if codex_pool_err is None:
+                return codex_pool_response
+            # The Codex-specific path already marked the exact cached pool
+            # entry that failed, evicted stale clients, selected the next
+            # entry, and retried once. Do not fall through into the generic
+            # same-provider pool recovery below: it cannot identify the exact
+            # retry entry and may reuse the original stale client, falsely
+            # exhausting additional credentials.
+            first_err = codex_pool_err
+            codex_pool_retry_failed = True
+
         # ── Nous auth refresh parity with main agent ──────────────────
         client_is_nous = (
             resolved_provider == "nous"
@@ -4327,7 +4691,11 @@ def call_llm(
 
         # ── Same-provider credential-pool recovery ─────────────────────
         pool_provider = _recoverable_pool_provider(resolved_provider, client)
-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+        if (
+            pool_provider
+            and not codex_pool_retry_failed
+            and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err))
+        ):
             recovery_err = first_err
             if _is_rate_limit_error(first_err):
                 try:
@@ -4626,6 +4994,39 @@ async def async_call_llm(
                     raise
                 first_err = retry_err
 
+        # ── Codex OAuth credential-pool rotation for auxiliary clients ─────
+        # Main AIAgent calls already rotate the pool on 429/402/401. Auxiliary
+        # calls keep their own cached clients, so explicitly evict/rebuild them
+        # when the exact Codex pool entry backing the cached client is exhausted.
+        handled_codex_pool, codex_pool_response, codex_pool_err = await _retry_codex_pool_once_async(
+            task=task,
+            resolved_provider=resolved_provider,
+            resolved_model=resolved_model,
+            resolved_base_url=resolved_base_url,
+            resolved_api_key=resolved_api_key,
+            resolved_api_mode=resolved_api_mode,
+            client=client,
+            first_err=first_err,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=effective_timeout,
+            extra_body=effective_extra_body,
+        )
+        codex_pool_retry_failed = False
+        if handled_codex_pool:
+            if codex_pool_err is None:
+                return codex_pool_response
+            # The Codex-specific path already marked the exact cached pool
+            # entry that failed, evicted stale clients, selected the next
+            # entry, and retried once. Do not fall through into the generic
+            # same-provider pool recovery below: it cannot identify the exact
+            # retry entry and may reuse the original stale client, falsely
+            # exhausting additional credentials.
+            first_err = codex_pool_err
+            codex_pool_retry_failed = True
+
         # ── Nous auth refresh parity with main agent ──────────────────
         client_is_nous = (
             resolved_provider == "nous"
@@ -4676,7 +5077,11 @@ async def async_call_llm(
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
         pool_provider = _recoverable_pool_provider(resolved_provider, client)
-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+        if (
+            pool_provider
+            and not codex_pool_retry_failed
+            and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err))
+        ):
             recovery_err = first_err
             if _is_rate_limit_error(first_err):
                 try:
