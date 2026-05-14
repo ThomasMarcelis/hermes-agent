@@ -8804,7 +8804,19 @@ class HermesCLI:
                     getattr(self.agent, "session_id", None)
                     and self.agent.session_id != self.session_id
                 ):
+                    old_session_id = self.session_id
                     self.session_id = self.agent.session_id
+                    try:
+                        from hermes_cli.goals import move_goal
+
+                        move_goal(old_session_id, self.session_id, reason="manual compression")
+                    except Exception as exc:
+                        logging.debug(
+                            "goal move after manual compression failed %s -> %s: %s",
+                            old_session_id,
+                            self.session_id,
+                            exc,
+                        )
                     self._pending_title = None
                     # Manual /compress replaces conversation_history with a new
                     # compressed handoff for the child session. Persist it from

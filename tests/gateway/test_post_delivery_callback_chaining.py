@@ -6,6 +6,9 @@ registration API chains them rather than clobbering. Per-callback
 exceptions are swallowed so one bad callback can't sabotage the others.
 Stale-generation registrations are rejected.
 """
+import asyncio
+import inspect
+
 import pytest
 
 from gateway.config import Platform, PlatformConfig
@@ -57,6 +60,48 @@ class TestPostDeliveryCallbackChaining:
         cb = adapter.pop_post_delivery_callback("s")
         cb()
         assert fired == ["A", "B", "C"]
+
+    @pytest.mark.asyncio
+    async def test_chained_callback_awaits_async_callbacks_in_order(self, adapter):
+        """Async post-delivery callbacks must not be silently discarded.
+
+        Goal-status delivery registers an async callback and background-review
+        release can already have a sync callback in the same slot.  The chained
+        callback must await the async leg before running later callbacks so the
+        visible status line is actually sent and ordering stays deterministic.
+        """
+        fired = []
+
+        async def first_async():
+            await asyncio.sleep(0)
+            fired.append("A")
+
+        def second_sync():
+            fired.append("B")
+
+        adapter.register_post_delivery_callback("s", first_async)
+        adapter.register_post_delivery_callback("s", second_sync)
+        cb = adapter.pop_post_delivery_callback("s")
+        result = cb()
+        if inspect.isawaitable(result):
+            await result
+        assert fired == ["A", "B"]
+
+    @pytest.mark.asyncio
+    async def test_chained_callback_isolates_async_callback_exception(self, adapter):
+        fired = []
+
+        async def boom_async():
+            await asyncio.sleep(0)
+            raise RuntimeError("boom")
+
+        adapter.register_post_delivery_callback("s", boom_async)
+        adapter.register_post_delivery_callback("s", lambda: fired.append("survived"))
+        cb = adapter.pop_post_delivery_callback("s")
+        result = cb()
+        if inspect.isawaitable(result):
+            await result
+        assert fired == ["survived"]
 
     def test_exception_in_one_callback_does_not_block_next(self, adapter):
         fired = []

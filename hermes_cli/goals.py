@@ -223,11 +223,11 @@ def _get_session_db() -> Optional[Any]:
     return db
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
-    """Load the goal for a session, or None if none exists."""
+def _load_goal_direct(session_id: str, db: Optional[Any] = None) -> Optional[GoalState]:
+    """Load only the exact ``goal:<session_id>`` row, with no lineage adoption."""
     if not session_id:
         return None
-    db = _get_session_db()
+    db = db or _get_session_db()
     if db is None:
         return None
     try:
@@ -244,6 +244,100 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
+def _save_goal_direct(db: Any, session_id: str, state: GoalState) -> None:
+    db.set_meta(_meta_key(session_id), state.to_json())
+
+
+def move_goal(
+    old_session_id: str,
+    new_session_id: str,
+    *,
+    reason: str = "session moved",
+) -> Optional[GoalState]:
+    """Move an active/paused goal between physical session IDs.
+
+    Context compression rotates ``session_id`` while preserving the logical
+    conversation. Goal state is keyed by physical session ID, so the standing
+    goal must follow the compression child; otherwise the post-turn hook sees
+    no active goal and auto-continuation stops after one turn.
+
+    Returns the copied state on the new session, or ``None`` when there was no
+    movable goal. The old row is retained for audit with ``status='cleared'``.
+    """
+    if not old_session_id or not new_session_id or old_session_id == new_session_id:
+        return None
+    db = _get_session_db()
+    if db is None:
+        return None
+
+    # Do not overwrite any explicit state on the destination, including a
+    # cleared row — if the user cleared the child goal, do not resurrect it.
+    if _load_goal_direct(new_session_id, db) is not None:
+        return None
+
+    old_state = _load_goal_direct(old_session_id, db)
+    if old_state is None or old_state.status not in ("active", "paused"):
+        return None
+
+    new_state = GoalState.from_json(old_state.to_json())
+    try:
+        _save_goal_direct(db, new_session_id, new_state)
+        old_state.status = "cleared"
+        old_state.last_reason = f"moved to {new_session_id} ({reason})"
+        _save_goal_direct(db, old_session_id, old_state)
+    except Exception as exc:
+        logger.debug("GoalManager: move_goal failed %s -> %s: %s", old_session_id, new_session_id, exc)
+        return None
+    return new_state
+
+
+def _adopt_goal_from_compression_lineage(session_id: str) -> Optional[GoalState]:
+    """Adopt the nearest active/paused ancestor goal across compression splits."""
+    db = _get_session_db()
+    if db is None or not session_id:
+        return None
+
+    current_id = session_id
+    seen = {current_id}
+    for _ in range(50):
+        try:
+            current = db.get_session(current_id)
+        except Exception as exc:
+            logger.debug("GoalManager: get_session failed during lineage adoption: %s", exc)
+            return None
+        if not current:
+            return None
+        parent_id = current.get("parent_session_id")
+        if not parent_id or parent_id in seen:
+            return None
+        seen.add(parent_id)
+
+        try:
+            parent = db.get_session(parent_id)
+        except Exception as exc:
+            logger.debug("GoalManager: get parent session failed during lineage adoption: %s", exc)
+            return None
+        if not parent or parent.get("end_reason") != "compression":
+            return None
+
+        parent_goal = _load_goal_direct(parent_id, db)
+        if parent_goal and parent_goal.status in ("active", "paused"):
+            return move_goal(parent_id, session_id, reason="compression")
+
+        # Keep walking up a pure compression chain; older buggy runs can leave
+        # empty child rows between the current session and the stale goal row.
+        current_id = parent_id
+    return None
+
+
+def load_goal(session_id: str) -> Optional[GoalState]:
+    """Load the goal for a session, adopting compression-parent goals if needed."""
+    state = _load_goal_direct(session_id)
+    if state is not None:
+        return state
+    return _adopt_goal_from_compression_lineage(session_id)
+
+
 def save_goal(session_id: str, state: GoalState) -> None:
     """Persist a goal to SessionDB. No-op if DB unavailable."""
     if not session_id:
@@ -252,7 +346,7 @@ def save_goal(session_id: str, state: GoalState) -> None:
     if db is None:
         return
     try:
-        db.set_meta(_meta_key(session_id), state.to_json())
+        _save_goal_direct(db, session_id, state)
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
@@ -335,7 +429,7 @@ def judge_goal(
     goal: str,
     last_response: str,
     *,
-    timeout: float = DEFAULT_JUDGE_TIMEOUT,
+    timeout: float | None = None,
     subgoals: Optional[List[str]] = None,
 ) -> Tuple[str, str, bool]:
     """Ask the auxiliary model whether the goal is satisfied.
@@ -365,13 +459,21 @@ def judge_goal(
         return "continue", "empty response (nothing to evaluate)", False
 
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import (
+            _get_task_extra_body,
+            _get_task_timeout,
+            get_text_auxiliary_client,
+        )
     except Exception as exc:
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
         return "continue", "auxiliary client unavailable", False
 
     try:
         client, model = get_text_auxiliary_client("goal_judge")
+        call_timeout = timeout if timeout is not None else _get_task_timeout(
+            "goal_judge", DEFAULT_JUDGE_TIMEOUT
+        )
+        extra_body = _get_task_extra_body("goal_judge")
     except Exception as exc:
         logger.debug("goal judge: get_text_auxiliary_client failed: %s", exc)
         return "continue", "auxiliary client unavailable", False
@@ -397,17 +499,19 @@ def judge_goal(
         )
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
+        call_kwargs = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0,
-            max_tokens=200,
-            timeout=timeout,
-            extra_body=get_auxiliary_extra_body() or None,
-        )
+            "temperature": 0,
+            "max_tokens": 200,
+            "timeout": call_timeout,
+        }
+        if extra_body:
+            call_kwargs["extra_body"] = extra_body
+        resp = client.chat.completions.create(**call_kwargs)
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
         return "continue", f"judge error: {type(exc).__name__}", False
@@ -717,6 +821,7 @@ __all__ = [
     "DEFAULT_MAX_TURNS",
     "load_goal",
     "save_goal",
+    "move_goal",
     "clear_goal",
     "judge_goal",
 ]

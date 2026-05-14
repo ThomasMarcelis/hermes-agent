@@ -196,6 +196,42 @@ async def test_goal_verdict_skipped_when_no_active_goal(hermes_home):
     assert adapter._pending_messages == {}
 
 
+def test_goal_state_moves_when_gateway_observes_compression_split(hermes_home):
+    """When gateway detects a compression session split, active /goal state
+    must move immediately to the child session.
+
+    Relying only on lazy GoalManager adoption left live active goals stranded on
+    compressed parent sessions when the post-turn hook was skipped or missed the
+    new physical session id.
+    """
+    from gateway.run import GatewayRunner
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    db.create_session("goal-parent", source="discord", model="test")
+    parent_mgr = GoalManager("goal-parent", default_max_turns=9)
+    parent_mgr.set("survive gateway compression")
+    db.end_session("goal-parent", "compression")
+    db.create_session(
+        "goal-child",
+        source="discord",
+        model="test",
+        parent_session_id="goal-parent",
+    )
+
+    runner = object.__new__(GatewayRunner)
+
+    moved = runner._move_goal_on_compression_split("goal-parent", "goal-child")
+
+    assert moved is not None
+    assert moved.goal == "survive gateway compression"
+    assert moved.max_turns == 9
+    assert load_goal("goal-child").status == "active"
+    assert load_goal("goal-child").goal == "survive gateway compression"
+    assert load_goal("goal-parent").status == "cleared"
+
+
 @pytest.mark.asyncio
 async def test_goal_verdict_survives_adapter_without_send(hermes_home):
     """Bad adapter (no ``send`` attribute) must not crash the judge hook."""
