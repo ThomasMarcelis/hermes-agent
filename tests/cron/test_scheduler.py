@@ -544,6 +544,39 @@ class TestDeliverResultWrapping:
         # Media files should be forwarded separately
         assert kwargs["media_files"] == [("/tmp/test-voice.ogg", False)]
 
+    def test_discord_thread_per_run_passes_thread_name_to_standalone_send(self):
+        """Cron jobs can request a fresh Discord thread for each delivery."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "thread_id": "thread-1"})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {
+                "id": "daily-job",
+                "name": "Daily Job",
+                "deliver": "discord:123456",
+                "delivery_options": {
+                    "discord": {
+                        "thread_per_run": True,
+                        "thread_name_template": "Thread {job_id}",
+                        "thread_auto_archive_duration": 60,
+                    }
+                },
+            }
+            assert _deliver_result(job, "Report body") is None
+
+        send_mock.assert_awaited_once()
+        args, kwargs = send_mock.await_args
+        assert args[2] == "123456"
+        assert args[3] == "Report body"
+        assert kwargs["discord_thread_name"] == "Thread daily-job"
+        assert kwargs["discord_thread_auto_archive_duration"] == 60
+
     def test_live_adapter_sends_media_as_attachments(self):
         """When a live adapter is available, MEDIA files should be sent as native
         platform attachments (e.g., Discord voice, Telegram audio) rather than

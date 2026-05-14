@@ -380,38 +380,95 @@ def _describe_media_for_mirror(media_files):
     return f"[Sent {len(media_files)} media attachments]"
 
 
-def _get_cron_auto_delivery_target():
-    """Return the cron scheduler's auto-delivery target for the current run, if any."""
+def _get_cron_auto_delivery_targets():
+    """Return cron scheduler auto-delivery targets for the current run, if any."""
     from gateway.session_context import get_session_env
+
+    raw_targets = get_session_env("HERMES_CRON_AUTO_DELIVER_TARGETS", "").strip()
+    if raw_targets:
+        try:
+            parsed = json.loads(raw_targets)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            targets = []
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                platform = str(item.get("platform") or "").strip().lower()
+                chat_id = str(item.get("chat_id") or "").strip()
+                if not platform or not chat_id:
+                    continue
+                thread_value = item.get("thread_id")
+                thread_id = None if thread_value in (None, "") else str(thread_value)
+                targets.append({
+                    "platform": platform,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "thread_per_run": bool(item.get("thread_per_run") or item.get("discord_thread_per_run")),
+                })
+            if targets:
+                return targets
+
     platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
     chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
     if not platform or not chat_id:
-        return None
+        return []
     thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
-    return {
+    return [{
         "platform": platform,
         "chat_id": chat_id,
         "thread_id": thread_id,
-    }
+    }]
+
+
+def _get_cron_auto_delivery_target():
+    """Return the first cron auto-delivery target for legacy callers."""
+    targets = _get_cron_auto_delivery_targets()
+    return targets[0] if targets else None
 
 
 def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):
     """Skip redundant cron send_message calls when the scheduler will auto-deliver there."""
-    auto_target = _get_cron_auto_delivery_target()
-    if not auto_target:
+    auto_targets = _get_cron_auto_delivery_targets()
+    if not auto_targets:
         return None
 
-    same_target = (
-        auto_target["platform"] == platform_name
-        and str(auto_target["chat_id"]) == str(chat_id)
-        and auto_target.get("thread_id") == thread_id
+    normalized_thread_id = None if thread_id in (None, "") else str(thread_id)
+    same_target = any(
+        target["platform"] == platform_name
+        and str(target["chat_id"]) == str(chat_id)
+        and target.get("thread_id") == normalized_thread_id
+        for target in auto_targets
     )
     if not same_target:
         return None
 
+    thread_per_run_parent = any(
+        target["platform"] == platform_name
+        and str(target["chat_id"]) == str(chat_id)
+        and target.get("thread_id") is None
+        and target.get("thread_per_run")
+        and normalized_thread_id is None
+        for target in auto_targets
+    )
     target_label = f"{platform_name}:{chat_id}"
     if thread_id is not None:
         target_label += f":{thread_id}"
+
+    if thread_per_run_parent:
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "cron_auto_delivery_thread_per_run_parent",
+            "target": target_label,
+            "note": (
+                f"Skipped send_message to {target_label}. This cron job will already auto-deliver "
+                "its final response to a fresh Discord thread under that parent channel. Put the "
+                "intended user-facing content in your final response instead, or target a different "
+                "channel/thread if you intentionally need an additional message."
+            ),
+        }
 
     return {
         "success": True,
@@ -515,7 +572,17 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    discord_thread_name=None,
+    discord_thread_auto_archive_duration=1440,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -608,13 +675,21 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
+            discord_kwargs = {
+                "media_files": media_files if is_last else [],
+                "thread_id": thread_id,
+            }
+            if discord_thread_name:
+                discord_kwargs["thread_name"] = discord_thread_name if i == 0 else None
+                discord_kwargs["thread_auto_archive_duration"] = discord_thread_auto_archive_duration
             result = await _send_discord(
                 pconfig.token,
                 chat_id,
                 chunk,
-                media_files=media_files if is_last else [],
-                thread_id=thread_id,
+                **discord_kwargs,
             )
+            if isinstance(result, dict) and result.get("success") and result.get("thread_id"):
+                thread_id = result["thread_id"]
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
@@ -910,7 +985,14 @@ def _derive_forum_thread_name(message: str) -> str:
     first_line = first_line.lstrip("#").strip()
     if not first_line:
         first_line = "New Post"
-    return first_line[:100]
+    return _sanitize_discord_thread_name(first_line)
+
+
+def _sanitize_discord_thread_name(name: str) -> str:
+    """Return a Discord-safe thread name capped at Discord's 100-char limit."""
+    clean = re.sub(r"\s+", " ", str(name or "")).strip()
+    clean = clean.lstrip("#").strip()
+    return (clean or "New Post")[:100]
 
 
 # Process-local cache for Discord channel-type probes.  Avoids re-probing the
@@ -927,13 +1009,23 @@ def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:
     return _DISCORD_CHANNEL_TYPE_PROBE_CACHE.get(str(chat_id))
 
 
-async def _send_discord(token, chat_id, message, thread_id=None, media_files=None):
+async def _send_discord(
+    token,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    thread_name=None,
+    thread_auto_archive_duration=1440,
+):
     """Send a single message via Discord REST API (no websocket client needed).
 
     Chunking is handled by _send_to_platform() before this is called.
 
     When thread_id is provided, the message is sent directly to that thread
-    via the /channels/{thread_id}/messages endpoint.
+    via the /channels/{thread_id}/messages endpoint. When thread_name is
+    provided without thread_id, a new public thread is created in the parent
+    text channel and the message is delivered there.
 
     Media files are uploaded one-by-one via multipart/form-data after the
     text message is sent (same pattern as Telegram).
@@ -996,8 +1088,9 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
                     except Exception:
                         logger.debug("Failed to probe channel type for %s", chat_id, exc_info=True)
 
+            requested_thread_name = _sanitize_discord_thread_name(thread_name) if thread_name else None
             if is_forum:
-                thread_name = _derive_forum_thread_name(message)
+                thread_name = requested_thread_name or _derive_forum_thread_name(message)
                 thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
 
                 # Filter to readable media files up front so we can pick the
@@ -1074,7 +1167,34 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
                     result["warnings"] = warnings
                 return result
 
-            url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
+            if requested_thread_name:
+                thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
+                try:
+                    auto_archive = int(thread_auto_archive_duration or 1440)
+                except (TypeError, ValueError):
+                    auto_archive = 1440
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+                    async with session.post(
+                        thread_url,
+                        headers=json_headers,
+                        json={
+                            "name": requested_thread_name,
+                            "type": 11,  # GUILD_PUBLIC_THREAD
+                            "auto_archive_duration": auto_archive,
+                        },
+                        **_req_kw,
+                    ) as resp:
+                        if resp.status not in (200, 201):
+                            body = await resp.text()
+                            return _error(f"Discord thread creation error ({resp.status}): {body}")
+                        data = await resp.json()
+
+                thread_id = data.get("id")
+                if not thread_id:
+                    return _error("Discord thread creation succeeded but response did not include a thread id")
+                url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
+            else:
+                url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
@@ -1117,6 +1237,8 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
             return {"error": error}
 
         result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
+        if thread_id:
+            result["thread_id"] = thread_id
         if warnings:
             result["warnings"] = warnings
         return result

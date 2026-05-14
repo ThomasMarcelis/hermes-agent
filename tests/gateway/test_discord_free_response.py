@@ -95,6 +95,7 @@ def adapter(monkeypatch):
         "DISCORD_REQUIRE_MENTION",
         "DISCORD_THREAD_REQUIRE_MENTION",
         "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_THREAD_FREE_RESPONSE_CHANNELS",
         "DISCORD_AUTO_THREAD",
         "DISCORD_NO_THREAD_CHANNELS",
         "DISCORD_ALLOWED_CHANNELS",
@@ -217,6 +218,76 @@ async def test_discord_free_response_channel_overrides_mention_requirement(adapt
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "allowed without mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_free_response_channel_bypasses_mention_and_still_threads(adapter, monkeypatch):
+    """thread_free_response_channels means free parent-channel response, not inline response."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    parent = FakeTextChannel(channel_id=789)
+    fake_thread = FakeThread(channel_id=999, name="auto-thread", parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(channel=parent, content="allowed without mention but threaded")
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "allowed without mention but threaded"
+    assert event.source.chat_id == "999"
+    assert event.source.thread_id == "999"
+    assert event.source.chat_type == "thread"
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_free_parent_does_not_exempt_unknown_child_thread(adapter, monkeypatch):
+    """thread_free_response_channels applies to parent messages, not arbitrary child threads."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    parent = FakeTextChannel(channel_id=789)
+    thread = FakeThread(channel_id=790, name="manual child thread", parent=parent)
+    message = make_message(channel=thread, content="unknown thread without mention")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_discord_thread_free_response_channels_bare_int(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["thread_free_response_channels"] = 1491973769726791812
+
+    assert adapter._discord_thread_free_response_channels() == {"1491973769726791812"}
+
+
+@pytest.mark.asyncio
+async def test_discord_no_thread_overrides_thread_free_response_channel(adapter, monkeypatch):
+    """Explicit no-thread config wins even for thread-free-response channels."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "789")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    adapter._auto_create_thread = AsyncMock()
+    message = make_message(channel=FakeTextChannel(channel_id=789), content="allowed without thread")
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "789"
+    assert event.source.thread_id is None
+    assert event.source.chat_type == "group"
 
 
 @pytest.mark.asyncio

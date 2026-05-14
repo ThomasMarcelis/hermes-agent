@@ -11,6 +11,7 @@ import pytest
 
 from tests.e2e.conftest import (
     BOT_USER_ID,
+    CHANNEL_ID,
     E2E_MESSAGE_SETTLE_DELAY,
     get_response_text,
     make_discord_message,
@@ -21,9 +22,32 @@ from tests.e2e.conftest import (
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def isolate_discord_channel_env(monkeypatch):
+    """Keep these e2e tests independent from the operator's live Discord config."""
+    for name in (
+        "DISCORD_ALLOWED_CHANNELS",
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_THREAD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_NO_THREAD_CHANNELS",
+        "DISCORD_REQUIRE_MENTION",
+        "DISCORD_AUTO_THREAD",
+        "DISCORD_IGNORED_CHANNELS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 async def dispatch(adapter, msg):
     await adapter._handle_message(msg)
     await asyncio.sleep(E2E_MESSAGE_SETTLE_DELAY)
+
+
+def _sent_chat_id(adapter) -> str | None:
+    """Extract chat_id from adapter.send(), regardless of positional/kw style."""
+    if not adapter.send.called:
+        return None
+    args, kwargs = adapter.send.call_args
+    return kwargs.get("chat_id") or (args[0] if args else None)
 
 
 class TestMentionStrippedCommandDispatch:
@@ -104,3 +128,66 @@ class TestAutoThreadingPreservesCommand:
         response = get_response_text(discord_adapter)
         assert response is not None
         assert "/new" in response
+
+
+class TestThreadFreeResponseChannels:
+    async def test_thread_free_response_channel_auto_threads_without_mention(
+        self, discord_adapter, monkeypatch
+    ):
+        """thread_free_response_channels: no @mention needed AND parent messages auto-thread."""
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+        monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", str(CHANNEL_ID))
+        monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", str(CHANNEL_ID))
+        fake_thread = make_fake_thread(thread_id=90002, name="help")
+        msg = make_discord_message(content="/help", mentions=[])
+        msg.create_thread = AsyncMock(return_value=fake_thread)
+
+        await dispatch(discord_adapter, msg)
+
+        msg.create_thread.assert_awaited_once()
+        response = get_response_text(discord_adapter)
+        assert response is not None
+        assert "/new" in response
+        assert _sent_chat_id(discord_adapter) == str(fake_thread.id)
+
+    async def test_thread_free_response_channel_accepts_platform_extra_list(
+        self, discord_adapter, monkeypatch
+    ):
+        """PlatformConfig.extra can configure thread-free channels without env vars."""
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+        monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", str(CHANNEL_ID))
+        discord_adapter.config.extra["thread_free_response_channels"] = [CHANNEL_ID]
+        fake_thread = make_fake_thread(thread_id=90004, name="help")
+        msg = make_discord_message(content="/help", mentions=[])
+        msg.create_thread = AsyncMock(return_value=fake_thread)
+
+        await dispatch(discord_adapter, msg)
+
+        msg.create_thread.assert_awaited_once()
+        response = get_response_text(discord_adapter)
+        assert response is not None
+        assert "/new" in response
+        assert _sent_chat_id(discord_adapter) == str(fake_thread.id)
+
+    async def test_thread_free_response_channel_overrides_free_response_skip_thread(
+        self, discord_adapter, monkeypatch
+    ):
+        """If both lists contain a channel, thread-free mode wins over inline free-response."""
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+        monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", str(CHANNEL_ID))
+        monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", str(CHANNEL_ID))
+        monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", str(CHANNEL_ID))
+        fake_thread = make_fake_thread(thread_id=90003, name="help")
+        msg = make_discord_message(content="/help", mentions=[])
+        msg.create_thread = AsyncMock(return_value=fake_thread)
+
+        await dispatch(discord_adapter, msg)
+
+        msg.create_thread.assert_awaited_once()
+        response = get_response_text(discord_adapter)
+        assert response is not None
+        assert "/new" in response
+        assert _sent_chat_id(discord_adapter) == str(fake_thread.id)

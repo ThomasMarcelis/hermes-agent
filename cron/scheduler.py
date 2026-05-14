@@ -426,6 +426,79 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _truthy_config(value) -> bool:
+    """Interpret common JSON/YAML truthy values for optional job settings."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _discord_thread_per_run_options(job: dict) -> Optional[dict]:
+    """Return per-run Discord thread delivery options for a cron job, if enabled.
+
+    Supported shape in jobs.json::
+
+        "delivery_options": {
+          "discord": {
+            "thread_per_run": true,
+            "thread_name_template": "Daily — {date}",
+            "thread_auto_archive_duration": 1440
+          }
+        }
+
+    Top-level ``discord_thread_*`` keys are accepted for simple hand-edits.
+    """
+    delivery_options = job.get("delivery_options") if isinstance(job.get("delivery_options"), dict) else {}
+    discord_options = delivery_options.get("discord") if isinstance(delivery_options.get("discord"), dict) else {}
+
+    enabled = discord_options.get("thread_per_run", job.get("discord_thread_per_run"))
+    if not _truthy_config(enabled):
+        return None
+
+    template = (
+        discord_options.get("thread_name_template")
+        or discord_options.get("thread_title_template")
+        or job.get("discord_thread_name_template")
+        or job.get("discord_thread_title_template")
+        or "{job_name} — {date} {time}"
+    )
+    auto_archive = (
+        discord_options.get("thread_auto_archive_duration")
+        or job.get("discord_thread_auto_archive_duration")
+        or 1440
+    )
+    try:
+        auto_archive = int(auto_archive)
+    except (TypeError, ValueError):
+        auto_archive = 1440
+    return {
+        "thread_name": _format_discord_cron_thread_name(job, template),
+        "thread_auto_archive_duration": auto_archive,
+    }
+
+
+def _format_discord_cron_thread_name(job: dict, template: str) -> str:
+    """Format a stable Discord thread name for one cron delivery."""
+    now = _hermes_now()
+    values = {
+        "job_id": str(job.get("id", "")),
+        "job_name": str(job.get("name") or job.get("id") or "Cron job"),
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M"),
+        "datetime": now.strftime("%Y-%m-%d %H:%M"),
+    }
+    try:
+        name = str(template or "").format(**values)
+    except Exception:
+        name = values["job_name"]
+    name = " ".join(name.split()).strip() or values["job_name"]
+    return name[:100]
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -541,6 +614,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        discord_thread_options = None
+        if str(platform_name).lower() == "discord" and not thread_id:
+            discord_thread_options = _discord_thread_per_run_options(job)
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -578,7 +654,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
-        if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
+        if (
+            runtime_adapter is not None
+            and loop is not None
+            and getattr(loop, "is_running", lambda: False)()
+            and not discord_thread_options
+        ):
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
@@ -625,7 +706,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            send_kwargs = {}
+            if discord_thread_options:
+                send_kwargs.update(
+                    {
+                        "discord_thread_name": discord_thread_options["thread_name"],
+                        "discord_thread_auto_archive_duration": discord_thread_options[
+                            "thread_auto_archive_duration"
+                        ],
+                    }
+                )
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                **send_kwargs,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -635,7 +734,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    retry_coro = _send_to_platform(
+                        platform,
+                        pconfig,
+                        chat_id,
+                        cleaned_delivery_content,
+                        thread_id=thread_id,
+                        media_files=media_files,
+                        **send_kwargs,
+                    )
+                    future = pool.submit(asyncio.run, retry_coro)
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
@@ -1237,6 +1345,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        "HERMES_CRON_AUTO_DELIVER_TARGETS",
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
@@ -1274,7 +1383,23 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except UnicodeDecodeError:
             load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="latin-1")
 
-        delivery_target = _resolve_delivery_target(job)
+        delivery_targets = _resolve_delivery_targets(job)
+        delivery_target = delivery_targets[0] if delivery_targets else None
+        if delivery_targets:
+            import json as _json
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_TARGETS"].set(_json.dumps([
+                {
+                    "platform": target.get("platform"),
+                    "chat_id": str(target.get("chat_id")),
+                    "thread_id": None if target.get("thread_id") is None else str(target.get("thread_id")),
+                    "thread_per_run": bool(
+                        str(target.get("platform", "")).lower() == "discord"
+                        and target.get("thread_id") is None
+                        and _discord_thread_per_run_options(job)
+                    ),
+                }
+                for target in delivery_targets
+            ]))
         if delivery_target:
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))

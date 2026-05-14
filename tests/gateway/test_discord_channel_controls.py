@@ -73,6 +73,24 @@ class FakeThread:
         self.topic = None
 
 
+_CHANNEL_CONTROL_ENV_VARS = (
+    "DISCORD_ALLOWED_CHANNELS",
+    "DISCORD_IGNORED_CHANNELS",
+    "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_THREAD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_NO_THREAD_CHANNELS",
+    "DISCORD_AUTO_THREAD",
+    "DISCORD_REQUIRE_MENTION",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_channel_control_env(monkeypatch):
+    """Keep host Discord channel config from leaking into these unit tests."""
+    for name in _CHANNEL_CONTROL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)

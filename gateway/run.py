@@ -1520,6 +1520,64 @@ class GatewayRunner:
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
 
+    @staticmethod
+    def _coerce_config_bool(value: Any) -> bool:
+        """Return a bool for config values that may come from YAML or strings."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off", ""}:
+                return False
+        return bool(value)
+
+    def _auto_tts_global_defaults(self) -> tuple[bool, str]:
+        """Read the profile-wide auto-TTS defaults from config.yaml."""
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            _full_cfg = _load_full_config()
+            _voice_cfg = _full_cfg.get("voice") or {}
+            if not isinstance(_voice_cfg, dict):
+                _voice_cfg = {}
+            enabled = self._coerce_config_bool(_voice_cfg.get("auto_tts", False))
+            mode = BasePlatformAdapter._normalize_auto_tts_default_mode(
+                _voice_cfg.get("auto_tts_mode", "voice_only")
+            )
+            return enabled, mode
+        except Exception:
+            return False, "voice_only"
+
+    def _effective_auto_tts_for_event(self, event: MessageEvent) -> bool:
+        """Canonical auto-TTS decision for streamed and non-streamed paths."""
+        chat_id = event.source.chat_id
+        mode = self._voice_mode.get(self._voice_key(event.source.platform, chat_id))
+        enabled_chats = {chat_id} if mode in ("voice_only", "all") else set()
+        all_chats = {chat_id} if mode == "all" else set()
+        disabled_chats = {chat_id} if mode == "off" else set()
+        default_enabled, default_mode = self._auto_tts_global_defaults()
+        return BasePlatformAdapter._should_auto_tts_for_state(
+            chat_id=chat_id,
+            message_type=event.message_type,
+            auto_tts_default=default_enabled,
+            auto_tts_default_mode=default_mode,
+            enabled_chats=enabled_chats,
+            all_chats=all_chats,
+            disabled_chats=disabled_chats,
+        )
+
+    def _effective_voice_mode_label(self, event: MessageEvent) -> tuple[str, str]:
+        """Return (mode, source) for /voice status display."""
+        chat_id = event.source.chat_id
+        explicit = self._voice_mode.get(self._voice_key(event.source.platform, chat_id))
+        if explicit in {"off", "voice_only", "all"}:
+            return explicit, "chat override"
+        enabled, mode = self._auto_tts_global_defaults()
+        if enabled:
+            return mode, "profile default"
+        return "off", "profile default"
+
     def _set_adapter_auto_tts_disabled(self, adapter, chat_id: str, disabled: bool) -> None:
         """Update an adapter's in-memory auto-TTS suppression set if present."""
         disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
@@ -1531,33 +1589,50 @@ class GatewayRunner:
             enabled_chats = getattr(adapter, "_auto_tts_enabled_chats", None)
             if isinstance(enabled_chats, set):
                 enabled_chats.discard(chat_id)
+            all_chats = getattr(adapter, "_auto_tts_all_chats", None)
+            if isinstance(all_chats, set):
+                all_chats.discard(chat_id)
         else:
             disabled_chats.discard(chat_id)
 
-    def _set_adapter_auto_tts_enabled(self, adapter, chat_id: str, enabled: bool) -> None:
+    def _set_adapter_auto_tts_enabled(self, adapter, chat_id: str, enabled: bool, *, all_messages: bool = False) -> None:
         """Update an adapter's per-chat auto-TTS opt-in set if present.
 
         Used for ``/voice on``/``/voice tts`` where the user explicitly wants
-        auto-TTS even when ``voice.auto_tts`` is False globally.
+        auto-TTS even when ``voice.auto_tts`` is False globally. ``all_messages``
+        is set for ``/voice tts`` and makes text-message replies spoken too.
         """
         enabled_chats = getattr(adapter, "_auto_tts_enabled_chats", None)
-        if not isinstance(enabled_chats, set):
+        all_chats = getattr(adapter, "_auto_tts_all_chats", None)
+        if not isinstance(enabled_chats, set) and not isinstance(all_chats, set):
             return
         if enabled:
-            enabled_chats.add(chat_id)
+            if isinstance(enabled_chats, set):
+                enabled_chats.add(chat_id)
+            if isinstance(all_chats, set):
+                if all_messages:
+                    all_chats.add(chat_id)
+                else:
+                    all_chats.discard(chat_id)
             # An explicit opt-in clears any stale /voice off for this chat.
             disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
             if isinstance(disabled_chats, set):
                 disabled_chats.discard(chat_id)
         else:
-            enabled_chats.discard(chat_id)
+            if isinstance(enabled_chats, set):
+                enabled_chats.discard(chat_id)
+            if isinstance(all_chats, set):
+                all_chats.discard(chat_id)
 
     def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
         """Restore persisted /voice state into a live platform adapter.
 
-        Populates three fields from config + ``self._voice_mode``:
-          - ``_auto_tts_default``: global default from ``voice.auto_tts``
+        Populates five fields from config + ``self._voice_mode``:
+          - ``_auto_tts_default``: global master switch from ``voice.auto_tts``
+          - ``_auto_tts_default_mode``: global scope from ``voice.auto_tts_mode``
+            (``voice_only`` or ``all``)
           - ``_auto_tts_enabled_chats``: chats with mode ``voice_only``/``all``
+          - ``_auto_tts_all_chats``: chats with mode ``all`` only
           - ``_auto_tts_disabled_chats``: chats with mode ``off``
         """
         platform = getattr(adapter, "platform", None)
@@ -1566,21 +1641,20 @@ class GatewayRunner:
 
         disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
         enabled_chats = getattr(adapter, "_auto_tts_enabled_chats", None)
-        if not isinstance(disabled_chats, set) and not isinstance(enabled_chats, set):
+        all_chats = getattr(adapter, "_auto_tts_all_chats", None)
+        if (
+            not isinstance(disabled_chats, set)
+            and not isinstance(enabled_chats, set)
+            and not isinstance(all_chats, set)
+        ):
             return
 
-        # Push the global voice.auto_tts default (config.yaml) onto the adapter.
-        # Lazy import to avoid adding a module-level dep from gateway → hermes_cli.
-        try:
-            from hermes_cli.config import load_config as _load_full_config
-            _full_cfg = _load_full_config()
-            _auto_tts_default = bool(
-                (_full_cfg.get("voice") or {}).get("auto_tts", False)
-            )
-        except Exception:
-            _auto_tts_default = False
+        # Push the global voice.auto_tts defaults (config.yaml) onto the adapter.
+        _auto_tts_default, _auto_tts_default_mode = self._auto_tts_global_defaults()
         if hasattr(adapter, "_auto_tts_default"):
             adapter._auto_tts_default = _auto_tts_default
+        if hasattr(adapter, "_auto_tts_default_mode"):
+            adapter._auto_tts_default_mode = _auto_tts_default_mode
 
         prefix = f"{platform.value}:"
         if isinstance(disabled_chats, set):
@@ -1594,6 +1668,12 @@ class GatewayRunner:
             enabled_chats.update(
                 key[len(prefix):] for key, mode in self._voice_mode.items()
                 if mode in {"voice_only", "all"} and key.startswith(prefix)
+            )
+        if isinstance(all_chats, set):
+            all_chats.clear()
+            all_chats.update(
+                key[len(prefix):] for key, mode in self._voice_mode.items()
+                if mode == "all" and key.startswith(prefix)
             )
 
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
@@ -1811,6 +1891,7 @@ class GatewayRunner:
             session_key=session_entry.session_key,
             session_id=session_entry.session_id,
         )
+
 
     def _resolve_session_agent_runtime(
         self,
@@ -2094,6 +2175,38 @@ class GatewayRunner:
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
         return depth
+
+    @staticmethod
+    def _move_goal_on_compression_split(old_session_id: str, new_session_id: str):
+        """Move active /goal state when compression rotates the session id.
+
+        Goal state is keyed by physical SessionDB id.  Lazy lineage adoption in
+        ``GoalManager`` is still the fallback, but the gateway is the component
+        that observes compression splits in real time, so move the goal at that
+        boundary to avoid orphaned active goals if a later post-turn hook is
+        skipped or receives stale session metadata.
+        """
+        if not old_session_id or not new_session_id or old_session_id == new_session_id:
+            return None
+        try:
+            from hermes_cli.goals import move_goal
+
+            moved = move_goal(old_session_id, new_session_id, reason="compression")
+            if moved is not None:
+                logger.info(
+                    "goal continuation: moved active goal across compression split %s → %s",
+                    old_session_id,
+                    new_session_id,
+                )
+            return moved
+        except Exception as exc:
+            logger.debug(
+                "goal continuation: move across compression split failed %s → %s: %s",
+                old_session_id,
+                new_session_id,
+                exc,
+            )
+            return None
 
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
@@ -7424,8 +7537,13 @@ class GatewayRunner:
                                     # and searchable via session_search.
                                     _hyg_new_sid = _hyg_agent.session_id
                                     if _hyg_new_sid != session_entry.session_id:
+                                        _hyg_old_sid = session_entry.session_id
                                         session_entry.session_id = _hyg_new_sid
                                         self.session_store._save()
+                                        self._move_goal_on_compression_split(
+                                            _hyg_old_sid,
+                                            _hyg_new_sid,
+                                        )
 
                                     self.session_store.rewrite_transcript(
                                         session_entry.session_id, _compressed
@@ -7949,10 +8067,14 @@ class GatewayRunner:
                     try:
                         _foot_adapter = self.adapters.get(source.platform)
                         if _foot_adapter:
+                            _footer_meta = self._thread_metadata_for_source(
+                                source,
+                                self._reply_anchor_for_event(event),
+                            )
                             await _foot_adapter.send(
                                 source.chat_id,
                                 _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                metadata=_footer_meta,
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
@@ -9816,19 +9938,22 @@ class GatewayRunner:
             self._voice_mode[voice_key] = "all"
             self._save_voice_modes()
             if adapter:
-                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True, all_messages=True)
             return t("gateway.voice.tts_enabled")
         elif args in {"channel", "join"}:
             return await self._handle_voice_channel_join(event)
         elif args == "leave":
             return await self._handle_voice_channel_leave(event)
         elif args == "status":
-            mode = self._voice_mode.get(voice_key, "off")
+            mode, mode_source = self._effective_voice_mode_label(event)
             labels = {
                 "off": t("gateway.voice.label_off"),
                 "voice_only": t("gateway.voice.label_voice_only"),
                 "all": t("gateway.voice.label_all"),
             }
+            mode_label = labels.get(mode, mode)
+            if mode_source == "profile default":
+                mode_label = f"{mode_label} — profile default"
             # Append voice channel info if connected
             adapter = self.adapters.get(event.source.platform)
             guild_id = self._get_guild_id(event)
@@ -9836,7 +9961,7 @@ class GatewayRunner:
                 info = adapter.get_voice_channel_info(guild_id)
                 if info:
                     lines = [
-                        t("gateway.voice.status_mode", label=labels.get(mode, mode)),
+                        t("gateway.voice.status_mode", label=mode_label),
                         t("gateway.voice.status_channel", channel=info['channel_name']),
                         t("gateway.voice.status_participants", count=info['member_count']),
                     ]
@@ -9844,10 +9969,13 @@ class GatewayRunner:
                         status = t("gateway.voice.speaking") if m.get("is_speaking") else ""
                         lines.append(t("gateway.voice.status_member", name=m['display_name'], status=status))
                     return "\n".join(lines)
-            return t("gateway.voice.status_mode", label=labels.get(mode, mode))
+            return t("gateway.voice.status_mode", label=mode_label)
         else:
-            # Toggle: off → on, on/all → off
-            current = self._voice_mode.get(voice_key, "off")
+            # Toggle the effective mode, not just persisted per-chat state.
+            # With profile-wide defaults (e.g. auto_tts_mode=all), a bare
+            # /voice should opt this chat off rather than redundantly storing
+            # voice_only over an already-speaking default.
+            current, _mode_source = self._effective_voice_mode_label(event)
             if current == "off":
                 self._voice_mode[voice_key] = "voice_only"
                 self._save_voice_modes()
@@ -9903,7 +10031,7 @@ class GatewayRunner:
                 adapter._voice_sources[guild_id] = event.source.to_dict()
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
-            self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+            self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True, all_messages=True)
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
@@ -10064,26 +10192,20 @@ class GatewayRunner:
         """Decide whether the runner should send a TTS voice reply.
 
         Returns False when:
-        - voice_mode is off for this chat
         - response is empty or an error
+        - automatic TTS is not enabled for this event after chat/profile overrides
         - agent already called text_to_speech tool (dedup)
-        - voice input and base adapter auto-TTS already handled it (skip_double)
-          UNLESS streaming already consumed the response (already_sent=True),
-          in which case the base adapter won't have text for auto-TTS so the
-          runner must handle it.
+        - the response was not streamed: the base adapter owns post-processing TTS
+          for non-streamed responses, so the runner would duplicate audio.
+
+        When streaming already delivered the text (already_sent=True), the base
+        adapter receives None and cannot run auto-TTS, so the runner owns the
+        voice attachment/playback for that response.
         """
         if not response or response.startswith("Error:"):
             return False
 
-        chat_id = event.source.chat_id
-        voice_mode = self._voice_mode.get(self._voice_key(event.source.platform, chat_id), "off")
-        is_voice_input = (event.message_type == MessageType.VOICE)
-
-        should = (
-            (voice_mode == "all")
-            or (voice_mode == "voice_only" and is_voice_input)
-        )
-        if not should:
+        if not self._effective_auto_tts_for_event(event):
             return False
 
         # Dedup: agent already called TTS tool
@@ -10098,25 +10220,35 @@ class GatewayRunner:
         if has_agent_tts:
             return False
 
-        # Dedup: base adapter auto-TTS already handles voice input
-        # (play_tts plays in VC when connected, so runner can skip).
-        # When streaming already delivered the text (already_sent=True),
-        # the base adapter will receive None and can't run auto-TTS,
-        # so the runner must take over.
-        if is_voice_input and not already_sent:
+        # Dedup: non-streamed responses are post-processed by BasePlatformAdapter,
+        # which has the same effective auto-TTS decision and can send audio before
+        # the text. The runner only owns streamed responses because the base
+        # adapter gets no final response body there.
+        if not already_sent:
             return False
 
         return True
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
-        """Generate TTS audio and send as a voice message before the text reply."""
+        """Generate TTS audio and deliver it for an assistant reply.
+
+        Non-streamed replies call this from the base adapter before text send;
+        streamed replies call it from GatewayRunner after text chunks were
+        already delivered because post-processing receives no final body.
+        """
         import uuid as _uuid
         audio_path = None
         actual_path = None
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
-            tts_text = _strip_markdown_for_tts(text[:4000])
+            # Keep streamed auto-TTS aligned with the non-streamed adapter path:
+            # strip Markdown noise, but preserve ElevenLabs audio tags and let
+            # ``text_to_speech_tool`` enforce provider/model-aware length caps.
+            # Pre-truncating here caused long Discord replies to get only a
+            # partial narration file even though the visible text had been split
+            # across multiple messages.
+            tts_text = _strip_markdown_for_tts(text)
             if not tts_text:
                 return
 
@@ -10952,10 +11084,12 @@ class GatewayRunner:
                 # (preserving its full transcript in SQLite) and creates a new
                 # session_id for the continuation.  Write the compressed messages
                 # into the NEW session so the original history stays searchable.
+                old_session_id = session_entry.session_id
                 new_session_id = tmp_agent.session_id
-                if new_session_id != session_entry.session_id:
+                if new_session_id != old_session_id:
                     session_entry.session_id = new_session_id
                     self.session_store._save()
+                    self._move_goal_on_compression_split(old_session_id, new_session_id)
 
                 self.session_store.rewrite_transcript(new_session_id, compressed)
                 # Reset stored token count — transcript changed, old value is stale
@@ -12335,7 +12469,6 @@ class GatewayRunner:
     def _reply_anchor_for_event(event: MessageEvent) -> Optional[str]:
         """Return the platform-specific reply anchor for GatewayRunner sends."""
         return _reply_anchor_for_event(event)
-
 
     # ------------------------------------------------------------------
     # /approve & /deny — explicit dangerous-command approval
@@ -13862,18 +13995,78 @@ class GatewayRunner:
             agent._last_activity_desc = "starting new turn (cached)"
         agent._api_call_count = 0
 
+    def _store_cached_agent(self, session_key: str, agent: Any, signature: str) -> None:
+        """Insert/replace a cached agent and release any displaced instance.
+
+        A config-signature change for the same ``session_key`` creates a new
+        AIAgent and overwrites the old cache entry.  Without explicitly
+        releasing the displaced object, its memory provider can lose its last
+        owner while still holding provider-owned aiohttp sessions.  Release
+        outside the cache lock and avoid touching agents marked mid-turn.
+        """
+        _cache = getattr(self, "_agent_cache", None)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _cache is None or _lock is None:
+            return
+
+        displaced_agent = None
+        with _lock:
+            previous = _cache.get(session_key)
+            if isinstance(previous, tuple) and previous:
+                previous_agent = previous[0]
+                previous_signature = previous[1] if len(previous) > 1 else None
+                if (
+                    previous_agent is not None
+                    and previous_agent is not agent
+                    and previous_signature != signature
+                ):
+                    running_ids = {
+                        id(a)
+                        for a in getattr(self, "_running_agents", {}).values()
+                        if a is not None and a is not _AGENT_PENDING_SENTINEL
+                    }
+                    if id(previous_agent) not in running_ids:
+                        displaced_agent = previous_agent
+                    else:
+                        logger.debug(
+                            "Replacing cache entry for active session %s; skipping soft release of active old agent",
+                            session_key,
+                        )
+            _cache[session_key] = (agent, signature)
+            if hasattr(_cache, "move_to_end"):
+                _cache.move_to_end(session_key)
+            self._enforce_agent_cache_cap()
+
+        if displaced_agent is not None:
+            threading.Thread(
+                target=self._release_evicted_agent_soft,
+                args=(displaced_agent,),
+                daemon=True,
+                name=f"agent-cache-replace-{session_key[:24]}",
+            ).start()
+
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
 
-        Called from _enforce_agent_cache_cap and _sweep_idle_cached_agents.
-        Distinct from _cleanup_agent_resources (full teardown) because a
-        cache-evicted session may resume at any time — its terminal
-        sandbox, browser daemon, and tracked bg processes must outlive
-        the Python AIAgent instance so the next agent built for the
-        same task_id inherits them.
+        Called from _enforce_agent_cache_cap, _sweep_idle_cached_agents, and
+        same-key cache replacement.  Distinct from _cleanup_agent_resources
+        (full teardown) because a cache-evicted session may resume at any
+        time — its terminal sandbox, browser daemon, and tracked bg processes
+        must outlive the Python AIAgent instance so the next agent built for
+        the same task_id inherits them.
         """
         if agent is None:
             return
+        # Memory providers (notably Hindsight cloud) own their own aiohttp
+        # clients.  Cache eviction drops the Python AIAgent instance, so close
+        # those provider resources now; do not run on_session_end(), because
+        # eviction is not a logical conversation boundary.
+        try:
+            release_memory = getattr(agent, "release_memory_provider_resources", None)
+            if callable(release_memory):
+                release_memory()
+        except Exception:
+            pass
         try:
             if hasattr(agent, "release_clients"):
                 agent.release_clients()
@@ -14538,11 +14731,10 @@ class GatewayRunner:
             # config (defaults to 40 chars when unset to keep gateway messages
             # compact — unlike CLI spinners, these persist as permanent messages).
             if preview:
-                from agent.display import get_tool_preview_max_len
+                from agent.display import get_tool_preview_max_len, truncate_tool_preview
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
-                    preview = preview[:_cap - 3] + "..."
+                preview = truncate_tool_preview(tool_name, preview, _cap)
                 msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
@@ -15094,9 +15286,7 @@ class GatewayRunner:
                     fallback_model=self._fallback_model,
                 )
                 if _cache_lock and _cache is not None:
-                    with _cache_lock:
-                        _cache[session_key] = (agent, _sig)
-                        self._enforce_agent_cache_cap()
+                    self._store_cached_agent(session_key, agent, _sig)
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
             # Per-message state — callbacks and reasoning config change every
@@ -15608,6 +15798,7 @@ class GatewayRunner:
                 if entry:
                     entry.session_id = agent.session_id
                     self.session_store._save()
+                self._move_goal_on_compression_split(session_id, agent.session_id)
 
             effective_session_id = getattr(agent, 'session_id', session_id) if agent else session_id
 
