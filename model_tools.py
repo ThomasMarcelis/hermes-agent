@@ -23,6 +23,7 @@ Public API (signatures preserved from the original 2,400-line version):
 import json
 import asyncio
 import logging
+import os
 import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
@@ -77,6 +78,43 @@ def _get_worker_loop():
         asyncio.set_event_loop(loop)
         _worker_thread_local.loop = loop
     return loop
+
+
+def _coerce_positive_timeout(value: Any) -> Optional[float]:
+    """Return *value* as a positive timeout in seconds, or None if invalid."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return None
+    if timeout <= 0:
+        return None
+    return timeout
+
+
+def _async_tool_timeout_seconds(default: float = 300.0) -> float:
+    """Resolve async-tool bridge timeout for event-loop contexts.
+
+    Long-running async tools (notably OpenRouter-backed aggregation and deep
+    session_search runs) are dispatched through this bridge in gateway/ACP/RL
+    contexts. Keep the legacy 300 s fallback, but honor explicit operational
+    knobs for long reasoning/model and tool workflows.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        agent_cfg = cfg.get("agent") or {}
+        timeout = _coerce_positive_timeout(agent_cfg.get("async_tool_timeout_seconds"))
+        if timeout is not None:
+            return timeout
+    except Exception:
+        pass
+
+    timeout = _coerce_positive_timeout(os.getenv("HERMES_ASYNC_TOOL_TIMEOUT"))
+    if timeout is not None:
+        return timeout
+
+    return float(default)
 
 
 def _run_async(coro):
@@ -141,8 +179,9 @@ def _run_async(coro):
 
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = pool.submit(_run_in_worker)
+        timeout_seconds = _async_tool_timeout_seconds()
         try:
-            return future.result(timeout=300)
+            return future.result(timeout=timeout_seconds)
         except concurrent.futures.TimeoutError:
             # Cancel the coroutine inside its own loop so the worker thread
             # can wind down instead of running forever.

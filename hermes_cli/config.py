@@ -1052,7 +1052,7 @@ DEFAULT_CONFIG = {
     
     "stt": {
         "enabled": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe)
+        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe v2) | "xai" (Grok STT)
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
@@ -1063,12 +1063,20 @@ DEFAULT_CONFIG = {
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
         },
+        "elevenlabs": {
+            "model": "scribe_v2",  # scribe_v2, scribe_v1
+            "language_code": "",  # optional ISO-639-1 or ISO-639-3 hint; blank = auto-detect
+            "diarize": False,
+            "tag_audio_events": True,
+            "timestamps_granularity": "none",  # none, word, character
+        },
     },
 
     "voice": {
         "record_key": "ctrl+b",
         "max_recording_seconds": 120,
         "auto_tts": False,
+        "auto_tts_mode": "voice_only",  # voice_only (safe default) | all (profile-wide voice+text replies)
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
@@ -1247,7 +1255,8 @@ DEFAULT_CONFIG = {
     # Discord platform settings (gateway mode)
     "discord": {
         "require_mention": True,       # Require @mention to respond in server channels
-        "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
+        "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention and replies inline
+        "thread_free_response_channels": "",  # Channel IDs where bot responds without mention and still auto-threads
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)

@@ -11,8 +11,47 @@ from model_tools import (
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
+    _async_tool_timeout_seconds,
     TOOL_TO_TOOLSET_MAP,
 )
+
+
+# =========================================================================
+# Async tool timeout resolution
+# =========================================================================
+
+class TestAsyncToolTimeoutResolution:
+    def test_config_value_overrides_legacy_300s_bridge_timeout(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  async_tool_timeout_seconds: 14400\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_ASYNC_TOOL_TIMEOUT", "123")
+
+        assert _async_tool_timeout_seconds() == 14400.0
+
+    def test_env_value_is_used_when_config_key_absent(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_ASYNC_TOOL_TIMEOUT", "7200")
+
+        assert _async_tool_timeout_seconds() == 7200.0
+
+    def test_invalid_values_fall_back_to_legacy_default(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  async_tool_timeout_seconds: not-a-number\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_ASYNC_TOOL_TIMEOUT", "0")
+
+        assert _async_tool_timeout_seconds() == 300.0
 
 
 # =========================================================================
