@@ -112,6 +112,30 @@ def test_specify_task_happy_path(kanban_home):
     assert "**Goal**" in (task.body or "")
 
 
+def test_specify_task_uses_configured_timeout_and_extra_body(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    content = jsonlib.dumps({
+        "title": "Refined rough",
+        "body": "**Goal**\nA concrete goal.",
+    })
+    p, client = _patch_aux_client(content, model="aux-model")
+    extra_body = {"reasoning": {"enabled": True, "effort": "xhigh"}}
+    with (
+        p,
+        patch("agent.auxiliary_client._get_task_timeout", return_value=3600),
+        patch("agent.auxiliary_client._get_task_extra_body", return_value=extra_body),
+    ):
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is True
+    call_kwargs = client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["model"] == "aux-model"
+    assert call_kwargs["timeout"] == 3600
+    assert call_kwargs["extra_body"] == extra_body
+
+
 def test_specify_task_falls_back_to_body_only_on_bad_json(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="keep title", triage=True)

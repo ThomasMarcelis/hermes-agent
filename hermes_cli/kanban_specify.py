@@ -155,13 +155,22 @@ def specify_task(
         )
 
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import (
+            _get_task_extra_body,
+            _get_task_timeout,
+            get_text_auxiliary_client,
+        )
     except Exception as exc:  # pragma: no cover — import smoke test
         logger.debug("specify: auxiliary client import failed: %s", exc)
         return SpecifyOutcome(task_id, False, "auxiliary client unavailable")
 
     try:
         client, model = get_text_auxiliary_client("triage_specifier")
+        call_timeout = timeout if timeout is not None else _get_task_timeout(
+            "triage_specifier",
+            120,
+        )
+        extra_body = _get_task_extra_body("triage_specifier")
     except Exception as exc:
         logger.debug("specify: get_text_auxiliary_client failed: %s", exc)
         return SpecifyOutcome(task_id, False, "auxiliary client unavailable")
@@ -178,17 +187,19 @@ def specify_task(
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
+        call_kwargs = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            temperature=0.3,
-            max_tokens=1500,
-            timeout=timeout or 120,
-            extra_body=get_auxiliary_extra_body() or None,
-        )
+            "temperature": 0.3,
+            "max_tokens": 1500,
+            "timeout": call_timeout,
+        }
+        if extra_body:
+            call_kwargs["extra_body"] = extra_body
+        resp = client.chat.completions.create(**call_kwargs)
     except Exception as exc:
         logger.info(
             "specify: API call failed for %s (%s) — skipping",
