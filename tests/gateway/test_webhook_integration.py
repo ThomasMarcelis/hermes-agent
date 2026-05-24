@@ -8,9 +8,11 @@ These tests exercise end-to-end flows through the webhook adapter:
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -336,3 +338,373 @@ class TestGitHubCommentDelivery:
         # Delivery info is retained after send() so interim status messages
         # don't strand the final response (TTL-based cleanup happens on POST).
         assert chat_id in adapter._delivery_info
+
+# ===================================================================
+# Test 5: Cloudflare Email Service delivery
+# ===================================================================
+
+class TestCloudflareEmailDelivery:
+
+    @pytest.mark.asyncio
+    async def test_cloudflare_email_delivery(self, tmp_path):
+        """When deliver='cloudflare_email', final agent text is POSTed to
+        Cloudflare Email Service with rendered sender/recipient/threading.
+        """
+        env_file = tmp_path / "cloudflare.env"
+        env_file.write_text(
+            "CLOUDFLARE_ACCOUNT_ID=acct_123\n"
+            "CLOUDFLARE_API_TOKEN=token_456\n",
+            encoding="utf-8",
+        )
+        routes = {
+            "agent-email": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{body_text}",
+                "deliver": "cloudflare_email",
+                "deliver_extra": {
+                    "env_file": str(env_file),
+                    "from": "{recipient}",
+                    "to": "{from.address}",
+                    "subject": "{subject}",
+                    "in_reply_to": "{message_id}",
+                    "references": "{message_id}",
+                },
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "body_text": "Please update the site",
+            "recipient": "agent@example.com",
+            "from": {"address": "thomas@example.com"},
+            "subject": "Website feedback",
+            "message_id": "<msg-1@example.com>",
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/agent-email",
+                json=payload,
+                headers={"X-Request-ID": "email-001"},
+            )
+            assert resp.status == 202
+
+        calls = []
+
+        class FakeResponse:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self):
+                return b'{"success": true, "errors": []}'
+
+        def fake_urlopen(req, timeout=None):
+            calls.append((req, timeout))
+            return FakeResponse()
+
+        markdown_reply = (
+            "# Done\n\n"
+            "- **Updated** the site\n"
+            "- See [the page](https://example.com/?a=1&b=2)\n\n"
+            "<script>alert('x')</script>\n\n"
+            "[unsafe](javascript:alert(1))"
+        )
+
+        with patch("gateway.platforms.webhook_email.urllib.request.urlopen", fake_urlopen):
+            result = await adapter.send(
+                "webhook:agent-email:email-001",
+                markdown_reply,
+            )
+
+        assert result.success is True
+        assert len(calls) == 1
+        req, timeout = calls[0]
+        assert timeout == 45
+        assert req.full_url == (
+            "https://api.cloudflare.com/client/v4/accounts/acct_123/email/sending/send"
+        )
+        assert req.headers["Authorization"] == "Bearer token_456"
+        sent = json.loads(req.data.decode("utf-8"))
+        assert sent["to"] == "thomas@example.com"
+        assert sent["from"] == "agent@example.com"
+        assert sent["subject"] == "Re: Website feedback"
+        assert sent["text"] == markdown_reply
+        assert sent["headers"] == {
+            "In-Reply-To": "<msg-1@example.com>",
+            "References": "<msg-1@example.com>",
+        }
+        assert "html" in sent
+        assert "<h1>Done</h1>" in sent["html"]
+        assert "<strong>Updated</strong>" in sent["html"]
+        assert 'href="https://example.com/?a=1&amp;b=2"' in sent["html"]
+        assert "<script" not in sent["html"].lower()
+        assert "javascript:" not in sent["html"].lower()
+
+    @pytest.mark.asyncio
+    async def test_agent_email_attachment_bytes_are_saved_and_prompt_augmented(self, tmp_path, monkeypatch):
+        """agent_email_received payload attachments are decoded to local files
+        and local paths are appended to the agent prompt before dispatch.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        routes = {
+            "agent-email": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["agent_email_received"],
+                "prompt": "{agent_prompt}",
+                "deliver": "log",
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+
+        image_bytes = b"\x89PNG\r\n\x1a\nsmall-test-image"
+        payload = {
+            "event_type": "agent_email_received",
+            "agent_prompt": "Please inspect the attachment.",
+            "body_text": "Please inspect the attachment.",
+            "recipient": "agent@example.com",
+            "from": {"address": "thomas@example.com"},
+            "subject": "Attachment test",
+            "message_id": "<att-1@example.com>",
+            "attachments": {
+                "supported": True,
+                "count": 1,
+                "items": [
+                    {
+                        "filename": "screenshot.png",
+                        "content_type": "image/png",
+                        "approx_bytes": len(image_bytes),
+                        "content_included": True,
+                        "content_encoding": "base64",
+                        "content_base64": base64.b64encode(image_bytes).decode("ascii"),
+                    }
+                ],
+            },
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/agent-email",
+                json=payload,
+                headers={"X-Request-ID": "email-att-001"},
+            )
+            assert resp.status == 202
+
+        await asyncio.sleep(0.05)
+        adapter.handle_message.assert_awaited_once()
+        await_args = adapter.handle_message.await_args
+        assert await_args is not None
+        event = await_args.args[0]
+        assert isinstance(event, MessageEvent)
+        assert "Hermes saved email attachments" in event.text
+        assert "screenshot.png" in event.text
+        assert "vision_analyze" in event.text
+
+        item = event.raw_message["attachments"]["items"][0]
+        assert "content_base64" not in item
+        assert item["content_saved"] is True
+        saved_path = Path(item["local_path"])
+        assert saved_path.exists()
+        assert saved_path.read_bytes() == image_bytes
+
+    @pytest.mark.asyncio
+    async def test_cloudflare_email_intro_reply_uses_payload_reply_plan(self, tmp_path):
+        """Introduction handoffs can override the default reply-to-sender rule.
+
+        The authenticated Worker decides the validated recipient set from the
+        message To/Cc headers. Hermes must honor that payload-level plan so a
+        one-off introduction can continue directly with the introduced address
+        while removing the introducer from recipients.
+        """
+        env_file = tmp_path / "cloudflare.env"
+        env_file.write_text(
+            "CLOUDFLARE_ACCOUNT_ID=acct_123\n"
+            "CLOUDFLARE_API_TOKEN=token_456\n",
+            encoding="utf-8",
+        )
+        routes = {
+            "agent-email": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{agent_prompt}",
+                "deliver": "cloudflare_email",
+                "deliver_extra": {
+                    "env_file": str(env_file),
+                    "from": "{recipient}",
+                    "to": "{from.address}",
+                    "subject": "{subject}",
+                    "in_reply_to": "{message_id}",
+                    "references": "{message_id}",
+                },
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "event_type": "agent_email_received",
+            "agent_prompt": "Private intro prompt\n\nPlease reply to the copied recipient.",
+            "body_text": "Please reply directly to the copied recipient and remove me.",
+            "recipient": "agent-intro@example.com",
+            "from": {"address": "thomas@example.com"},
+            "subject": "Intro to project contact",
+            "message_id": "<intro-1@example.com>",
+            "reply_to": {
+                "mode": "introduction",
+                "to": ["anton@example.com"],
+                "cc": [],
+                "excluded": ["agent-intro@example.com", "sender@example.com"],
+            },
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/agent-email",
+                json=payload,
+                headers={"X-Request-ID": "email-intro-001"},
+            )
+            assert resp.status == 202
+
+        class FakeResponse:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self):
+                return b'{"success": true, "errors": []}'
+
+        calls = []
+        def fake_urlopen(req, timeout=None):
+            calls.append((req, timeout))
+            return FakeResponse()
+
+        with patch("gateway.platforms.webhook_email.urllib.request.urlopen", fake_urlopen):
+            result = await adapter.send(
+                "webhook:agent-email:email-intro-001",
+                "Thanks - continuing here directly.",
+            )
+
+        assert result.success is True
+        assert len(calls) == 1
+        sent = json.loads(calls[0][0].data.decode("utf-8"))
+        assert sent["to"] == "anton@example.com"
+        assert "cc" not in sent
+        assert sent["from"] == "agent-intro@example.com"
+        assert "thomas@example.com" not in json.dumps(sent)
+        assert sent["headers"] == {
+            "In-Reply-To": "<intro-1@example.com>",
+            "References": "<intro-1@example.com>",
+        }
+
+
+# ===================================================================
+# Test 6: Operator mirror for supervised agent-email channels
+# ===================================================================
+
+class TestOperatorMirror:
+
+    @pytest.mark.asyncio
+    async def test_incoming_and_final_outgoing_are_mirrored_to_discord_thread(self, tmp_path):
+        """Payload-provided operator_mirror copies inbound/outbound email
+        content to Discord while the canonical reply still goes via email.
+        """
+        env_file = tmp_path / "cloudflare.env"
+        env_file.write_text(
+            "CLOUDFLARE_ACCOUNT_ID=acct_123\n"
+            "CLOUDFLARE_API_TOKEN=token_456\n",
+            encoding="utf-8",
+        )
+        routes = {
+            "agent-email": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["agent_email_received"],
+                "prompt": "{agent_prompt}",
+                "deliver": "cloudflare_email",
+                "deliver_extra": {
+                    "env_file": str(env_file),
+                    "from": "{recipient}",
+                    "to": "{from.address}",
+                    "subject": "{subject}",
+                    "in_reply_to": "{message_id}",
+                    "references": "{message_id}",
+                },
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+
+        mock_discord_adapter = AsyncMock()
+        mock_discord_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform.DISCORD: mock_discord_adapter}
+        mock_runner.config = GatewayConfig(
+            platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="fake")}
+        )
+        adapter.gateway_runner = mock_runner
+
+        payload = {
+            "event_type": "agent_email_received",
+            "agent_prompt": "Private project prompt\n\nPlease review this page.",
+            "body_text": "Please review this page.",
+            "recipient": "agent-project@example.com",
+            "channel": {"agent_key": "jd-parigo-anton"},
+            "from": {"raw": "Client <client@example.com>", "address": "client@example.com"},
+            "subject": "Project website",
+            "message_id": "<anton-1@example.com>",
+            "trust": {"spf": "pass", "dkim": "pass", "dmarc": "pass"},
+            "operator_mirror": {
+                "enabled": True,
+                "platform": "discord",
+                "chat_id": "parent-channel",
+                "thread_id": "thread-123",
+                "label": "Client / Project",
+                "include_incoming": True,
+                "include_outgoing": True,
+            },
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/agent-email",
+                json=payload,
+                headers={"X-Request-ID": "email-anton-001"},
+            )
+            assert resp.status == 202
+
+        await asyncio.sleep(0.05)
+        assert mock_discord_adapter.send.await_count == 1
+        incoming_call = mock_discord_adapter.send.await_args_list[0]
+        assert incoming_call.args[0] == "parent-channel"
+        assert "Client / Project - incoming email" in incoming_call.args[1]
+        assert "Please review this page." in incoming_call.args[1]
+        assert incoming_call.kwargs == {"metadata": {"thread_id": "thread-123"}}
+
+        class FakeResponse:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self):
+                return b'{"success": true, "errors": []}'
+
+        with patch("gateway.platforms.webhook_email.urllib.request.urlopen", return_value=FakeResponse()):
+            result = await adapter.send(
+                "webhook:agent-email:email-anton-001",
+                "I reviewed it; here are the project-specific notes.",
+                metadata={"notify": True},
+            )
+
+        assert result.success is True
+        assert mock_discord_adapter.send.await_count == 2
+        outgoing_call = mock_discord_adapter.send.await_args_list[1]
+        assert outgoing_call.args[0] == "parent-channel"
+        assert "Client / Project - outgoing email reply" in outgoing_call.args[1]
+        assert "Email delivery:** sent" in outgoing_call.args[1]
+        assert "project-specific notes" in outgoing_call.args[1]
+        assert outgoing_call.kwargs == {"metadata": {"thread_id": "thread-123"}}
