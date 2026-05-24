@@ -8920,7 +8920,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
-                session_entry.session_id = agent_result["session_id"]
+                old_session_id = session_entry.session_id
+                new_session_id = agent_result["session_id"]
+                self._move_goal_on_compression_split(old_session_id, new_session_id)
+                session_entry.session_id = new_session_id
                 self.session_store._save()
                 self._sync_telegram_topic_binding(
                     source, session_entry, reason="agent-result-compression",
@@ -9706,6 +9709,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return int(goals_cfg.get("max_turns", 20) or 20)
         except Exception:
             return 20
+
+    def _move_goal_on_compression_split(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+    ) -> Any:
+        """Move active /goal state when context compression rotates sessions."""
+        try:
+            from hermes_cli.goals import move_goal
+        except Exception as exc:
+            logger.debug("goal compression move unavailable: %s", exc)
+            return None
+        try:
+            return move_goal(old_session_id, new_session_id, reason="compression")
+        except Exception as exc:
+            logger.debug(
+                "goal compression move failed %s -> %s: %s",
+                old_session_id,
+                new_session_id,
+                exc,
+            )
+            return None
 
     def _get_goal_manager_for_event(self, event: "MessageEvent"):
         """Return a GoalManager bound to the session for this gateway event.
@@ -14985,6 +15010,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Session split detected: %s → %s (compression)",
                     session_id, agent_session_id,
                 )
+                self._move_goal_on_compression_split(session_id, agent_session_id)
                 entry = self.session_store._entries.get(session_key)
                 if entry:
                     entry.session_id = agent_session_id

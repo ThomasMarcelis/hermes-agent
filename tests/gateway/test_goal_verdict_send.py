@@ -96,126 +96,171 @@ def _make_runner_with_adapter(session_id: str = None):
     return runner, adapter, session_entry, src
 
 
-@pytest.mark.asyncio
-async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
+def _run_async(coro):
+    return asyncio.run(coro)
+
+
+def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
     """When the judge says done, the '✓ Goal achieved' message must reach
     the user through the adapter's ``send()`` method."""
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    async def _run_case() -> None:
+        runner, adapter, session_entry, src = _make_runner_with_adapter()
 
-    from hermes_cli.goals import GoalManager
+        from hermes_cli.goals import GoalManager
 
-    mgr = GoalManager(session_entry.session_id)
-    mgr.set("ship the feature")
+        mgr = GoalManager(session_entry.session_id)
+        mgr.set("ship the feature")
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("done", "the feature shipped", False)):
-        await runner._post_turn_goal_continuation(
-            session_entry=session_entry,
-            source=src,
-            final_response="I shipped the feature.",
-        )
-        # fire-and-forget create_task — give the loop a tick
-        await asyncio.sleep(0.05)
+        with patch("hermes_cli.goals.judge_goal", return_value=("done", "the feature shipped", False)):
+            await runner._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=src,
+                final_response="I shipped the feature.",
+            )
+            await asyncio.sleep(0.05)
 
-    assert len(adapter.sends) == 1, f"expected 1 send, got {len(adapter.sends)}: {adapter.sends}"
-    msg = adapter.sends[0]
-    assert msg["chat_id"] == "c1"
-    assert "Goal achieved" in msg["content"]
-    assert "the feature shipped" in msg["content"]
+        assert len(adapter.sends) == 1, f"expected 1 send, got {len(adapter.sends)}: {adapter.sends}"
+        msg = adapter.sends[0]
+        assert msg["chat_id"] == "c1"
+        assert "Goal achieved" in msg["content"]
+        assert "the feature shipped" in msg["content"]
+
+    _run_async(_run_case())
 
 
-@pytest.mark.asyncio
-async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
+def test_goal_verdict_continue_enqueues_continuation(hermes_home):
     """When the judge says continue, both the 'continuing' status and the
     continuation-prompt event must be delivered. The continuation prompt is
     routed through the adapter's pending-messages FIFO so the goal loop
     proceeds on the next turn."""
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    async def _run_case() -> None:
+        runner, adapter, session_entry, src = _make_runner_with_adapter()
 
-    from hermes_cli.goals import GoalManager
+        from hermes_cli.goals import GoalManager
 
-    mgr = GoalManager(session_entry.session_id)
-    mgr.set("polish the docs")
+        mgr = GoalManager(session_entry.session_id)
+        mgr.set("polish the docs")
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False)):
-        await runner._post_turn_goal_continuation(
-            session_entry=session_entry,
-            source=src,
-            final_response="here's a partial edit",
-        )
-        await asyncio.sleep(0.05)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False)):
+            await runner._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=src,
+                final_response="here's a partial edit",
+            )
+            await asyncio.sleep(0.05)
 
-    # Status line sent back
-    assert len(adapter.sends) == 1
-    assert "Continuing toward goal" in adapter.sends[0]["content"]
-    # Continuation prompt enqueued for next turn
-    assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
+        assert len(adapter.sends) == 1
+        assert "Continuing toward goal" in adapter.sends[0]["content"]
+        assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
+
+    _run_async(_run_case())
 
 
-@pytest.mark.asyncio
-async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
+def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     """When the budget is exhausted, a '⏸ Goal paused' message must be sent
     and no further continuation enqueued."""
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    async def _run_case() -> None:
+        runner, adapter, session_entry, src = _make_runner_with_adapter()
 
-    from hermes_cli.goals import GoalManager, save_goal
+        from hermes_cli.goals import GoalManager, save_goal
 
-    mgr = GoalManager(session_entry.session_id, default_max_turns=2)
-    state = mgr.set("tiny goal", max_turns=2)
-    state.turns_used = 2
-    save_goal(session_entry.session_id, state)
+        mgr = GoalManager(session_entry.session_id, default_max_turns=2)
+        state = mgr.set("tiny goal", max_turns=2)
+        state.turns_used = 2
+        save_goal(session_entry.session_id, state)
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False)):
-        await runner._post_turn_goal_continuation(
-            session_entry=session_entry,
-            source=src,
-            final_response="still partial",
-        )
-        await asyncio.sleep(0.05)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False)):
+            await runner._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=src,
+                final_response="still partial",
+            )
+            await asyncio.sleep(0.05)
 
-    assert len(adapter.sends) == 1
-    content = adapter.sends[0]["content"]
-    assert "paused" in content.lower()
-    assert "turns used" in content.lower()
-    # No continuation enqueued when budget is exhausted
-    assert not adapter._pending_messages
+        assert len(adapter.sends) == 1
+        content = adapter.sends[0]["content"]
+        assert "paused" in content.lower()
+        assert "turns used" in content.lower()
+        assert not adapter._pending_messages
+
+    _run_async(_run_case())
 
 
-@pytest.mark.asyncio
-async def test_goal_verdict_skipped_when_no_active_goal(hermes_home):
+def test_goal_verdict_skipped_when_no_active_goal(hermes_home):
     """No goal set → the hook is a no-op. Nothing is sent, nothing enqueued."""
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    async def _run_case() -> None:
+        runner, adapter, session_entry, src = _make_runner_with_adapter()
 
-    await runner._post_turn_goal_continuation(
-        session_entry=session_entry,
-        source=src,
-        final_response="anything",
-    )
-    await asyncio.sleep(0.05)
-
-    assert adapter.sends == []
-    assert adapter._pending_messages == {}
-
-
-@pytest.mark.asyncio
-async def test_goal_verdict_survives_adapter_without_send(hermes_home):
-    """Bad adapter (no ``send`` attribute) must not crash the judge hook."""
-    runner, _adapter, session_entry, src = _make_runner_with_adapter()
-
-    from hermes_cli.goals import GoalManager
-
-    GoalManager(session_entry.session_id).set("survive missing send")
-
-    class _NoSendAdapter:
-        def __init__(self):
-            self._pending_messages: dict = {}
-
-    runner.adapters[Platform.TELEGRAM] = _NoSendAdapter()
-
-    with patch("hermes_cli.goals.judge_goal", return_value=("done", "ok", False)):
-        # must not raise
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
-            final_response="whatever",
+            final_response="anything",
         )
         await asyncio.sleep(0.05)
+
+        assert adapter.sends == []
+        assert adapter._pending_messages == {}
+
+    _run_async(_run_case())
+
+
+def test_goal_state_moves_when_gateway_observes_compression_split(hermes_home):
+    """When gateway detects a compression session split, active /goal state
+    must move immediately to the child session.
+
+    Relying only on lazy GoalManager adoption left live active goals stranded on
+    compressed parent sessions when the post-turn hook was skipped or missed the
+    new physical session id.
+    """
+    from gateway.run import GatewayRunner
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    db.create_session("goal-parent", source="discord", model="test")
+    parent_mgr = GoalManager("goal-parent", default_max_turns=9)
+    parent_mgr.set("survive gateway compression")
+    db.end_session("goal-parent", "compression")
+    db.create_session(
+        "goal-child",
+        source="discord",
+        model="test",
+        parent_session_id="goal-parent",
+    )
+
+    runner = object.__new__(GatewayRunner)
+
+    moved = runner._move_goal_on_compression_split("goal-parent", "goal-child")
+
+    assert moved is not None
+    assert moved.goal == "survive gateway compression"
+    assert moved.max_turns == 9
+    assert load_goal("goal-child").status == "active"
+    assert load_goal("goal-child").goal == "survive gateway compression"
+    assert load_goal("goal-parent").status == "cleared"
+
+
+def test_goal_verdict_survives_adapter_without_send(hermes_home):
+    """Bad adapter (no ``send`` attribute) must not crash the judge hook."""
+    async def _run_case() -> None:
+        runner, _adapter, session_entry, src = _make_runner_with_adapter()
+
+        from hermes_cli.goals import GoalManager
+
+        GoalManager(session_entry.session_id).set("survive missing send")
+
+        class _NoSendAdapter:
+            def __init__(self):
+                self._pending_messages: dict = {}
+
+        runner.adapters[Platform.TELEGRAM] = _NoSendAdapter()
+
+        with patch("hermes_cli.goals.judge_goal", return_value=("done", "ok", False)):
+            await runner._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=src,
+                final_response="whatever",
+            )
+            await asyncio.sleep(0.05)
+
+    _run_async(_run_case())
