@@ -170,11 +170,52 @@ def _oneline(text: str) -> str:
 
 
 def _truncate_preview(text: str, max_len: int | None) -> str:
-    if max_len and max_len > 0 and len(text) > max_len:
-        if max_len <= 3:
-            return "." * max_len
-        return text[:max_len - 3] + "..."
+    if max_len and max_len > 0:
+        return _truncate_with_ellipsis(text, max_len)
     return text
+
+
+_PATH_PREVIEW_TOOLS = frozenset({"read_file", "write_file", "patch"})
+
+
+def _should_preserve_preview_end(tool_name: str, key: str | None = None) -> bool:
+    """Return true for previews where the suffix is more useful than the prefix."""
+    return key == "path" or tool_name in _PATH_PREVIEW_TOOLS
+
+
+def _truncate_with_ellipsis(text: str, max_len: int, *, preserve_end: bool = False) -> str:
+    """Truncate text to max_len, optionally keeping the end instead of start."""
+    try:
+        limit = int(max_len)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if limit <= 3:
+        return "." * limit
+    if preserve_end:
+        return "..." + text[-(limit - 3):]
+    return text[:limit - 3] + "..."
+
+
+def truncate_tool_preview(
+    tool_name: str,
+    preview: str,
+    max_len: int,
+    *,
+    key: str | None = None,
+) -> str:
+    """Truncate a tool preview with path-aware suffix preservation.
+
+    Generic previews keep their beginning (commands, queries, prompts). Path
+    previews keep their end so narrow progress bubbles still show the actual
+    file name instead of only the common home directory prefix.
+    """
+    return _truncate_with_ellipsis(
+        str(preview),
+        max_len,
+        preserve_end=_should_preserve_preview_end(tool_name, key),
+    )
 
 
 def _delegate_task_goal_parts(tasks: Any, *, per_goal_len: int) -> tuple[int, list[str]]:
@@ -296,7 +337,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     if not preview:
         return None
     if max_len > 0 and len(preview) > max_len:
-        preview = preview[:max_len - 3] + "..."
+        preview = truncate_tool_preview(tool_name, preview, max_len, key=key)
     return preview
 
 
@@ -1070,5 +1111,4 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
-
 
