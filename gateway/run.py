@@ -376,7 +376,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    platform_value = _gateway_platform_value(platform)
+    # Webhook routes can be backed by durable external transports such as
+    # email.  Unlike chat adapters with editable progress/status bubbles,
+    # webhook delivery should emit only the final agent response; lifecycle
+    # chatter like "Compacting context..." becomes permanent user-facing mail.
+    if platform_value == "webhook":
+        return None
+    if platform_value != "telegram":
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
@@ -4253,6 +4260,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not busy_ack_enabled:
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
+        if event.source.platform == Platform.WEBHOOK:
+            logger.debug("Busy ack suppressed for webhook session %s", session_key)
+            return True  # input still processed; webhook/email sends final replies only
 
         # Debounce: only send an acknowledgment once every 30 seconds per session
         # to avoid spamming the user when they send multiple messages quickly
@@ -16271,7 +16281,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _notify_start = time.time()
 
         async def _notify_long_running():
-            if _NOTIFY_INTERVAL is None:
+            if _NOTIFY_INTERVAL is None or source.platform == Platform.WEBHOOK:
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self.adapters.get(source.platform)
             if not _notify_adapter:
@@ -16421,7 +16431,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             and _idle_secs >= _agent_warning):
                         _warning_fired = True
                         _warn_adapter = self.adapters.get(source.platform)
-                        if _warn_adapter:
+                        if _warn_adapter and source.platform != Platform.WEBHOOK:
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                             try:

@@ -54,6 +54,12 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platforms.webhook_email import (
+    deliver_cloudflare_email,
+    format_operator_mirror_message,
+    materialize_payload_attachments,
+    operator_mirror_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +267,17 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "cloudflare_email":
+            result = await deliver_cloudflare_email(content, delivery)
+            if metadata and metadata.get("notify"):
+                await self._maybe_deliver_operator_mirror(
+                    stage="outgoing",
+                    content=content,
+                    delivery=delivery,
+                    delivery_result=result,
+                )
+            return result
 
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
@@ -549,6 +566,18 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        # Build a unique delivery ID before prompt rendering so payload-level
+        # attachment bytes can be materialized to stable per-delivery paths and
+        # appended to agent_email prompts.
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
+        )
+        materialize_payload_attachments(payload, route_name, delivery_id)
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
@@ -583,15 +612,6 @@ class WebhookAdapter(BasePlatformAdapter):
                         )
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
-
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
 
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
@@ -681,6 +701,11 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
+        self._schedule_operator_mirror(
+            stage="incoming",
+            content=prompt,
+            delivery=deliver_config,
+        )
 
         # Build source and event
         source = self.build_source(
@@ -891,6 +916,69 @@ class WebhookAdapter(BasePlatformAdapter):
         return rendered
 
     # ------------------------------------------------------------------
+    # Operator mirrors / audit copies
+    # ------------------------------------------------------------------
+
+    def _schedule_operator_mirror(
+        self, stage: str, content: str, delivery: dict
+    ) -> None:
+        """Schedule a best-effort inbound mirror without delaying webhook ACK."""
+        if not operator_mirror_config(delivery, stage):
+            return
+        task = asyncio.create_task(
+            self._maybe_deliver_operator_mirror(stage, content, delivery)
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _maybe_deliver_operator_mirror(
+        self,
+        stage: str,
+        content: str,
+        delivery: dict,
+        delivery_result: Optional[SendResult] = None,
+    ) -> None:
+        mirror = operator_mirror_config(delivery, stage)
+        if not mirror:
+            return
+        platform_name = str(mirror.get("platform") or "discord").strip().lower()
+        chat_id = str(mirror.get("chat_id") or "").strip()
+        thread_id = str(
+            mirror.get("thread_id")
+            or mirror.get("message_thread_id")
+            or ""
+        ).strip()
+        mirror_extra: Dict[str, Any] = {"chat_id": chat_id}
+        if thread_id:
+            mirror_extra["thread_id"] = thread_id
+        mirror_delivery = {
+            "deliver_extra": mirror_extra,
+            "payload": delivery.get("payload", {}) or {},
+        }
+        mirror_content = format_operator_mirror_message(
+            stage, content, delivery, delivery_result
+        )
+        try:
+            result = await self._deliver_cross_platform(
+                platform_name, mirror_content, mirror_delivery
+            )
+        except Exception as exc:
+            logger.warning(
+                "[webhook] operator mirror exception stage=%s platform=%s: %s",
+                stage,
+                platform_name,
+                exc,
+            )
+            return
+        if not result.success:
+            logger.warning(
+                "[webhook] operator mirror failed stage=%s platform=%s error=%s",
+                stage,
+                platform_name,
+                result.error,
+            )
+
+    # ------------------------------------------------------------------
     # Response delivery
     # ------------------------------------------------------------------
 
@@ -915,6 +1003,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "cloudflare_email":
+            return await deliver_cloudflare_email(content, delivery)
 
         # Fall through to the cross-platform dispatcher, which validates the
         # target name and routes via the gateway runner.
