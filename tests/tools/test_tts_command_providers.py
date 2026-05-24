@@ -31,6 +31,9 @@ from tools.tts_tool import (
     _get_command_tts_timeout,
     _get_named_provider_config,
     _has_any_command_tts_provider,
+    _parse_elevenlabs_dialogue_inputs,
+    _should_preserve_audio_tags_for_tts,
+    _should_preserve_voice_markup_for_tts,
     _is_command_provider_config,
     _is_command_tts_voice_compatible,
     _iter_command_providers,
@@ -38,7 +41,9 @@ from tools.tts_tool import (
     _resolve_command_provider_config,
     _resolve_max_text_length,
     _shell_quote_context,
+    _strip_markdown_for_tts,
     check_tts_requirements,
+    strip_elevenlabs_voice_markup,
     text_to_speech_tool,
 )
 
@@ -450,6 +455,29 @@ class TestTextToSpeechToolWithCommandProvider:
         assert data["voice_compatible"] is False
         assert Path(data["file_path"]).exists()
 
+    def test_command_provider_strips_storyteller_voice_markup(self, tmp_path):
+        cfg = {
+            "provider": "py-copy",
+            "providers": {
+                "py-copy": {
+                    "type": "command",
+                    "command": _python_copy_command(),
+                    "output_format": "mp3",
+                },
+            },
+        }
+        out = tmp_path / "clip.mp3"
+
+        with patch("tools.tts_tool._load_tts_config", return_value=cfg):
+            result = text_to_speech_tool(
+                text="[[voice:clerk.asset_regularization]]Desk Six.[[/voice]]",
+                output_path=str(out),
+            )
+
+        data = json.loads(result)
+        assert data["success"] is True, data
+        assert Path(data["file_path"]).read_text(encoding="utf-8") == "Desk Six."
+
     def test_voice_compatible_opt_in_toggles_flag(self, tmp_path):
         """voice_compatible=true is reflected in the response when the
         file is already .ogg (no ffmpeg needed)."""
@@ -496,3 +524,60 @@ class TestCheckTtsRequirements:
         cfg = {"providers": {"x": {"type": "command", "command": "echo x"}}}
         with patch("tools.tts_tool._load_tts_config", return_value=cfg):
             assert check_tts_requirements() is True
+
+
+class TestElevenLabsStorytellerDialogue:
+    def test_voice_markup_is_removed_for_display(self):
+        assert (
+            strip_elevenlabs_voice_markup("[[voice:narrator]]Hello[[/voice]]")
+            == "Hello"
+        )
+
+    def test_dialogue_inputs_resolve_configured_aliases(self):
+        cfg = {
+            "elevenlabs": {
+                "voice_id": "default-voice-id-000",
+                "voices": {
+                    "clerk.asset_regularization": {
+                        "voice_id": "clerk-voice-id-000",
+                        "name": "Asset Clerk",
+                    }
+                },
+            }
+        }
+
+        inputs = _parse_elevenlabs_dialogue_inputs(
+            "Intro. [[voice:clerk.asset_regularization]]Desk Six.[[/voice]] Back.",
+            cfg,
+        )
+
+        assert inputs == [
+            {"text": "Intro.", "voice_id": "default-voice-id-000"},
+            {"text": "Desk Six.", "voice_id": "clerk-voice-id-000"},
+            {"text": "Back.", "voice_id": "default-voice-id-000"},
+        ]
+
+    def test_audio_tag_preservation_is_elevenlabs_v3_only_by_default(self):
+        assert _should_preserve_audio_tags_for_tts({
+            "provider": "elevenlabs",
+            "elevenlabs": {"model_id": "eleven_v3"},
+        }) is True
+        assert _should_preserve_audio_tags_for_tts({
+            "provider": "elevenlabs",
+            "elevenlabs": {"model_id": "eleven_multilingual_v2"},
+        }) is False
+        assert _should_preserve_audio_tags_for_tts({
+            "provider": "edge",
+        }) is False
+
+    def test_voice_markup_preservation_is_elevenlabs_only(self):
+        assert _should_preserve_voice_markup_for_tts({"provider": "elevenlabs"}) is True
+        assert _should_preserve_voice_markup_for_tts({"provider": "edge"}) is False
+
+    def test_markdown_cleanup_can_strip_audio_tags_and_voice_markup(self):
+        text = "[whispers] [[voice:narrator]]**Hello** from [the door](https://x.test).[[/voice]]"
+        assert _strip_markdown_for_tts(
+            text,
+            preserve_audio_tags=False,
+            preserve_voice_markup=False,
+        ) == "Hello from the door."

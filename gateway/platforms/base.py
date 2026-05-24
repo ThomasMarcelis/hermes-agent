@@ -1696,20 +1696,30 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
-        # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
-        # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
-        # Per-chat overrides live in two sets populated from ``_voice_mode``:
+        # Auto-TTS on assistant replies: ``_auto_tts_default`` is the global
+        # master switch (``voice.auto_tts`` in config.yaml, pushed by
+        # GatewayRunner on connect). ``_auto_tts_default_mode`` controls whether
+        # that global switch is voice-input scoped (``voice_only``; safe default)
+        # or applies to every message type (``all``; useful for dedicated
+        # voice/narration profiles).
+        # Per-chat overrides live in sets populated from ``_voice_mode``:
         #   - ``_auto_tts_enabled_chats``: chat explicitly opted in via ``/voice on``
         #     or ``/voice tts`` (mode is ``voice_only`` or ``all``). Fires even when
-        #     the global default is False.
+        #     the global default is False for voice-message replies. A chat in this
+        #     set but not in ``_auto_tts_all_chats`` is an explicit voice-only opt-in.
+        #   - ``_auto_tts_all_chats``: chat explicitly opted in via ``/voice tts``
+        #     (mode is ``all``). Fires for text-message replies too.
         #   - ``_auto_tts_disabled_chats``: chat explicitly opted out via
         #     ``/voice off`` (mode is ``off``). Suppresses auto-TTS even when the
         #     global default is True.
         # The gate in _process_message() is:
-        #   fire if chat in _auto_tts_enabled_chats
-        #     OR (_auto_tts_default and chat not in _auto_tts_disabled_chats)
+        #   text event: explicit all chat, else global all mode when enabled
+        #   voice event: explicit voice/all chat, else global default when enabled
+        #   explicit off always suppresses both.
         self._auto_tts_default: bool = False
+        self._auto_tts_default_mode: str = "voice_only"
         self._auto_tts_enabled_chats: set = set()
+        self._auto_tts_all_chats: set = set()
         self._auto_tts_disabled_chats: set = set()
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
@@ -1809,20 +1819,76 @@ class BasePlatformAdapter(ABC):
     def fatal_error_retryable(self) -> bool:
         return self._fatal_error_retryable
 
+    @staticmethod
+    def _normalize_auto_tts_default_mode(mode: Any) -> str:
+        """Normalize ``voice.auto_tts_mode`` to a supported default scope."""
+        value = str(mode or "voice_only").strip().lower().replace("-", "_")
+        if value in {"all", "always", "all_messages", "text_and_voice"}:
+            return "all"
+        if value in {"voice", "voice_only", "voice_input", "voice_input_only"}:
+            return "voice_only"
+        return "voice_only"
+
+    @staticmethod
+    def _should_auto_tts_for_state(
+        *,
+        chat_id: str,
+        message_type: MessageType,
+        auto_tts_default: bool,
+        auto_tts_default_mode: Any = "voice_only",
+        enabled_chats: Optional[set] = None,
+        all_chats: Optional[set] = None,
+        disabled_chats: Optional[set] = None,
+    ) -> bool:
+        """Pure auto-TTS decision used by adapter and runner paths."""
+        disabled_chats = disabled_chats or set()
+        enabled_chats = enabled_chats or set()
+        all_chats = all_chats or set()
+
+        if chat_id in disabled_chats:
+            return False
+        if chat_id in all_chats:
+            return True
+        if chat_id in enabled_chats:
+            return message_type == MessageType.VOICE
+
+        if not bool(auto_tts_default):
+            return False
+        if message_type == MessageType.VOICE:
+            return True
+        default_mode = BasePlatformAdapter._normalize_auto_tts_default_mode(
+            auto_tts_default_mode
+        )
+        return default_mode == "all"
+
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
         """Whether auto-TTS on voice input should fire for ``chat_id``.
 
-        Decision layers (Issue #16007):
-          1. Explicit ``/voice on`` or ``/voice tts`` → always fire (even if
-             ``voice.auto_tts`` is False).
-          2. Explicit ``/voice off`` → never fire.
-          3. Fall back to the global ``voice.auto_tts`` config default.
+        Kept for callers that only need the historical voice-input decision.
         """
-        if chat_id in self._auto_tts_enabled_chats:
-            return True
-        if chat_id in self._auto_tts_disabled_chats:
-            return False
-        return bool(self._auto_tts_default)
+        return BasePlatformAdapter._should_auto_tts_for_state(
+            chat_id=chat_id,
+            message_type=MessageType.VOICE,
+            auto_tts_default=bool(getattr(self, "_auto_tts_default", False)),
+            auto_tts_default_mode=getattr(self, "_auto_tts_default_mode", "voice_only"),
+            enabled_chats=getattr(self, "_auto_tts_enabled_chats", set()),
+            all_chats=getattr(self, "_auto_tts_all_chats", set()),
+            disabled_chats=getattr(self, "_auto_tts_disabled_chats", set()),
+        )
+
+    def _should_auto_tts_for_event(self, chat_id: str, message_type: MessageType) -> bool:
+        """Whether an assistant reply to this event should include TTS audio."""
+        if message_type == MessageType.VOICE and hasattr(self, "_should_auto_tts_for_chat"):
+            return self._should_auto_tts_for_chat(chat_id)
+        return BasePlatformAdapter._should_auto_tts_for_state(
+            chat_id=chat_id,
+            message_type=message_type,
+            auto_tts_default=bool(getattr(self, "_auto_tts_default", False)),
+            auto_tts_default_mode=getattr(self, "_auto_tts_default_mode", "voice_only"),
+            enabled_chats=getattr(self, "_auto_tts_enabled_chats", set()),
+            all_chats=getattr(self, "_auto_tts_all_chats", set()),
+            disabled_chats=getattr(self, "_auto_tts_disabled_chats", set()),
+        )
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
@@ -2462,9 +2528,22 @@ class BasePlatformAdapter(ABC):
     def prepare_tts_text(self, text: str) -> str:
         """Prepare text for TTS. Override to filter tool output, code, etc.
 
-        Default strips markdown formatting and truncates to 4000 chars.
+        Default strips markdown/display formatting while preserving only the
+        TTS markup that the active provider can consume.
         """
-        return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
+        try:
+            from tools.tts_tool import (
+                _strip_markdown_for_tts,
+                _should_preserve_audio_tags_for_tts,
+                _should_preserve_voice_markup_for_tts,
+            )
+            return _strip_markdown_for_tts(
+                text,
+                preserve_audio_tags=_should_preserve_audio_tags_for_tts(),
+                preserve_voice_markup=_should_preserve_voice_markup_for_tts(),
+            ).strip()
+        except Exception:
+            return re.sub(r'[*_`#\[\]()]', '', text).strip()
 
     async def play_tts(
         self,
@@ -3814,6 +3893,12 @@ class BasePlatformAdapter(ABC):
                 # below can still pick up the bare path — otherwise the file would
                 # be silently dropped (issue #34517).
                 text_content = MEDIA_TAG_CLEANUP_RE.sub("", text_content).strip()
+                _strip_voice_markup_for_display = None
+                if "[[voice" in text_content.lower():
+                    try:
+                        from tools.tts_tool import strip_elevenlabs_voice_markup as _strip_voice_markup_for_display
+                    except Exception:
+                        _strip_voice_markup_for_display = None
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
@@ -3824,13 +3909,11 @@ class BasePlatformAdapter(ABC):
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
                 
-                # Auto-TTS: if voice message, generate audio FIRST (before sending text)
-                # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
-                # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
-                # True globally and no ``/voice off`` has been issued.
+                # Auto-TTS: generate audio FIRST (before sending text) when this
+                # chat is explicitly in all-message narration mode, or when a
+                # voice-input reply should get spoken audio.
                 _tts_path = None
-                if (self._should_auto_tts_for_chat(event.source.chat_id)
-                        and event.message_type == MessageType.VOICE
+                if (self._should_auto_tts_for_event(event.source.chat_id, event.message_type)
                         and text_content
                         and not media_files):
                     try:
@@ -3875,6 +3958,8 @@ class BasePlatformAdapter(ABC):
                             pass
 
                 # Send the text portion
+                if _strip_voice_markup_for_display is not None:
+                    text_content = _strip_voice_markup_for_display(text_content)
                 if text_content and not _tts_caption_delivered:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     _reply_anchor = _reply_anchor_for_event(event)
