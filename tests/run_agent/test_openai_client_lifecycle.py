@@ -207,3 +207,126 @@ def test_streaming_call_recreates_closed_shared_client_before_request(monkeypatc
     assert stale_shared.close_calls >= 1
     assert request_client.close_calls >= 1
     assert len(factory.calls) == 2
+
+
+def test_codex_stream_progress_prevents_stale_kill_while_events_arrive(monkeypatch):
+    """Codex Responses is streaming internally; stale detection tracks events."""
+    agent = _build_agent()
+    agent.api_mode = "codex_responses"
+    agent.status_callback = None
+    agent._print_fn = None
+    agent.tool_progress_callback = None
+    agent._executing_tools = False
+    agent.suppress_status_output = True
+    agent._has_stream_consumers = lambda: False
+    agent._compute_non_stream_stale_timeout = lambda _messages=None: 0.25
+    close_reasons = []
+
+    def _close_request_openai_client(client, *, reason):
+        close_reasons.append(reason)
+        client.close()
+
+    def _abort_request_openai_client(client, *, reason):
+        close_reasons.append(reason)
+        client.close()
+
+    def _run_codex_stream(api_kwargs, client=None, on_first_delta=None, on_stream_event=None):
+        time.sleep(0.20)
+        if on_stream_event is not None:
+            on_stream_event(SimpleNamespace(type="response.created"))
+        time.sleep(0.22)
+        return {"ok": "codex-result"}
+
+    agent._close_request_openai_client = _close_request_openai_client
+    agent._abort_request_openai_client = _abort_request_openai_client
+    agent._run_codex_stream = _run_codex_stream
+    monkeypatch.setattr(run_agent, "OpenAI", OpenAIFactory([FakeRequestClient(lambda **kwargs: None)]))
+
+    result = agent._interruptible_api_call({"model": agent.model, "messages": []})
+
+    assert result == {"ok": "codex-result"}
+    assert "stale_call_kill" not in close_reasons
+    assert close_reasons == ["request_complete"]
+
+
+def test_codex_stall_status_names_stream_first_event_not_non_streaming(monkeypatch):
+    """A Codex first-event stall should be diagnosed as a stream stall."""
+    agent = _build_agent()
+    agent.api_mode = "codex_responses"
+    agent.status_callback = None
+    agent._print_fn = None
+    agent.tool_progress_callback = None
+    agent._executing_tools = False
+    agent.suppress_status_output = True
+    agent._has_stream_consumers = lambda: False
+    agent._compute_non_stream_stale_timeout = lambda _messages=None: 0.05
+    activities = []
+    close_reasons = []
+    close_event = threading.Event()
+
+    def _close_request_openai_client(client, *, reason):
+        close_reasons.append(reason)
+        client.close()
+
+    def _abort_request_openai_client(client, *, reason):
+        close_reasons.append(reason)
+        client.close()
+        close_event.set()
+
+    def _run_codex_stream(api_kwargs, client=None, on_first_delta=None, on_stream_event=None):
+        close_event.wait(timeout=5)
+        raise TimeoutError("provider socket closed before first Codex event")
+
+    agent._touch_activity = activities.append
+    agent._close_request_openai_client = _close_request_openai_client
+    agent._abort_request_openai_client = _abort_request_openai_client
+    agent._run_codex_stream = _run_codex_stream
+    monkeypatch.setattr(run_agent, "OpenAI", OpenAIFactory([FakeRequestClient(lambda **kwargs: None)]))
+
+    with pytest.raises(TimeoutError, match="before first Codex event"):
+        agent._interruptible_api_call({"model": agent.model, "messages": []})
+
+    joined = "\n".join(activities)
+    assert "Codex stream first event" in joined
+    assert "non-streaming" not in joined
+    assert "stale_call_kill" in close_reasons
+
+
+def test_codex_first_event_guard_is_separate_from_total_stale_timeout(monkeypatch):
+    """High total stale windows must not disable no-first-event recovery."""
+    monkeypatch.setenv("HERMES_CODEX_STREAM_FIRST_EVENT_TIMEOUT", "0.05")
+    agent = _build_agent()
+    agent.api_mode = "codex_responses"
+    agent.status_callback = None
+    agent._print_fn = None
+    agent.tool_progress_callback = None
+    agent._executing_tools = False
+    agent.suppress_status_output = True
+    agent._has_stream_consumers = lambda: False
+    agent._compute_non_stream_stale_timeout = lambda _messages=None: 21600.0
+    close_reasons = []
+    close_event = threading.Event()
+
+    def _close_request_openai_client(client, *, reason):
+        close_reasons.append(reason)
+        client.close()
+
+    def _abort_request_openai_client(client, *, reason):
+        close_reasons.append(reason)
+        client.close()
+        close_event.set()
+
+    def _run_codex_stream(api_kwargs, client=None, on_first_delta=None, on_stream_event=None):
+        if close_event.wait(timeout=0.50):
+            raise TimeoutError("provider socket closed before first Codex event")
+        return {"unexpected": "hung until provider eventually replied"}
+
+    agent._close_request_openai_client = _close_request_openai_client
+    agent._abort_request_openai_client = _abort_request_openai_client
+    agent._run_codex_stream = _run_codex_stream
+    monkeypatch.setattr(run_agent, "OpenAI", OpenAIFactory([FakeRequestClient(lambda **kwargs: None)]))
+
+    with pytest.raises(TimeoutError, match="before first Codex event"):
+        agent._interruptible_api_call({"model": agent.model, "messages": []})
+
+    assert "stale_call_kill" in close_reasons

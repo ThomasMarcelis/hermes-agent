@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +419,13 @@ def _consume_codex_event_stream(
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta: Callable[..., Any] | None = None,
+    on_stream_event: Callable[..., Any] | None = None,
+):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -445,6 +451,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
+        if on_stream_event:
+            try:
+                on_stream_event(event)
+            except Exception:
+                pass
         agent._touch_activity("receiving stream response")
 
     def _interrupt_check() -> bool:
@@ -515,7 +526,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     pass
 
 
-def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):
+def run_codex_create_stream_fallback(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_stream_event: Callable[..., Any] | None = None,
+):
     """Backward-compatible alias for the unified event-driven path.
 
     Historically this was the fallback when the SDK's high-level
@@ -524,7 +540,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
     Kept as a public symbol because tests and a small number of call sites
     still reference it by name.
     """
-    return run_codex_stream(agent, api_kwargs, client=client)
+    return run_codex_stream(agent, api_kwargs, client=client, on_stream_event=on_stream_event)
 
 
 __all__ = [
