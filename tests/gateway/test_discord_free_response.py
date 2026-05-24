@@ -109,6 +109,7 @@ def adapter(monkeypatch):
         "DISCORD_REQUIRE_MENTION",
         "DISCORD_THREAD_REQUIRE_MENTION",
         "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_THREAD_FREE_RESPONSE_CHANNELS",
         "DISCORD_AUTO_THREAD",
         "DISCORD_NO_THREAD_CHANNELS",
         "DISCORD_ALLOWED_CHANNELS",
@@ -550,6 +551,40 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
     assert event.source.chat_type == "group"
 
 
+
+
+def test_discord_thread_free_response_channel_still_auto_threads(adapter, monkeypatch):
+    """Thread-free response channels bypass mentions but keep per-topic threads."""
+    import asyncio
+
+    async def _run_case() -> None:
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+        monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+        monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "789")
+        monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+        fake_thread = FakeThread(
+            channel_id=999,
+            name="auto-thread",
+            parent=FakeTextChannel(channel_id=789),
+        )
+        adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+        message = make_message(
+            channel=FakeTextChannel(channel_id=789),
+            content="casual chat with a dedicated thread",
+        )
+
+        await adapter._handle_message(message)
+
+        adapter._auto_create_thread.assert_awaited_once()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "casual chat with a dedicated thread"
+        assert event.source.chat_type == "thread"
+        assert event.source.thread_id == "999"
+
+    asyncio.run(_run_case())
 
 
 @pytest.mark.asyncio

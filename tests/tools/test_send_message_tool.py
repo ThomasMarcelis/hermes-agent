@@ -25,6 +25,24 @@ def _reset_signal_scheduler():
     yield
     _reset_scheduler()
 
+
+@pytest.fixture(autouse=True)
+def _reset_cron_auto_delivery_context():
+    """Keep cron ContextVars from leaking across scheduler/send-message tests."""
+    from gateway import session_context
+
+    cron_vars = [
+        session_context._VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"],
+        session_context._VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"],
+        session_context._VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"],
+        session_context._VAR_MAP["HERMES_CRON_AUTO_DELIVER_TARGETS"],
+    ]
+    for var in cron_vars:
+        var.set(session_context._UNSET)
+    yield
+    for var in cron_vars:
+        var.set(session_context._UNSET)
+
 from gateway.config import Platform
 from tools.send_message_tool import (
     _is_telegram_thread_not_found,
@@ -53,6 +71,8 @@ async def _send_discord(
     *,
     thread_id=None,
     media_files=None,
+    thread_name=None,
+    thread_auto_archive_duration=1440,
 ):
     """Pre-migration ``(token, chat_id, message, …)`` adapter around the
     plugin's ``_standalone_send(pconfig, …)``.  Lets test bodies continue
@@ -65,6 +85,8 @@ async def _send_discord(
         message,
         thread_id=thread_id,
         media_files=media_files,
+        thread_name=thread_name,
+        thread_auto_archive_duration=thread_auto_archive_duration,
     )
 
 
@@ -96,12 +118,23 @@ class _patch_discord_sender:
         self._entry = None
         self._original = None
 
-    async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, media_files=None):
+    async def _adapter(
+        self,
+        pconfig,
+        chat_id,
+        message,
+        *,
+        thread_id=None,
+        media_files=None,
+        thread_name=None,
+        thread_auto_archive_duration=1440,
+    ):
         token = getattr(pconfig, "token", None)
-        return await self._mock(
-            token, chat_id, message,
-            thread_id=thread_id, media_files=media_files,
-        )
+        kwargs = {"thread_id": thread_id, "media_files": media_files}
+        if thread_name:
+            kwargs["thread_name"] = thread_name
+            kwargs["thread_auto_archive_duration"] = thread_auto_archive_duration
+        return await self._mock(token, chat_id, message, **kwargs)
 
     def __enter__(self):
         self._entry = _discord_entry()
@@ -239,6 +272,83 @@ class TestSendMessageTool:
         assert "final response" in result["note"]
         send_mock.assert_not_awaited()
         mirror_mock.assert_not_called()
+
+    def test_cron_duplicate_target_checks_all_auto_delivery_targets(self):
+        config, _telegram_cfg = _make_config()
+        config.platforms[Platform.DISCORD] = SimpleNamespace(enabled=True, token="tok", extra={})
+        config.get_home_channel = lambda platform: SimpleNamespace(
+            chat_id="-2002" if platform == Platform.DISCORD else "-1001"
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_CRON_AUTO_DELIVER_TARGETS": json.dumps([
+                    {"platform": "telegram", "chat_id": "-1001", "thread_id": None},
+                    {"platform": "discord", "chat_id": "-2002", "thread_id": "555"},
+                ])
+            },
+            clear=False,
+        ), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "discord:-2002:555",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["reason"] == "cron_auto_delivery_duplicate_target"
+        send_mock.assert_not_awaited()
+        mirror_mock.assert_not_called()
+
+    def test_cron_thread_per_run_parent_duplicate_is_skipped(self):
+        config, _telegram_cfg = _make_config()
+        config.platforms[Platform.DISCORD] = SimpleNamespace(enabled=True, token="tok", extra={})
+        config.get_home_channel = lambda _platform: SimpleNamespace(chat_id="-2002")
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_CRON_AUTO_DELIVER_TARGETS": json.dumps([
+                    {
+                        "platform": "discord",
+                        "chat_id": "-2002",
+                        "thread_id": None,
+                        "thread_per_run": True,
+                    }
+                ])
+            },
+            clear=False,
+        ), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "discord:-2002",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["reason"] == "cron_auto_delivery_thread_per_run_parent"
+        assert "fresh Discord thread" in result["note"]
+        send_mock.assert_not_awaited()
 
     def test_resolved_telegram_topic_name_preserves_thread_id(self):
         config, telegram_cfg = _make_config()
@@ -1518,6 +1628,29 @@ class TestSendToPlatformDiscordThread:
         send_mock.assert_awaited_once()
         _, call_kwargs = send_mock.await_args
         assert call_kwargs["thread_id"] is None
+
+    def test_discord_thread_per_run_options_passed_to_sender(self):
+        """Cron can request a fresh Discord thread under a parent channel."""
+        send_mock = AsyncMock(return_value={"success": True, "message_id": "1", "thread_id": "th-1"})
+
+        with _patch_discord_sender(send_mock):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "9876543210",
+                    "hello channel",
+                    discord_thread_name="Daily report",
+                    discord_thread_auto_archive_duration=60,
+                )
+            )
+
+        assert result["success"] is True
+        assert result["thread_id"] == "th-1"
+        send_mock.assert_awaited_once()
+        _, call_kwargs = send_mock.await_args
+        assert call_kwargs["thread_name"] == "Daily report"
+        assert call_kwargs["thread_auto_archive_duration"] == 60
 
 
 # ---------------------------------------------------------------------------
