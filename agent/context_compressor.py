@@ -1850,10 +1850,17 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             summary_search_start,
             compress_end,
         )
+        skip_existing_summary_idx: Optional[int] = None
         if summary_idx is not None:
             if summary_body and not self._previous_summary:
                 self._previous_summary = summary_body
+            # Do not serialize an existing handoff as a fresh user turn. If it
+            # sits in the protected head after a resume/restart, keep the
+            # protected head intact except for that stale handoff, then insert
+            # the updated summary below.
             turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
+            if summary_idx < compress_start:
+                skip_existing_summary_idx = summary_idx
 
         if not self.quiet_mode:
             logger.info(
@@ -1909,6 +1916,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Phase 4: Assemble compressed message list
         compressed = []
         for i in range(compress_start):
+            if i == skip_existing_summary_idx:
+                continue
             msg = messages[i].copy()
             if i == 0 and msg.get("role") == "system":
                 existing = msg.get("content")
