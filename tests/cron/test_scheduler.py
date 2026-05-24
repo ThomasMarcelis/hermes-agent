@@ -549,6 +549,42 @@ class TestDeliverResultWrapping:
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "Cronjob Response: abc-123" in sent_content
 
+    def test_discord_thread_per_run_uses_standalone_thread_options(self):
+        """Discord cron jobs can deliver each run into a fresh child thread."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler._hermes_now") as now_mock:
+            now_mock.return_value.strftime.side_effect = lambda fmt: {
+                "%Y-%m-%d": "2026-05-24",
+                "%H:%M": "08:39",
+                "%Y-%m-%d %H:%M": "2026-05-24 08:39",
+            }[fmt]
+            job = {
+                "id": "daily",
+                "name": "Daily report",
+                "deliver": "discord:parent-1",
+                "delivery_options": {
+                    "discord": {
+                        "thread_per_run": True,
+                        "thread_name_template": "{job_name} {date}",
+                        "thread_auto_archive_duration": 60,
+                    }
+                },
+            }
+            _deliver_result(job, "Clean output only.")
+
+        send_mock.assert_called_once()
+        assert send_mock.call_args.kwargs["discord_thread_name"] == "Daily report 2026-05-24"
+        assert send_mock.call_args.kwargs["discord_thread_auto_archive_duration"] == 60
+
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
         from gateway.config import Platform

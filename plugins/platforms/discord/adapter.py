@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import struct
 import subprocess
 import tempfile
@@ -1443,7 +1444,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                return await self._send_to_forum(channel, content)
+                return await self._send_to_forum(channel, content, metadata=metadata)
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -1514,7 +1515,12 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -1578,6 +1584,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str = "",
         file: Any = None,
         files: Optional[list] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Create a forum thread whose starter message carries file attachments.
 
@@ -1661,6 +1668,7 @@ class DiscordAdapter(BasePlatformAdapter):
         file_path: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a local file as a Discord attachment.
 
@@ -1670,11 +1678,12 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        channel = self._client.get_channel(int(chat_id))
+        target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+        channel = self._client.get_channel(int(target_id))
         if not channel:
-            channel = await self._client.fetch_channel(int(chat_id))
+            channel = await self._client.fetch_channel(int(target_id))
         if not channel:
-            return SendResult(success=False, error=f"Channel {chat_id} not found")
+            return SendResult(success=False, error=f"Channel {target_id} not found")
 
         filename = file_name or os.path.basename(file_path)
         with open(file_path, "rb") as fh:
@@ -1684,6 +1693,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     channel,
                     content=(caption or "").strip(),
                     file=file,
+                    metadata=metadata,
                 )
             msg = await channel.send(content=caption if caption else None, file=file)
         return SendResult(success=True, message_id=str(msg.id))
@@ -1718,11 +1728,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         try:
-            channel = self._client.get_channel(int(chat_id))
+            target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+            channel = self._client.get_channel(int(target_id))
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+                channel = await self._client.fetch_channel(int(target_id))
             if not channel:
-                logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
+                logger.warning("[%s] Channel %s not found for multi-image send", self.name, target_id)
                 return
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
@@ -1799,6 +1810,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel,
                         content=(content or "").strip(),
                         files=files,
+                        metadata=metadata,
                     )
                 else:
                     await channel.send(content=content, files=files)
@@ -1847,11 +1859,12 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import io
 
-            channel = self._client.get_channel(int(chat_id))
+            target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+            channel = self._client.get_channel(int(target_id))
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+                channel = await self._client.fetch_channel(int(target_id))
             if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
+                return SendResult(success=False, error=f"Channel {target_id} not found")
 
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
@@ -1871,6 +1884,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     channel,
                     content=(caption or "").strip(),
                     file=forum_file,
+                    metadata=metadata,
                 )
 
             # Try sending as a native voice message via raw API (flags=8192).
@@ -2547,7 +2561,12 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local image file natively as a Discord file attachment."""
         try:
-            return await self._send_file_attachment(chat_id, image_path, caption)
+            return await self._send_file_attachment(
+                chat_id,
+                image_path,
+                caption,
+                metadata=metadata,
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"Image file not found: {image_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -2573,11 +2592,12 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import aiohttp
 
-            channel = self._client.get_channel(int(chat_id))
+            target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+            channel = self._client.get_channel(int(target_id))
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+                channel = await self._client.fetch_channel(int(target_id))
             if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
+                return SendResult(success=False, error=f"Channel {target_id} not found")
 
             # Download the image and send as a Discord file attachment
             # (Discord renders attachments inline, unlike plain URLs)
@@ -2609,6 +2629,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             channel,
                             content=(caption or "").strip(),
                             file=file,
+                            metadata=metadata,
                         )
 
                     msg = await channel.send(
@@ -2623,7 +2644,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name,
                 exc_info=True,
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[%s] Failed to send image attachment, falling back to URL: %s",
@@ -2631,7 +2652,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
     async def send_animation(
         self,
@@ -2652,11 +2673,12 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import aiohttp
 
-            channel = self._client.get_channel(int(chat_id))
+            target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+            channel = self._client.get_channel(int(target_id))
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+                channel = await self._client.fetch_channel(int(target_id))
             if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
+                return SendResult(success=False, error=f"Channel {target_id} not found")
 
             # Download the GIF and send as a Discord file attachment
             # (Discord renders .gif attachments as auto-playing animations inline)
@@ -2678,6 +2700,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             channel,
                             content=(caption or "").strip(),
                             file=file,
+                            metadata=metadata,
                         )
 
                     msg = await channel.send(
@@ -2712,7 +2735,12 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local video file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, video_path, caption)
+            return await self._send_file_attachment(
+                chat_id,
+                video_path,
+                caption,
+                metadata=metadata,
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"Video file not found: {video_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -2730,7 +2758,13 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an arbitrary file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name)
+            return await self._send_file_attachment(
+                chat_id,
+                file_path,
+                caption,
+                file_name=file_name,
+                metadata=metadata,
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"File not found: {file_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -3674,6 +3708,16 @@ class DiscordAdapter(BasePlatformAdapter):
             and getattr(att, "waveform", None) is not None
         )
 
+    @staticmethod
+    def _parse_discord_channel_set(raw: Any) -> set:
+        """Parse a Discord channel-id config value into a normalized string set."""
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs where no bot mention is required.
 
@@ -3684,18 +3728,14 @@ class DiscordAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
             raw = os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        # Coerce non-list scalars (str/int/float) to str before splitting.
-        # YAML parses a bare numeric value such as
-        # `free_response_channels: 1491973769726791812` as int, which was
-        # previously falling through the isinstance(str) branch and silently
-        # returning an empty set.  str() here accepts whatever scalar the YAML
-        # loader hands us without changing existing string/CSV semantics.
-        s = str(raw).strip() if raw is not None else ""
-        if s:
-            return {part.strip() for part in s.split(",") if part.strip()}
-        return set()
+        return self._parse_discord_channel_set(raw)
+
+    def _discord_thread_free_response_channels(self) -> set:
+        """Return channels where parent messages need no mention and still auto-thread."""
+        raw = self.config.extra.get("thread_free_response_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "")
+        return self._parse_discord_channel_set(raw)
 
     def _discord_thread_require_mention(self) -> bool:
         """Return whether thread participation requires @mention to follow up.
@@ -4493,10 +4533,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Config (all settable via discord.* in config.yaml or DISCORD_* env vars):
         #   discord.require_mention: Require @mention in server channels (default: true)
         #   discord.free_response_channels: Channel IDs where bot responds without mention
+        #   discord.thread_free_response_channels: Channel IDs where bot responds without mention and still auto-threads parent messages
         #   discord.ignored_channels: Channel IDs where bot NEVER responds (even when mentioned)
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
-        #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
+        #   discord.auto_thread: Auto-create thread on @mention/thread-free messages in channels (default: true)
 
         thread_id = None
         parent_channel_id = None
@@ -4549,18 +4590,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
 
             free_channels = self._discord_free_response_channels()
-            if parent_channel_id:
-                channel_ids.add(parent_channel_id)
-
+            thread_free_channels = self._discord_thread_free_response_channels()
             require_mention = self._discord_require_mention()
             # Voice-linked text channels act as free-response while voice is active.
             # Only the exact bound channel gets the exemption, not sibling threads.
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
             current_channel_id = str(message.channel.id)
             is_voice_linked_channel = current_channel_id in voice_linked_ids
+            is_thread_free_parent_channel = (
+                not is_thread
+                and ("*" in thread_free_channels or current_channel_id in thread_free_channels)
+            )
             is_free_channel = (
                 "*" in free_channels
                 or bool(channel_ids & free_channels)
+                or is_thread_free_parent_channel
                 or is_voice_linked_channel
             )
 
@@ -4586,7 +4630,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
+            skip_thread = bool(channel_ids & no_thread_channels) or (
+                is_free_channel and not is_thread_free_parent_channel
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -5775,7 +5821,14 @@ def _derive_forum_thread_name(message: str) -> str:
     first_line = first_line.lstrip("#").strip()
     if not first_line:
         first_line = "New Post"
-    return first_line[:100]
+    return _sanitize_discord_thread_name(first_line)
+
+
+def _sanitize_discord_thread_name(name: str) -> str:
+    """Return a Discord-safe thread name capped at Discord's 100-char limit."""
+    clean = re.sub(r"\s+", " ", str(name or "")).strip()
+    clean = clean.lstrip("#").strip()
+    return (clean or "New Post")[:100]
 
 
 def _standalone_sanitize_error(text) -> str:
@@ -5802,6 +5855,8 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[list] = None,
     force_document: bool = False,
+    thread_name: Optional[str] = None,
+    thread_auto_archive_duration: int = 1440,
 ) -> Dict[str, Any]:
     """Send via Discord REST API without a live gateway adapter.
 
@@ -5875,8 +5930,9 @@ async def _standalone_send(
                     except Exception:
                         logger.debug("Failed to probe channel type for %s", chat_id, exc_info=True)
 
+            requested_thread_name = _sanitize_discord_thread_name(thread_name) if thread_name else None
             if is_forum:
-                thread_name = _derive_forum_thread_name(message)
+                thread_name = requested_thread_name or _derive_forum_thread_name(message)
                 thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
 
                 # Filter to readable media files up front so we can pick the
@@ -5950,7 +6006,33 @@ async def _standalone_send(
                     result["warnings"] = warnings
                 return result
 
-            url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
+            if requested_thread_name:
+                thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
+                try:
+                    auto_archive = int(thread_auto_archive_duration or 1440)
+                except (TypeError, ValueError):
+                    auto_archive = 1440
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+                    async with session.post(
+                        thread_url,
+                        headers=json_headers,
+                        json={
+                            "name": requested_thread_name,
+                            "type": 11,
+                            "auto_archive_duration": auto_archive,
+                        },
+                        **_req_kw,
+                    ) as resp:
+                        if resp.status not in {200, 201}:
+                            body = await resp.text()
+                            return {"error": f"Discord thread creation error ({resp.status}): {body}"}
+                        data = await resp.json()
+                thread_id = data.get("id")
+                if not thread_id:
+                    return {"error": "Discord thread creation succeeded but response did not include a thread id"}
+                url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
+            else:
+                url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
@@ -5993,6 +6075,8 @@ async def _standalone_send(
             return {"error": error}
 
         result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
+        if thread_id:
+            result["thread_id"] = thread_id
         if warnings:
             result["warnings"] = warnings
         return result
@@ -6118,6 +6202,11 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
         os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+    tfrc = discord_cfg.get("thread_free_response_channels")
+    if tfrc is not None and not os.getenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS"):
+        if isinstance(tfrc, list):
+            tfrc = ",".join(str(v) for v in tfrc)
+        os.environ["DISCORD_THREAD_FREE_RESPONSE_CHANNELS"] = str(tfrc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):

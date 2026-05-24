@@ -435,38 +435,95 @@ def _describe_media_for_mirror(media_files):
     return f"[Sent {len(media_files)} media attachments]"
 
 
-def _get_cron_auto_delivery_target():
-    """Return the cron scheduler's auto-delivery target for the current run, if any."""
+def _get_cron_auto_delivery_targets():
+    """Return cron scheduler auto-delivery targets for the current run, if any."""
     from gateway.session_context import get_session_env
+    raw_targets = get_session_env("HERMES_CRON_AUTO_DELIVER_TARGETS", "").strip()
+    if raw_targets:
+        try:
+            parsed = json.loads(raw_targets)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            targets = []
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                platform = str(item.get("platform") or "").strip().lower()
+                chat_id = str(item.get("chat_id") or "").strip()
+                if not platform or not chat_id:
+                    continue
+                thread_value = item.get("thread_id")
+                targets.append({
+                    "platform": platform,
+                    "chat_id": chat_id,
+                    "thread_id": None if thread_value in (None, "") else str(thread_value),
+                    "thread_per_run": bool(
+                        item.get("thread_per_run") or item.get("discord_thread_per_run")
+                    ),
+                })
+            if targets:
+                return targets
+
     platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
     chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
     if not platform or not chat_id:
-        return None
+        return []
     thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
-    return {
+    return [{
         "platform": platform,
         "chat_id": chat_id,
         "thread_id": thread_id,
-    }
+    }]
+
+
+def _get_cron_auto_delivery_target():
+    """Return the first cron auto-delivery target for legacy callers."""
+    targets = _get_cron_auto_delivery_targets()
+    return targets[0] if targets else None
 
 
 def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):
     """Skip redundant cron send_message calls when the scheduler will auto-deliver there."""
-    auto_target = _get_cron_auto_delivery_target()
-    if not auto_target:
+    auto_targets = _get_cron_auto_delivery_targets()
+    if not auto_targets:
         return None
 
-    same_target = (
-        auto_target["platform"] == platform_name
-        and str(auto_target["chat_id"]) == str(chat_id)
-        and auto_target.get("thread_id") == thread_id
+    normalized_thread_id = None if thread_id in (None, "") else str(thread_id)
+    same_target = any(
+        target["platform"] == platform_name
+        and str(target["chat_id"]) == str(chat_id)
+        and target.get("thread_id") == normalized_thread_id
+        for target in auto_targets
     )
     if not same_target:
         return None
 
+    thread_per_run_parent = any(
+        target["platform"] == platform_name
+        and str(target["chat_id"]) == str(chat_id)
+        and target.get("thread_id") is None
+        and target.get("thread_per_run")
+        and normalized_thread_id is None
+        for target in auto_targets
+    )
     target_label = f"{platform_name}:{chat_id}"
     if thread_id is not None:
         target_label += f":{thread_id}"
+
+    if thread_per_run_parent:
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "cron_auto_delivery_thread_per_run_parent",
+            "target": target_label,
+            "note": (
+                f"Skipped send_message to {target_label}. This cron job will already auto-deliver "
+                "its final response to a fresh Discord thread under that parent channel. Put the "
+                "intended user-facing content in your final response instead, or target a different "
+                "channel/thread if you intentionally need an additional message."
+            ),
+        }
 
     return {
         "success": True,
@@ -570,7 +627,17 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    discord_thread_name=None,
+    discord_thread_auto_archive_duration=1440,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -672,15 +739,23 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
+            discord_kwargs = {
+                "thread_id": thread_id,
+                "media_files": media_files if is_last else [],
+            }
+            if discord_thread_name:
+                discord_kwargs["thread_name"] = discord_thread_name if i == 0 else None
+                discord_kwargs["thread_auto_archive_duration"] = discord_thread_auto_archive_duration
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
-                thread_id=thread_id,
-                media_files=media_files if is_last else [],
+                **discord_kwargs,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
+            if isinstance(result, dict) and result.get("success") and result.get("thread_id"):
+                thread_id = result["thread_id"]
             last_result = result
         return last_result
 
