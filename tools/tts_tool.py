@@ -49,7 +49,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional, List, Tuple
 from urllib.parse import urljoin
 
 from hermes_constants import display_hermes_home
@@ -979,6 +979,9 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     voice_id = el_config.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
     model_id = el_config.get("model_id", DEFAULT_ELEVENLABS_MODEL_ID)
 
+    if _has_elevenlabs_voice_markup(text):
+        return _generate_elevenlabs_dialogue(text, output_path, tts_config)
+
     # Determine output format based on file extension
     if output_path.endswith(".ogg"):
         output_format = "opus_48000_64"
@@ -999,6 +1002,358 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
         for chunk in audio_generator:
             f.write(chunk)
 
+    return output_path
+
+
+_ELEVENLABS_VOICE_MARKER = re.compile(
+    r"\[\[\s*(/)?voice(?::([A-Za-z0-9_.:-]+))?\s*\]\]",
+    flags=re.IGNORECASE,
+)
+
+
+def _has_elevenlabs_voice_markup(text: str) -> bool:
+    """Return True when text contains Storyteller multi-voice markers."""
+    return bool(_ELEVENLABS_VOICE_MARKER.search(text or ""))
+
+
+def strip_elevenlabs_voice_markup(text: str) -> str:
+    """Remove Storyteller-only voice routing markers from visible text."""
+    return _ELEVENLABS_VOICE_MARKER.sub("", text or "").strip()
+
+
+def _config_bool(value: Any, default: bool = False) -> bool:
+    """Parse common YAML/env-style boolean values without surprising truthiness."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _safe_voice_key(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _load_storyteller_yaml(path_value: Any) -> Dict[str, Any]:
+    if not path_value:
+        return {}
+    try:
+        import yaml
+        path = Path(str(path_value)).expanduser()
+        if not path.exists():
+            return {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.debug("Could not load Storyteller voice YAML %s: %s", path_value, exc)
+        return {}
+
+
+def _voice_id_from_entry(entry: Any) -> str:
+    if isinstance(entry, str):
+        return entry.strip()
+    if isinstance(entry, dict):
+        return str(entry.get("voice_id") or entry.get("id") or "").strip()
+    return ""
+
+
+def _slug_voice_alias(name: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name or "").lower()).strip("_")
+
+
+def _add_voice_alias(mapping: Dict[str, str], key: Any, voice_id: str) -> None:
+    alias = _safe_voice_key(key)
+    if alias and voice_id:
+        mapping[alias] = voice_id
+
+
+def _looks_like_elevenlabs_voice_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{16,}", value or ""))
+
+
+def _voice_id_for_key(
+    voice_map: Dict[str, str],
+    key: str,
+    default_voice_id: str,
+    *,
+    allow_raw_voice_ids: bool = False,
+    raw_key: Optional[str] = None,
+) -> str:
+    if key in voice_map:
+        return voice_map[key]
+    raw_candidate = str(raw_key if raw_key is not None else key).strip()
+    if allow_raw_voice_ids and _looks_like_elevenlabs_voice_id(raw_candidate):
+        return raw_candidate
+    logger.debug("Unknown Storyteller voice key %r; falling back to default narrator", key)
+    return default_voice_id
+
+
+def _allow_raw_elevenlabs_voice_ids(tts_config: Dict[str, Any]) -> bool:
+    """Return whether prompt markup may route directly to raw ElevenLabs IDs."""
+    el_raw = tts_config.get("elevenlabs", {})
+    el_config = el_raw if isinstance(el_raw, dict) else {}
+    dialogue_raw = el_config.get("dialogue", {})
+    dialogue_cfg = dialogue_raw if isinstance(dialogue_raw, dict) else {}
+    if "allow_raw_voice_ids" in dialogue_cfg:
+        return _config_bool(dialogue_cfg.get("allow_raw_voice_ids"))
+    return _config_bool(el_config.get("allow_raw_voice_ids"), False)
+
+
+def _resolve_elevenlabs_voice_map(tts_config: Dict[str, Any]) -> Tuple[Dict[str, str], str]:
+    """Build voice-key -> voice-id map from config, catalog, and cast files."""
+    el_raw = tts_config.get("elevenlabs", {})
+    el_config = el_raw if isinstance(el_raw, dict) else {}
+    default_voice_id = str(el_config.get("voice_id") or DEFAULT_ELEVENLABS_VOICE_ID).strip()
+    dialogue_raw = el_config.get("dialogue", {})
+    dialogue_cfg = dialogue_raw if isinstance(dialogue_raw, dict) else {}
+
+    mapping: Dict[str, str] = {}
+    for alias in ("default", "narrator", "narrator.primary", "primary"):
+        _add_voice_alias(mapping, alias, default_voice_id)
+
+    inline_voices = el_config.get("voices", {})
+    if isinstance(inline_voices, dict):
+        for key, entry in inline_voices.items():
+            _add_voice_alias(mapping, key, _voice_id_from_entry(entry))
+
+    for path_key in ("voice_registry_path", "registry_path", "catalog_path"):
+        data = _load_storyteller_yaml(el_config.get(path_key) or dialogue_cfg.get(path_key))
+        voices = data.get("voices", {}) if isinstance(data, dict) else {}
+        if isinstance(voices, dict):
+            for key, entry in voices.items():
+                voice_id = _voice_id_from_entry(entry)
+                _add_voice_alias(mapping, key, voice_id)
+                if isinstance(entry, dict):
+                    _add_voice_alias(mapping, entry.get("name"), voice_id)
+                    slug = _slug_voice_alias(entry.get("name"))
+                    if slug:
+                        _add_voice_alias(mapping, slug, voice_id)
+        elif isinstance(voices, list):
+            for entry in voices:
+                if isinstance(entry, dict):
+                    voice_id = _voice_id_from_entry(entry)
+                    _add_voice_alias(mapping, entry.get("key") or entry.get("name"), voice_id)
+                    _add_voice_alias(mapping, entry.get("name"), voice_id)
+
+    cast_data = _load_storyteller_yaml(dialogue_cfg.get("cast_path") or el_config.get("cast_path"))
+    if cast_data:
+        narrators = cast_data.get("narrators", {})
+        if isinstance(narrators, dict):
+            for narrator_key, entry in narrators.items():
+                if not isinstance(entry, dict):
+                    continue
+                voice_key = _safe_voice_key(entry.get("voice_key") or entry.get("voice"))
+                voice_id = mapping.get(voice_key) or _voice_id_from_entry(entry)
+                for alias in (narrator_key, f"narrator.{narrator_key}", entry.get("name")):
+                    _add_voice_alias(mapping, alias, voice_id)
+        for section in ("characters", "npcs"):
+            characters = cast_data.get(section, {})
+            if isinstance(characters, dict):
+                for char_key, entry in characters.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    voice_key = _safe_voice_key(entry.get("voice_key") or entry.get("voice"))
+                    voice_id = mapping.get(voice_key) or _voice_id_from_entry(entry)
+                    for alias in (char_key, entry.get("name"), _slug_voice_alias(entry.get("name"))):
+                        _add_voice_alias(mapping, alias, voice_id)
+
+    default_key = _safe_voice_key(
+        dialogue_cfg.get("default_voice_key")
+        or el_config.get("default_voice_key")
+        or "narrator.primary"
+    )
+    return mapping, default_key
+
+
+def _parse_elevenlabs_dialogue_inputs(
+    text: str,
+    tts_config: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """Parse ``[[voice:key]]...[[/voice]]`` blocks into dialogue inputs."""
+    voice_map, default_key = _resolve_elevenlabs_voice_map(tts_config)
+    allow_raw_voice_ids = _allow_raw_elevenlabs_voice_ids(tts_config)
+    default_voice_id = voice_map.get(default_key) or voice_map.get("default") or DEFAULT_ELEVENLABS_VOICE_ID
+    current_key = default_key
+    current_voice_id = default_voice_id
+    pos = 0
+    inputs: List[Dict[str, str]] = []
+
+    def add_segment(segment_text: str, voice_id: str) -> None:
+        cleaned = strip_elevenlabs_voice_markup(segment_text).strip()
+        if not cleaned:
+            return
+        if inputs and inputs[-1]["voice_id"] == voice_id:
+            inputs[-1]["text"] = (inputs[-1]["text"].rstrip() + "\n\n" + cleaned).strip()
+        else:
+            inputs.append({"text": cleaned, "voice_id": voice_id})
+
+    for match in _ELEVENLABS_VOICE_MARKER.finditer(text or ""):
+        add_segment(text[pos:match.start()], current_voice_id)
+        closing = bool(match.group(1))
+        if closing:
+            current_key = default_key
+            raw_key = default_key
+        else:
+            raw_key = str(match.group(2) or default_key).strip()
+            current_key = _safe_voice_key(raw_key)
+        current_voice_id = _voice_id_for_key(
+            voice_map,
+            current_key,
+            default_voice_id,
+            allow_raw_voice_ids=allow_raw_voice_ids,
+            raw_key=raw_key,
+        )
+        pos = match.end()
+    add_segment((text or "")[pos:], current_voice_id)
+    return inputs
+
+
+def _split_dialogue_input(input_item: Dict[str, str], max_chars: int) -> List[Dict[str, str]]:
+    text = input_item["text"]
+    voice_id = input_item["voice_id"]
+    if len(text) <= max_chars:
+        return [input_item]
+    parts: List[Dict[str, str]] = []
+    remaining = text
+    while remaining:
+        limit = min(max_chars, len(remaining))
+        chunk = remaining[:limit]
+        cut = max(chunk.rfind("\n\n"), chunk.rfind(". "), chunk.rfind("? "), chunk.rfind("! "))
+        if cut > max_chars * 0.4:
+            limit = cut + 1
+            chunk = remaining[:limit]
+        cleaned = chunk.strip()
+        if cleaned:
+            parts.append({"text": cleaned, "voice_id": voice_id})
+        remaining = remaining[limit:].lstrip()
+    return parts
+
+
+def _chunk_dialogue_inputs(
+    inputs: List[Dict[str, str]],
+    max_chars: int,
+    max_inputs: int = 10,
+) -> List[List[Dict[str, str]]]:
+    expanded: List[Dict[str, str]] = []
+    for item in inputs:
+        expanded.extend(_split_dialogue_input(item, max_chars))
+    chunks: List[List[Dict[str, str]]] = []
+    current: List[Dict[str, str]] = []
+    current_len = 0
+    for item in expanded:
+        item_len = len(item.get("text", ""))
+        if current and (current_len + item_len > max_chars or len(current) >= max_inputs):
+            chunks.append(current)
+            current = []
+            current_len = 0
+        current.append(item)
+        current_len += item_len
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _concat_audio_files(paths: List[str], output_path: str) -> None:
+    if len(paths) == 1:
+        shutil.copyfile(paths[0], output_path)
+        return
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required to stitch multi-request dialogue audio")
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as list_file:
+        list_path = list_file.name
+        for path in paths:
+            escaped = path.replace("'", "'\\''")
+            list_file.write(f"file '{escaped}'\n")
+    try:
+        cmd = [
+            ffmpeg, "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c", "copy", "-y", "-loglevel", "error", output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0:
+            cmd = [
+                ffmpeg, "-f", "concat", "-safe", "0", "-i", list_path,
+                "-y", "-loglevel", "error", output_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=120)
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", errors="ignore")[:300]
+                raise RuntimeError(f"ffmpeg dialogue stitch failed: {stderr}")
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+
+
+def _generate_elevenlabs_dialogue(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate multi-voice ElevenLabs dialogue audio from Storyteller markers."""
+    api_key = (get_env_value("ELEVENLABS_API_KEY") or "")
+    if not api_key:
+        raise ValueError("ELEVENLABS_API_KEY not set. Get one at https://elevenlabs.io/")
+
+    el_raw = tts_config.get("elevenlabs", {})
+    el_config = el_raw if isinstance(el_raw, dict) else {}
+    dialogue_raw = el_config.get("dialogue", {})
+    dialogue_cfg = dialogue_raw if isinstance(dialogue_raw, dict) else {}
+    model_id = str(el_config.get("model_id") or DEFAULT_ELEVENLABS_MODEL_ID).strip() or DEFAULT_ELEVENLABS_MODEL_ID
+    base_url = str(dialogue_cfg.get("base_url") or el_config.get("base_url") or "https://api.elevenlabs.io").rstrip("/")
+    max_chars = int(dialogue_cfg.get("max_chars_per_request") or 2000)
+    max_chars = max(250, min(max_chars, 2000))
+
+    inputs = _parse_elevenlabs_dialogue_inputs(text, tts_config)
+    if not inputs:
+        raise ValueError("No dialogue text after voice markup parsing")
+    if len({item["voice_id"] for item in inputs}) > 10:
+        raise ValueError("ElevenLabs text-to-dialogue supports at most 10 unique voices per request")
+
+    output_format = "opus_48000_64" if output_path.endswith(".ogg") else "mp3_44100_128"
+    chunks = _chunk_dialogue_inputs(inputs, max_chars)
+    tmp_paths: List[str] = []
+    try:
+        import requests
+        endpoint = f"{base_url}/v1/text-to-dialogue"
+        for idx, chunk_inputs in enumerate(chunks):
+            suffix = ".ogg" if output_path.endswith(".ogg") else ".mp3"
+            payload: Dict[str, Any] = {
+                "inputs": chunk_inputs,
+                "model_id": model_id,
+                "apply_text_normalization": dialogue_cfg.get("apply_text_normalization", "auto"),
+            }
+            settings: Dict[str, Any] = {}
+            if dialogue_cfg.get("stability") is not None:
+                settings["stability"] = float(dialogue_cfg.get("stability"))
+            if settings:
+                payload["settings"] = settings
+            response = requests.post(
+                endpoint,
+                params={"output_format": output_format},
+                headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+                json=payload,
+                timeout=120,
+            )
+            if response.status_code != 200:
+                detail = response.text[:300]
+                try:
+                    response_json = response.json()
+                    detail = response_json.get("detail") or response_json.get("message") or detail
+                except Exception:
+                    pass
+                raise RuntimeError(f"ElevenLabs dialogue API error (HTTP {response.status_code}): {detail}")
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+            tmp_paths.append(tmp_path)
+            with open(tmp_path, "wb") as f:
+                f.write(response.content)
+            logger.info("Generated ElevenLabs dialogue chunk %d/%d", idx + 1, len(chunks))
+        _concat_audio_files(tmp_paths, output_path)
+    finally:
+        for tmp_path in tmp_paths:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
     return output_path
 
 
@@ -2161,6 +2516,14 @@ def text_to_speech_tool(
     # OpenAI handler.
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
 
+    # ``[[voice:key]]`` is Hermes/Storyteller routing markup for ElevenLabs'
+    # dialogue endpoint. Other providers would read those markers aloud, so
+    # strip them unless the native ElevenLabs backend is going to consume them.
+    if provider != "elevenlabs" or command_provider_config is not None:
+        text = strip_elevenlabs_voice_markup(text)
+        if not text.strip():
+            return tool_error("Text is empty after voice markup cleanup", success=False)
+
     # Truncate very long text with a warning. The cap is per-provider
     # (OpenAI 4096, xAI 15k, MiniMax 10k, ElevenLabs model-aware, etc.).
     max_len = _resolve_max_text_length(provider, tts_config)
@@ -2549,10 +2912,52 @@ _MD_HEADER = re.compile(r'^#+\s*', flags=re.MULTILINE)
 _MD_LIST_ITEM = re.compile(r'^\s*[-*]\s+', flags=re.MULTILINE)
 _MD_HR = re.compile(r'---+')
 _MD_EXCESS_NL = re.compile(r'\n{3,}')
+_MD_REASONING_PREFIX_BLOCK = re.compile(
+    r'^\s*(?:💭\s*)?(?:\*\*)?Reasoning:(?:\*\*)?\s*```[\s\S]*?```\s*',
+    flags=re.IGNORECASE,
+)
+_ELEVENLABS_AUDIO_TAG = re.compile(
+    r'(?i)(^|(?<=\s))\[(?:'
+    r'whispers?|sighs?|exhales?|laughs?|starts laughing|laughs harder|wheezing|'
+    r'curious|excited|sarcastic|mischievously|crying|snorts?|swallows?|gulps?|sings?|'
+    r'applause|clapping|gunshot|explosion|'
+    r'(?:strong\s+)?[a-z][a-z\- ]{1,40}\s+accent'
+    r')\]\s*'
+)
 
 
-def _strip_markdown_for_tts(text: str) -> str:
-    """Remove markdown formatting that shouldn't be spoken aloud."""
+def _should_preserve_audio_tags_for_tts(tts_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True when the active TTS backend is expected to consume tags."""
+    cfg = tts_config if tts_config is not None else _load_tts_config()
+    if not isinstance(cfg, dict):
+        return False
+    provider = _get_provider(cfg)
+    if provider != "elevenlabs":
+        return False
+    el_cfg = cfg.get("elevenlabs", {}) if isinstance(cfg.get("elevenlabs"), dict) else {}
+    explicit = el_cfg.get("preserve_audio_tags")
+    if explicit is not None:
+        return _config_bool(explicit)
+    model_id = str(el_cfg.get("model_id") or DEFAULT_ELEVENLABS_MODEL_ID).strip().lower()
+    return model_id in {"eleven_v3", "eleven_ttv_v3"}
+
+
+def _should_preserve_voice_markup_for_tts(tts_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True when Storyteller voice markers should reach the backend."""
+    cfg = tts_config if tts_config is not None else _load_tts_config()
+    return isinstance(cfg, dict) and _get_provider(cfg) == "elevenlabs"
+
+
+def _strip_markdown_for_tts(
+    text: str,
+    *,
+    preserve_audio_tags: bool = True,
+    preserve_voice_markup: bool = True,
+) -> str:
+    """Remove markdown/display formatting that should not be spoken aloud."""
+    text = _MD_REASONING_PREFIX_BLOCK.sub('', text)
+    if not preserve_voice_markup:
+        text = strip_elevenlabs_voice_markup(text)
     text = _MD_CODE_BLOCK.sub(' ', text)
     text = _MD_LINK.sub(r'\1', text)
     text = _MD_URL.sub('', text)
@@ -2563,6 +2968,8 @@ def _strip_markdown_for_tts(text: str) -> str:
     text = _MD_LIST_ITEM.sub('', text)
     text = _MD_HR.sub('', text)
     text = _MD_EXCESS_NL.sub('\n\n', text)
+    if not preserve_audio_tags:
+        text = _ELEVENLABS_AUDIO_TAG.sub('', text)
     return text.strip()
 
 

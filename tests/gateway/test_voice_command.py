@@ -287,13 +287,14 @@ class TestAutoVoiceReply:
         return _make_runner(tmp_path)
 
     def _call(self, runner, voice_mode, message_type, agent_messages=None,
-              response="Hello!", in_voice_channel=False):
+              response="Hello!", in_voice_channel=False, already_sent=False):
         """Call real _should_send_voice_reply on a GatewayRunner instance."""
         chat_id = "123"
-        if voice_mode != "off":
-            runner._voice_mode["telegram:" + chat_id] = voice_mode
+        key = "telegram:" + chat_id
+        if voice_mode is None:
+            runner._voice_mode.pop(key, None)
         else:
-            runner._voice_mode.pop("telegram:" + chat_id, None)
+            runner._voice_mode[key] = voice_mode
 
         event = _make_event(message_type=message_type)
 
@@ -304,7 +305,7 @@ class TestAutoVoiceReply:
             runner.adapters[event.source.platform] = mock_adapter
 
         return runner._should_send_voice_reply(
-            event, response, agent_messages or []
+            event, response, agent_messages or [], already_sent=already_sent
         )
 
     # -- Full platform x input x mode matrix --------------------------------
@@ -343,11 +344,25 @@ class TestAutoVoiceReply:
         """all + voice input: base auto-TTS handles it, runner skips."""
         assert self._call(runner, "all", MessageType.VOICE) is False
 
-    # -- Text input: only runner handles -----------------------------------
+    # -- Text input: base handles non-streamed, runner handles streamed -----
 
     def test_text_input_all_mode_runner_fires(self, runner):
-        """all + text input: only runner fires (base auto-TTS only for voice)."""
-        assert self._call(runner, "all", MessageType.TEXT) is True
+        """all + streamed text input: runner fires because base never sees the body."""
+        assert self._call(
+            runner,
+            "all",
+            MessageType.TEXT,
+            already_sent=True,
+        ) is True
+
+    def test_non_streamed_text_input_all_mode_runner_skips_to_avoid_duplicate(self, runner):
+        """all + non-streamed text input: base adapter owns TTS."""
+        assert self._call(
+            runner,
+            "all",
+            MessageType.TEXT,
+            already_sent=False,
+        ) is False
 
     def test_text_input_voice_only_no_reply(self, runner):
         """voice_only + text input: neither fires."""
@@ -400,7 +415,13 @@ class TestAutoVoiceReply:
                 "function": {"name": "web_search", "arguments": "{}"},
             }],
         }]
-        assert self._call(runner, "all", MessageType.TEXT, agent_messages=messages) is True
+        assert self._call(
+            runner,
+            "all",
+            MessageType.TEXT,
+            agent_messages=messages,
+            already_sent=True,
+        ) is True
 
 
 # =====================================================================
@@ -426,7 +447,7 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result) as mock_tts, \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t, **_kw: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
@@ -475,7 +496,7 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t, **_kw: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
@@ -512,7 +533,7 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": False, "error": "API error"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t, **_kw: t), \
              patch("os.path.isfile", return_value=False), \
              patch("os.makedirs"):
             await runner._send_voice_reply(event, "Hello")
@@ -523,7 +544,7 @@ class TestSendVoiceReply:
     async def test_exception_caught(self, runner):
         event = _make_event()
         with patch("tools.tts_tool.text_to_speech_tool", side_effect=RuntimeError("boom")), \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t, **_kw: t), \
              patch("os.makedirs"):
             # Should not raise
             await runner._send_voice_reply(event, "Hello")
@@ -2558,6 +2579,14 @@ class TestVoiceReception:
         receiver._decoders[ssrc] = mock_decoder
         return mock_decoder
 
+    @staticmethod
+    def _mock_davey_module():
+        """Stub the optional davey package so DAVE packet tests stay hermetic."""
+        return patch.dict(
+            sys.modules,
+            {"davey": SimpleNamespace(MediaType=SimpleNamespace(audio="audio"))},
+        )
+
     def test_on_packet_dave_known_user_decrypt_ok(self):
         """Known SSRC + DAVE decrypt success → audio buffered."""
         dave = MagicMock()
@@ -2567,7 +2596,7 @@ class TestVoiceReception:
         )
         self._inject_mock_decoder(receiver, 100)
 
-        with patch("nacl.secret.Aead") as mock_aead:
+        with self._mock_davey_module(), patch("nacl.secret.Aead") as mock_aead:
             mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
             receiver._on_packet(self._build_rtp_packet(ssrc=100))
 
@@ -2581,7 +2610,7 @@ class TestVoiceReception:
         receiver = self._make_receiver_with_nacl(dave_session=dave)
         self._inject_mock_decoder(receiver, 100)
 
-        with patch("nacl.secret.Aead") as mock_aead:
+        with self._mock_davey_module(), patch("nacl.secret.Aead") as mock_aead:
             mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
             receiver._on_packet(self._build_rtp_packet(ssrc=100))
 
@@ -2600,7 +2629,7 @@ class TestVoiceReception:
         )
         self._inject_mock_decoder(receiver, 100)
 
-        with patch("nacl.secret.Aead") as mock_aead:
+        with self._mock_davey_module(), patch("nacl.secret.Aead") as mock_aead:
             mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
             receiver._on_packet(self._build_rtp_packet(ssrc=100))
 
@@ -2615,7 +2644,7 @@ class TestVoiceReception:
             dave_session=dave, mapped_ssrcs={100: 42}
         )
 
-        with patch("nacl.secret.Aead") as mock_aead:
+        with self._mock_davey_module(), patch("nacl.secret.Aead") as mock_aead:
             mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
             receiver._on_packet(self._build_rtp_packet(ssrc=100))
 
@@ -2744,7 +2773,7 @@ class TestVoiceTTSPlayback:
             event, response, agent_msgs or [], already_sent=already_sent,
         )
 
-    # -- Streaming OFF (existing behavior, must not change) --
+    # -- Streaming OFF: base adapter owns post-processing TTS ---------------
 
     def test_voice_input_runner_skips(self):
         """Streaming OFF + voice input: runner skips — base adapter handles."""
@@ -2752,11 +2781,11 @@ class TestVoiceTTSPlayback:
         runner = self._make_runner()
         assert self._call_should_reply(runner, "all", MessageType.VOICE, already_sent=False) is False
 
-    def test_text_input_voice_all_runner_fires(self):
-        """Streaming OFF + text input + voice_mode=all: runner generates TTS."""
+    def test_text_input_voice_all_runner_skips(self):
+        """Streaming OFF + text input + voice_mode=all: base adapter handles TTS."""
         from gateway.platforms.base import MessageType
         runner = self._make_runner()
-        assert self._call_should_reply(runner, "all", MessageType.TEXT, already_sent=False) is True
+        assert self._call_should_reply(runner, "all", MessageType.TEXT, already_sent=False) is False
 
     def test_text_input_voice_off_no_tts(self):
         """Streaming OFF + text input + voice_mode=off: no TTS."""
@@ -2903,13 +2932,15 @@ class TestUDPKeepalive:
 # =====================================================================
 
 class TestShouldAutoTtsForChat:
-    """Three-layer gate: per-chat enable > per-chat disable > config default."""
+    """Auto-TTS precedence: off > all > voice_only > config default."""
 
-    def _make_adapter(self, *, default: bool, enabled=(), disabled=()):
+    def _make_adapter(self, *, default: bool, default_mode="voice_only", enabled=(), disabled=(), all_chats=()):
         """Build a bare adapter with only the attrs the gate reads."""
         adapter = SimpleNamespace(
             _auto_tts_default=default,
+            _auto_tts_default_mode=default_mode,
             _auto_tts_enabled_chats=set(enabled),
+            _auto_tts_all_chats=set(all_chats),
             _auto_tts_disabled_chats=set(disabled),
         )
         # Bind the unbound method — _should_auto_tts_for_chat only reads the
@@ -2936,15 +2967,90 @@ class TestShouldAutoTtsForChat:
         fn, adapter = self._make_adapter(default=True, disabled={"chat1"})
         assert fn(adapter, "chat1") is False
 
-    def test_enabled_wins_over_disabled(self):
-        """An explicit enable beats an explicit disable (enable takes priority)."""
+    def test_disabled_wins_over_enabled(self):
+        """If contradictory state exists, explicit off is safest and suppresses."""
         fn, adapter = self._make_adapter(
             default=False, enabled={"chat1"}, disabled={"chat1"}
         )
-        assert fn(adapter, "chat1") is True
+        assert fn(adapter, "chat1") is False
 
     def test_per_chat_isolation(self):
         """Enable for chat1 doesn't leak to chat2."""
         fn, adapter = self._make_adapter(default=False, enabled={"chat1"})
         assert fn(adapter, "chat1") is True
         assert fn(adapter, "chat2") is False
+
+    def test_tts_all_mode_speaks_text_messages(self):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter = self._make_adapter(default=False, enabled={"chat1"}, all_chats={"chat1"})[1]
+
+        assert BasePlatformAdapter._should_auto_tts_for_event(
+            adapter,
+            "chat1",
+            MessageType.TEXT,
+        ) is True
+
+    def test_voice_only_mode_does_not_speak_text_messages(self):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter = self._make_adapter(default=False, enabled={"chat1"})[1]
+
+        assert BasePlatformAdapter._should_auto_tts_for_event(
+            adapter,
+            "chat1",
+            MessageType.TEXT,
+        ) is False
+        assert BasePlatformAdapter._should_auto_tts_for_event(
+            adapter,
+            "chat1",
+            MessageType.VOICE,
+        ) is True
+
+    def test_global_auto_tts_default_remains_voice_input_only(self):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter = self._make_adapter(default=True, default_mode="voice_only")[1]
+
+        assert BasePlatformAdapter._should_auto_tts_for_event(
+            adapter,
+            "chat1",
+            MessageType.TEXT,
+        ) is False
+        assert BasePlatformAdapter._should_auto_tts_for_event(
+            adapter,
+            "chat1",
+            MessageType.VOICE,
+        ) is True
+
+    def test_global_auto_tts_all_mode_speaks_future_text_chats(self):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter = self._make_adapter(default=True, default_mode="all")[1]
+
+        assert BasePlatformAdapter._should_auto_tts_for_event(
+            adapter,
+            "future_chat",
+            MessageType.TEXT,
+        ) is True
+        assert BasePlatformAdapter._should_auto_tts_for_event(
+            adapter,
+            "future_chat",
+            MessageType.VOICE,
+        ) is True
+
+    def test_explicit_voice_only_overrides_global_all_for_text_messages(self):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter = self._make_adapter(default=True, default_mode="all", enabled={"chat1"})[1]
+
+        assert BasePlatformAdapter._should_auto_tts_for_event(
+            adapter,
+            "chat1",
+            MessageType.TEXT,
+        ) is False
+        assert BasePlatformAdapter._should_auto_tts_for_event(
+            adapter,
+            "chat1",
+            MessageType.VOICE,
+        ) is True
