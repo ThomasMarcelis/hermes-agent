@@ -31,6 +31,18 @@ def test_non_telegram_status_is_unchanged():
     assert _prepare_gateway_status_message("local", "lifecycle", message) == message
 
 
+def test_webhook_status_is_suppressed_for_email_like_routes():
+    """Webhook-backed transports should emit only the final agent response."""
+    noisy_messages = [
+        "Compacting context — summarizing earlier conversation so I can continue...",
+        "⏳ Retrying in 4.2s (attempt 1/3)...",
+        "⚠ Compression summary failed: fallback marker inserted.",
+    ]
+
+    for message in noisy_messages:
+        assert _prepare_gateway_status_message(Platform.WEBHOOK, "lifecycle", message) is None
+
+
 def test_telegram_status_sanitizes_raw_provider_security_errors():
     """Provider policy/security bodies should be replaced before chat delivery."""
     raw = (
