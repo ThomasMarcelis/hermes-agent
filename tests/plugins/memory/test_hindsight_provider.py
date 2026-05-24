@@ -42,6 +42,7 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
+        "HINDSIGHT_RECALL_TAGS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -242,6 +243,7 @@ class TestConfig:
             recall_types=["world", "experience"],
             recall_prompt_preamble="Custom preamble:",
             recall_max_input_chars=500,
+            recall_debug_visible=True,
             bank_mission="Test agent mission",
         )
         assert p._tags == ["tag1", "tag2"]
@@ -260,6 +262,7 @@ class TestConfig:
         assert p._recall_types == ["world", "experience"]
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
+        assert p._recall_debug_visible is True
         assert p._bank_mission == "Test agent mission"
 
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
@@ -615,6 +618,52 @@ class TestPrefetch:
         result = p.prefetch("test")
         assert result.startswith("Custom header:")
         assert "- memory line" in result
+
+    def test_visible_recall_debug_disabled_by_default(self, provider):
+        result = provider.format_visible_recall_debug(
+            query="what does Thomas prefer?",
+            injected_context="- Memory 1\n- Memory 2",
+            session_id="test-session",
+        )
+        assert result == ""
+
+    def test_visible_recall_debug_formats_full_footer(self, provider_with_config):
+        p = provider_with_config(
+            recall_debug_visible=True,
+            recall_tags=["scope:jd-default"],
+            recall_tags_match="all",
+        )
+        context = (
+            "# Hindsight Memory\n"
+            "- First recalled memory line that should not be truncated for display\n"
+            "- Second recalled memory line\n"
+        )
+        result = p.format_visible_recall_debug(
+            query="debug this query",
+            injected_context=context,
+            session_id="test-session",
+        )
+        assert "auto-recall debug" in result
+        assert "bank=`test-bank`" in result
+        assert "tags=`scope:jd-default`" in result
+        assert "match=`all`" in result
+        assert "turn=`1`" in result
+        assert "cadence=" not in result
+        assert "items=`" not in result
+        assert "debug this query" in result
+        assert context in result
+        assert "First recalled memory line that should not be truncated for display" in result
+        assert "Second recalled memory line" in result
+
+    def test_visible_recall_debug_reports_cold_cache(self, provider_with_config):
+        p = provider_with_config(recall_debug_visible=True)
+        result = p.format_visible_recall_debug(
+            query="first turn",
+            injected_context="",
+            session_id="test-session",
+        )
+        assert "injected: `no`" in result
+        assert "cold-cache" in result
 
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
@@ -1004,6 +1053,19 @@ class TestSessionSwitchBufferFlush:
         provider._client.aretain_batch.assert_not_called()
         assert provider._session_id == "new-sid"
 
+    def test_parent_session_cleared_when_switching_to_root_session(self, provider):
+        """A later root/fresh session must not inherit stale parent tags."""
+        provider._parent_session_id = "old-parent"
+
+        provider.on_session_switch("root-sid", parent_session_id="")
+        provider.sync_turn("hello", "hi")
+        provider._retain_queue.join()
+
+        item = provider._client.aretain_batch.call_args.kwargs["items"][0]
+        assert provider._parent_session_id == ""
+        assert "session:root-sid" in item["tags"]
+        assert "parent:old-parent" not in item["tags"]
+
     def test_prefetch_result_cleared_on_switch(self, provider):
         """Stale recall text from the old session must not leak into the
         next session's first prefetch read."""
@@ -1242,8 +1304,8 @@ class TestConfigSchema:
             "recall_tags", "recall_tags_match",
             "auto_recall", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
-            "recall_max_tokens", "recall_max_input_chars",
-            "recall_prompt_preamble",
+            "recall_max_tokens", "reflect_budget", "reflect_max_tokens",
+            "recall_max_input_chars", "recall_prompt_preamble",
         }
         assert expected_keys.issubset(keys), f"Missing: {expected_keys - keys}"
 

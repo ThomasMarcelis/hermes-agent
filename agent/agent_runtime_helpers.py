@@ -1618,7 +1618,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=tool_call_id or "",
             )
         except Exception:
             pass
@@ -1675,7 +1679,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 pass
         return result
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
-        return agent._memory_manager.handle_tool_call(function_name, function_args)
+        start = time.monotonic()
+        result = agent._memory_manager.handle_tool_call(function_name, function_args)
+        duration_ms = int((time.monotonic() - start) * 1000)
+        agent._emit_post_tool_call_hook(
+            function_name,
+            function_args,
+            result,
+            task_id=effective_task_id or "",
+            session_id=agent.session_id or "",
+            tool_call_id=tool_call_id or "",
+            duration_ms=duration_ms,
+        )
+        return result
     elif function_name == "clarify":
         from tools.clarify_tool import clarify_tool as _clarify_tool
         return _clarify_tool(

@@ -59,6 +59,7 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+_PARENT_SESSION_UNSET = object()
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -81,6 +82,23 @@ def _parse_int_setting(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         logger.warning("Invalid integer Hindsight setting %r; using default %s", value, default)
         return default
+
+
+def _parse_bool_setting(value: Any, default: bool) -> bool:
+    """Parse a boolean config/env value, falling back on invalid input."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    logger.warning("Invalid boolean Hindsight setting %r; using default %s", value, default)
+    return default
 
 
 def _check_local_runtime() -> tuple[bool, str | None]:
@@ -269,6 +287,15 @@ RECALL_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
+            "budget": {
+                "type": "string",
+                "enum": ["low", "mid", "high"],
+                "description": "Optional per-call recall budget override. Use 'high' for deep searches.",
+            },
+            "max_tokens": {
+                "type": "integer",
+                "description": "Optional maximum tokens for recall results; overrides configured recall_max_tokens.",
+            },
         },
         "required": ["query"],
     },
@@ -284,6 +311,15 @@ REFLECT_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "The question to reflect on."},
+            "budget": {
+                "type": "string",
+                "enum": ["low", "mid", "high"],
+                "description": "Optional per-call reflect budget override. Use 'high' for deep synthesis across large memory banks.",
+            },
+            "max_tokens": {
+                "type": "integer",
+                "description": "Optional maximum tokens for the synthesized response; overrides configured reflect_max_tokens.",
+            },
         },
         "required": ["query"],
     },
@@ -570,6 +606,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Retain controls
         self._auto_retain = True
+        self._expose_retain_tool = True
         self._retain_every_n_turns = 1
         self._retain_async = True
         self._retain_context = "conversation between Hermes Agent and the User"
@@ -579,6 +616,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall controls
         self._auto_recall = True
         self._recall_max_tokens = 4096
+        self._reflect_budget: str | None = None
+        self._reflect_max_tokens = 4096
         # Default to observation-only recall. Observations are Hindsight's
         # consolidated knowledge layer — deduplicated, evidence-grounded
         # beliefs built from many raw facts, with proof counts and
@@ -590,6 +629,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+        self._recall_debug_visible = False
 
         # Bank
         self._bank_mission = ""
@@ -857,6 +897,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
             {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
+            {"key": "reflect_budget", "description": "Default reflect thoroughness (falls back to recall_budget when unset)", "choices": ["low", "mid", "high"]},
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
@@ -868,12 +909,15 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
+            {"key": "expose_retain_tool", "description": "Expose the model-visible hindsight_retain tool", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
+            {"key": "reflect_max_tokens", "description": "Maximum tokens for hindsight_reflect synthesized responses (falls back to recall_max_tokens when unset)", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
+            {"key": "recall_debug_visible", "description": "Append the full auto-recall injection/debug block to each completed response", "default": False},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
         ]
@@ -1160,6 +1204,8 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
+        reflect_budget = self._config.get("reflect_budget") or self._config.get("hindsight_reflect_budget")
+        self._reflect_budget = reflect_budget if reflect_budget in _VALID_BUDGETS else None
 
         memory_mode = self._config.get("memory_mode", "hybrid")
         self._memory_mode = memory_mode if memory_mode in {"context", "tools", "hybrid"} else "hybrid"
@@ -1177,7 +1223,10 @@ class HindsightMemoryProvider(MemoryProvider):
             or os.environ.get("HINDSIGHT_RETAIN_TAGS", "")
         )
         self._tags = self._retain_tags or None
-        self._recall_tags = self._config.get("recall_tags") or None
+        self._recall_tags = _normalize_retain_tags(
+            self._config.get("recall_tags")
+            or os.environ.get("HINDSIGHT_RECALL_TAGS", "")
+        ) or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
@@ -1190,13 +1239,21 @@ class HindsightMemoryProvider(MemoryProvider):
         ).strip() or "Assistant"
 
         # Retain controls
-        self._auto_retain = self._config.get("auto_retain", True)
+        self._auto_retain = _parse_bool_setting(self._config.get("auto_retain"), True)
+        self._expose_retain_tool = _parse_bool_setting(
+            self._config.get("expose_retain_tool"),
+            True,
+        )
         self._retain_every_n_turns = max(1, int(self._config.get("retain_every_n_turns", 1)))
         self._retain_context = self._config.get("retain_context", "conversation between Hermes Agent and the User")
 
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
+        self._reflect_max_tokens = _parse_int_setting(
+            self._config.get("reflect_max_tokens"),
+            self._recall_max_tokens,
+        )
         # Default narrows recall to observation-only; pass an explicit
         # `recall_types` list in config.json to broaden (e.g. include
         # "world" / "experience") or to disable the filter entirely.
@@ -1210,6 +1267,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        self._recall_debug_visible = _parse_bool_setting(self._config.get("recall_debug_visible"), False)
         self._retain_async = self._config.get("retain_async", True)
 
         _client_version = "unknown"
@@ -1218,16 +1276,16 @@ class HindsightMemoryProvider(MemoryProvider):
             _client_version = pkg_version("hindsight-client")
         except Exception:
             pass
-        logger.info("Hindsight initialized: mode=%s, api_url=%s, bank=%s, budget=%s, memory_mode=%s, prefetch_method=%s, client=%s",
-                     self._mode, self._api_url, self._bank_id, self._budget, self._memory_mode, self._prefetch_method, _client_version)
+        logger.info("Hindsight initialized: mode=%s, api_url=%s, bank=%s, budget=%s, reflect_budget=%s, memory_mode=%s, prefetch_method=%s, client=%s",
+                     self._mode, self._api_url, self._bank_id, self._budget, self._reflect_budget or self._budget, self._memory_mode, self._prefetch_method, _client_version)
         if self._bank_id_template:
             logger.debug("Hindsight bank resolved from template %r: profile=%s workspace=%s platform=%s user=%s -> bank=%s",
                          self._bank_id_template, self._agent_identity, self._agent_workspace,
                          self._platform, self._user_id, self._bank_id)
         logger.debug("Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
-                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s",
+                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, reflect_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s",
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
-                     self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
+                     self._retain_async, self._retain_context, self._recall_max_tokens, self._reflect_max_tokens, self._recall_max_input_chars,
                      self._tags, self._recall_tags)
 
         # For local mode, start the embedded daemon in the background so it
@@ -1284,18 +1342,28 @@ class HindsightMemoryProvider(MemoryProvider):
                 f"Relevant memories are automatically injected into context."
             )
         if self._memory_mode == "tools":
+            tools_line = "Use hindsight_recall to search and hindsight_reflect for synthesis."
+            if self._expose_retain_tool:
+                tools_line = (
+                    "Use hindsight_recall to search, hindsight_reflect for synthesis, "
+                    "hindsight_retain to store facts."
+                )
             return (
                 f"# Hindsight Memory\n"
                 f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
-                f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-                f"hindsight_retain to store facts."
+                f"{tools_line}"
+            )
+        tools_line = "Use hindsight_recall to search and hindsight_reflect for synthesis."
+        if self._expose_retain_tool:
+            tools_line = (
+                "Use hindsight_recall to search, hindsight_reflect for synthesis, "
+                "hindsight_retain to store facts."
             )
         return (
             f"# Hindsight Memory\n"
             f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
             f"Relevant memories are automatically injected into context. "
-            f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-            f"hindsight_retain to store facts."
+            f"{tools_line}"
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -1316,6 +1384,51 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    @staticmethod
+    def _debug_fence(text: str, *, language: str = "text") -> str:
+        """Return a Markdown fence that cannot be closed by *text* content."""
+        body = str(text or "")
+        fence = "```"
+        while fence in body:
+            fence += "`"
+        return f"{fence}{language}\n{body}\n{fence}"
+
+    def format_visible_recall_debug(
+        self,
+        *,
+        query: str,
+        injected_context: str,
+        session_id: str = "",
+    ) -> str:
+        """Format the opt-in user-visible auto-recall debug footer."""
+        if not self._recall_debug_visible:
+            return ""
+        turn_number = self._turn_counter + 1
+        context = str(injected_context or "")
+        injected = bool(context.strip())
+        tags = ",".join(self._recall_tags or []) or "none"
+        lines = [
+            "---",
+            "**auto-recall debug** "
+            f"provider=hindsight bank=`{self._bank_id}` budget=`{self._budget}` "
+            f"tags=`{tags}` match=`{self._recall_tags_match}` "
+            f"turn=`{turn_number}`",
+            "query:",
+            self._debug_fence(str(query or "")),
+            f"injected: `{'yes' if injected else 'no'}`; chars=`{len(context)}`",
+        ]
+        if not injected:
+            lines.append(
+                "note: no prefetched recall context was available for this turn "
+                "(often a cold-cache/first-turn condition); next-turn prefetch is still queued."
+            )
+        else:
+            lines.extend([
+                "injected auto-recall context:",
+                self._debug_fence(context),
+            ])
+        return "\n".join(lines)
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -1334,18 +1447,11 @@ class HindsightMemoryProvider(MemoryProvider):
             try:
                 if self._prefetch_method == "reflect":
                     logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                    reflect_kwargs = self._build_reflect_kwargs(query)
+                    resp = self._run_hindsight_operation(lambda client: client.areflect(**reflect_kwargs))
                     text = resp.text or ""
                 else:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
+                    recall_kwargs = self._build_recall_kwargs(query)
                     logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
                                  self._bank_id, len(query), self._budget)
                     resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -1433,6 +1539,32 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["tags"] = merged_tags
         return kwargs
 
+    def _build_recall_kwargs(self, query: str, *, budget: str | None = None, max_tokens: Any = None) -> Dict[str, Any]:
+        recall_kwargs: Dict[str, Any] = {
+            "bank_id": self._bank_id,
+            "query": query,
+            "budget": budget if budget in _VALID_BUDGETS else self._budget,
+            "max_tokens": int(max_tokens or self._recall_max_tokens),
+        }
+        if self._recall_tags:
+            recall_kwargs["tags"] = self._recall_tags
+            recall_kwargs["tags_match"] = self._recall_tags_match
+        if self._recall_types:
+            recall_kwargs["types"] = self._recall_types
+        return recall_kwargs
+
+    def _build_reflect_kwargs(self, query: str, *, budget: str | None = None, max_tokens: Any = None) -> Dict[str, Any]:
+        reflect_kwargs: Dict[str, Any] = {
+            "bank_id": self._bank_id,
+            "query": query,
+            "budget": budget if budget in _VALID_BUDGETS else (self._reflect_budget or self._budget),
+            "max_tokens": int(max_tokens or self._reflect_max_tokens),
+        }
+        if self._recall_tags:
+            reflect_kwargs["tags"] = self._recall_tags
+            reflect_kwargs["tags_match"] = self._recall_tags_match
+        return reflect_kwargs
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Enqueue a retain for the current turn. Non-blocking.
 
@@ -1513,10 +1645,15 @@ class HindsightMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        schemas = [RECALL_SCHEMA, REFLECT_SCHEMA]
+        if self._expose_retain_tool:
+            schemas.insert(0, RETAIN_SCHEMA)
+        return schemas
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
+            if not self._expose_retain_tool:
+                return tool_error("hindsight_retain is disabled by configuration")
             content = args.get("content", "")
             if not content:
                 return tool_error("Missing required parameter: content")
@@ -1541,17 +1678,13 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
-                }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
+                recall_kwargs = self._build_recall_kwargs(
+                    query,
+                    budget=args.get("budget"),
+                    max_tokens=args.get("max_tokens"),
+                )
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
+                             self._bank_id, len(query), recall_kwargs["budget"])
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                 num_results = len(resp.results) if resp.results else 0
                 logger.debug("Tool hindsight_recall: %d results", num_results)
@@ -1568,13 +1701,14 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = self._run_hindsight_operation(
-                    lambda client: client.areflect(
-                        bank_id=self._bank_id, query=query, budget=self._budget
-                    )
+                reflect_kwargs = self._build_reflect_kwargs(
+                    query,
+                    budget=args.get("budget"),
+                    max_tokens=args.get("max_tokens"),
                 )
+                logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s, max_tokens=%d",
+                             self._bank_id, len(query), reflect_kwargs["budget"], reflect_kwargs["max_tokens"])
+                resp = self._run_hindsight_operation(lambda client: client.areflect(**reflect_kwargs))
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
                 return json.dumps({"result": resp.text or "No relevant memories found."})
             except Exception as e:
@@ -1587,7 +1721,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self,
         new_session_id: str,
         *,
-        parent_session_id: str = "",
+        parent_session_id: Any = _PARENT_SESSION_UNSET,
         reset: bool = False,
         **kwargs,
     ) -> None:
@@ -1697,9 +1831,14 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_result = ""
 
-        # 3. Now rotate to the new session.
-        if parent_session_id:
-            self._parent_session_id = str(parent_session_id).strip()
+        # 3. Now rotate to the new session.  Distinguish older callers that
+        # omit parent_session_id from callers that explicitly pass "" for a
+        # root/fresh session.
+        if parent_session_id is _PARENT_SESSION_UNSET:
+            if reset:
+                self._parent_session_id = ""
+        else:
+            self._parent_session_id = str(parent_session_id or "").strip()
         self._session_id = new_id
         start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._document_id = f"{self._session_id}-{start_ts}"

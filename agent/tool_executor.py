@@ -192,7 +192,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
+                    tool_call_id=getattr(tool_call, "id", "") or "",
                 )
             except Exception:
                 block_message = None
@@ -593,7 +597,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
+                    tool_call_id=getattr(tool_call, "id", "") or "",
                 )
             except Exception:
                 pass
@@ -826,6 +834,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
             finally:
                 tool_duration = time.time() - tool_start_time
+                agent._emit_post_tool_call_hook(
+                    function_name,
+                    function_args,
+                    function_result,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    duration_ms=int(tool_duration * 1000),
+                )
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
                 if spinner:
                     spinner.stop(cute_msg)
