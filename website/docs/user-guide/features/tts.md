@@ -51,6 +51,17 @@ tts:
   elevenlabs:
     voice_id: "pNInz6obpgDQGcFmaJgB"  # Adam
     model_id: "eleven_multilingual_v2"
+    preserve_audio_tags: false       # true for eleven_v3-style [whispers] performance cues
+    voices:                          # Optional aliases for multi-voice Storyteller dialogue
+      narrator.primary:
+        voice_id: "pNInz6obpgDQGcFmaJgB"
+      clerk.asset_regularization:
+        voice_id: "EXAVITQu4vr4xnSDxMaL"
+        name: "Asset Clerk"
+    dialogue:
+      default_voice_key: narrator.primary
+      allow_raw_voice_ids: false     # safer default: only configured aliases may be selected
+      max_chars_per_request: 2000    # ElevenLabs dialogue endpoint chunk size
   openai:
     model: "gpt-4o-mini-tts"
     voice: "alloy"              # alloy, echo, fable, onyx, nova, shimmer
@@ -164,6 +175,27 @@ tts:
 ```
 
 Only positive integers are honored. Zero, negative, non-numeric, or boolean values fall through to the provider default, so a broken config can't accidentally disable truncation.
+
+### ElevenLabs audio cues and Storyteller multi-voice dialogue
+
+ElevenLabs v3 models can interpret bracketed performance cues such as `[whispers]` or `[sighs]`. Flash/Turbo v2/v2.5 models may read those cues aloud, so Hermes preserves them automatically only for `eleven_v3` / `eleven_ttv_v3`. Override with:
+
+```yaml
+tts:
+  provider: elevenlabs
+  elevenlabs:
+    model_id: eleven_v3
+    preserve_audio_tags: true
+```
+
+For narration or Storyteller profiles, Hermes also supports ElevenLabs Text to Dialogue routing markers:
+
+```text
+[[voice:narrator.primary]][whispers] The latch clicks.[[/voice]]
+[[voice:clerk.asset_regularization]]Desk Six does not make mistakes.[[/voice]]
+```
+
+Configure selectable voices under `tts.elevenlabs.voices` or a YAML registry/cast file referenced by `voice_registry_path` / `dialogue.cast_path`. Unknown voice keys fall back to the default narrator. Raw ElevenLabs voice IDs in `[[voice:...]]` are disabled by default; set `tts.elevenlabs.dialogue.allow_raw_voice_ids: true` only if you intentionally want prompts or scripts to route to unregistered IDs. Non-ElevenLabs providers strip `[[voice:...]]` markers before speech generation so the markers are not spoken aloud.
 
 ### Telegram Voice Bubbles & ffmpeg
 
@@ -433,6 +465,8 @@ stt:
     model: "whisper-1"        # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
   mistral:
     model: "voxtral-mini-latest"  # voxtral-mini-latest, voxtral-mini-2602
+  elevenlabs:
+    model: "scribe_v2"
   xai:
     model: "grok-stt"         # xAI Grok STT
 ```
@@ -454,6 +488,8 @@ stt:
 **OpenAI API** — Accepts `VOICE_TOOLS_OPENAI_KEY` first and falls back to `OPENAI_API_KEY`. Supports `whisper-1`, `gpt-4o-mini-transcribe`, and `gpt-4o-transcribe`.
 
 **Mistral API (Voxtral Transcribe)** — Requires `MISTRAL_API_KEY`. Uses Mistral's [Voxtral Transcribe](https://docs.mistral.ai/capabilities/audio/speech_to_text/) models. Supports 13 languages, speaker diarization, and word-level timestamps. Install with `pip install hermes-agent[mistral]`.
+
+**ElevenLabs Scribe** — Requires `ELEVENLABS_API_KEY` and the `elevenlabs` package. Uses the same key as ElevenLabs TTS and supports optional `stt.elevenlabs` settings such as `language_code`, `diarize`, `tag_audio_events`, `timestamps_granularity`, and `num_speakers`.
 
 **xAI Grok STT** — Requires `XAI_API_KEY`. Posts to `https://api.x.ai/v1/stt` as multipart/form-data. Good choice if you're already using xAI for chat or TTS and want one API key for everything. Auto-detection order puts it after Groq — explicitly set `stt.provider: xai` to force it.
 
