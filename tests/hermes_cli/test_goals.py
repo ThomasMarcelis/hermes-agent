@@ -175,6 +175,37 @@ class TestJudgeGoal:
         assert verdict == "continue"
         assert reason == "not yet"
 
+    def test_judge_goal_uses_configured_timeout_and_extra_body(self):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": false, "reason": "not yet"}')
+                )
+            ]
+        )
+        extra_body = {"reasoning": {"enabled": True, "effort": "xhigh"}}
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "aux-model"),
+        ), patch(
+            "agent.auxiliary_client._get_task_timeout",
+            return_value=3600.0,
+        ), patch(
+            "agent.auxiliary_client._get_task_extra_body",
+            return_value=extra_body,
+        ):
+            verdict, reason, _ = goals.judge_goal("goal", "agent response")
+
+        assert verdict == "continue"
+        assert reason == "not yet"
+        kwargs = fake_client.chat.completions.create.call_args.kwargs
+        assert kwargs["model"] == "aux-model"
+        assert kwargs["timeout"] == 3600.0
+        assert kwargs["extra_body"] == extra_body
+
 
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
@@ -238,7 +269,6 @@ class TestGoalManager:
 
     def test_persistence_across_managers(self, hermes_home):
         """Key invariant: a second manager on the same session sees the goal.
-
         This is what makes /resume work — each session rebinds its
         GoalManager and picks up the saved state.
         """
@@ -251,6 +281,61 @@ class TestGoalManager:
         assert mgr2.state is not None
         assert mgr2.state.goal == "do the thing"
         assert mgr2.is_active()
+
+    def test_compression_child_adopts_active_parent_goal(self, hermes_home):
+        """Regression: compression rotates session_id, but /goal state lives
+        under the pre-compression session key. A GoalManager on the child
+        session must adopt that standing goal so auto-continuation continues.
+        """
+        from hermes_cli.goals import GoalManager, load_goal
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        db.create_session("parent-sid", source="discord", model="test")
+
+        parent_mgr = GoalManager(session_id="parent-sid", default_max_turns=7)
+        parent_mgr.set("finish the compression-spanning goal")
+
+        db.end_session("parent-sid", "compression")
+        db.create_session(
+            "child-sid",
+            source="discord",
+            model="test",
+            parent_session_id="parent-sid",
+        )
+
+        child_mgr = GoalManager(session_id="child-sid")
+
+        assert child_mgr.state is not None
+        assert child_mgr.state.goal == "finish the compression-spanning goal"
+        assert child_mgr.state.status == "active"
+        assert child_mgr.state.max_turns == 7
+        assert child_mgr.is_active()
+        assert load_goal("child-sid").status == "active"
+        assert load_goal("parent-sid").status == "cleared"
+        assert "moved to child-sid" in (load_goal("parent-sid").last_reason or "")
+
+    def test_non_compression_child_does_not_adopt_parent_goal(self, hermes_home):
+        """Only compression lineage should move goals; branches/manual child
+        sessions should not silently steal an active parent goal.
+        """
+        from hermes_cli.goals import GoalManager
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        db.create_session("branch-parent", source="discord", model="test")
+        GoalManager(session_id="branch-parent").set("parent-only goal")
+        db.end_session("branch-parent", "user_exit")
+        db.create_session(
+            "branch-child",
+            source="discord",
+            model="test",
+            parent_session_id="branch-parent",
+        )
+
+        child_mgr = GoalManager(session_id="branch-child")
+
+        assert child_mgr.state is None
 
     def test_evaluate_after_turn_done(self, hermes_home):
         """Judge says done → status=done, no continuation."""

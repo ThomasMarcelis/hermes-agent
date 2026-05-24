@@ -30,6 +30,8 @@ def _messages_with_handoff(summary_body: str):
         {"role": "assistant", "content": "handoff acknowledged after resume"},
         {"role": "user", "content": "new user turn after resume"},
         {"role": "assistant", "content": "new assistant work after resume"},
+        {"role": "user", "content": "middle user work after resume"},
+        {"role": "assistant", "content": "middle assistant work after resume"},
         {"role": "user", "content": "more new work after resume"},
         {"role": "assistant", "content": "latest tail response"},
         {"role": "user", "content": "final active request stays in protected tail"},
@@ -43,13 +45,14 @@ def test_existing_previous_summary_is_not_serialized_again_as_new_turn():
     compressor._previous_summary = old_summary
 
     with patch("agent.context_compressor.call_llm", return_value=_response("updated summary")) as mock_call:
-        compressor.compress(_messages_with_handoff(old_summary))
+        compressed = compressor.compress(_messages_with_handoff(old_summary))
 
     prompt = mock_call.call_args.kwargs["messages"][0]["content"]
     assert "PREVIOUS SUMMARY:" in prompt
     assert "NEW TURNS TO INCORPORATE:" in prompt
     assert prompt.count(old_summary) == 1
     assert f"[USER]: {SUMMARY_PREFIX}" not in prompt
+    assert old_summary not in "\n".join(str(msg.get("content", "")) for msg in compressed)
 
 
 def test_resume_rehydrates_previous_summary_from_handoff_message():
@@ -59,7 +62,7 @@ def test_resume_rehydrates_previous_summary_from_handoff_message():
     assert compressor._previous_summary is None
 
     with patch("agent.context_compressor.call_llm", return_value=_response("updated summary")) as mock_call:
-        compressor.compress(_messages_with_handoff(old_summary))
+        compressed = compressor.compress(_messages_with_handoff(old_summary))
 
     prompt = mock_call.call_args.kwargs["messages"][0]["content"]
     assert "PREVIOUS SUMMARY:" in prompt
@@ -67,6 +70,7 @@ def test_resume_rehydrates_previous_summary_from_handoff_message():
     assert "TURNS TO SUMMARIZE:" not in prompt
     assert prompt.count(old_summary) == 1
     assert f"[USER]: {SUMMARY_PREFIX}" not in prompt
+    assert old_summary not in "\n".join(str(msg.get("content", "")) for msg in compressed)
 
 
 def test_handoff_in_protected_head_populates_previous_summary_before_update():
