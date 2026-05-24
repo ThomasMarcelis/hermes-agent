@@ -42,6 +42,7 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    _ext_prefetch_cache=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -387,6 +388,26 @@ def finalize_turn(
         interrupted=interrupted,
         messages=messages,
     )
+
+    # Optional visible auto-recall debug. Append only to the outgoing result,
+    # after session persistence and external-memory sync, so debug footers do
+    # not become durable conversation history or Hindsight retain material.
+    if result.get("final_response") and not interrupted and agent._memory_manager:
+        try:
+            _debug_query = (
+                original_user_message
+                if isinstance(original_user_message, str)
+                else _summarize_user_message_for_log(original_user_message)
+            )
+            _recall_debug = agent._memory_manager.build_visible_recall_debug(
+                query=_debug_query,
+                injected_context=_ext_prefetch_cache,
+                session_id=agent.session_id or "",
+            )
+            if _recall_debug:
+                result["final_response"] = result["final_response"].rstrip() + "\n\n" + _recall_debug
+        except Exception as exc:
+            logger.debug("visible auto-recall debug footer failed: %s", exc)
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.

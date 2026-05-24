@@ -498,6 +498,34 @@ class MemoryManager:
 
         self._submit_background(_run)
 
+    def build_visible_recall_debug(
+        self,
+        *,
+        query: str,
+        injected_context: str,
+        session_id: str = "",
+    ) -> str:
+        """Return opt-in user-visible debug text for auto-recall."""
+        parts = []
+        for provider in self._providers:
+            formatter = getattr(provider, "format_visible_recall_debug", None)
+            if not callable(formatter):
+                continue
+            try:
+                result = formatter(
+                    query=query,
+                    injected_context=injected_context,
+                    session_id=session_id,
+                )
+                if result and str(result).strip():
+                    parts.append(str(result).strip())
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' visible recall debug failed (non-fatal): %s",
+                    provider.name, e,
+                )
+        return "\n\n".join(parts)
+
     # -- Sync ----------------------------------------------------------------
 
     @staticmethod
