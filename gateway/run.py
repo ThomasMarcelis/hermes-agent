@@ -12949,6 +12949,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if agent is None:
             return
         try:
+            if hasattr(agent, "release_memory_provider_resources"):
+                agent.release_memory_provider_resources()
             if hasattr(agent, "release_clients"):
                 agent.release_clients()
             else:
@@ -12964,6 +12966,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # persisted session JSON on the next turn, so dropping it here is safe.
         if hasattr(agent, "_session_messages"):
             agent._session_messages = []
+
+    def _store_cached_agent(self, session_key: str, agent: Any, signature: str, message_count: Any = None) -> None:
+        """Store an agent in the LRU cache, softly releasing replaced idle agents."""
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache is None:
+            return
+        previous = _cache.get(session_key)
+        previous_agent = previous[0] if isinstance(previous, tuple) and previous else None
+        _cache[session_key] = (agent, signature, message_count)
+        if hasattr(_cache, "move_to_end"):
+            try:
+                _cache.move_to_end(session_key)
+            except KeyError:
+                pass
+        if (
+            previous_agent is not None
+            and previous_agent is not agent
+            and previous_agent is not getattr(self, "_running_agents", {}).get(session_key)
+        ):
+            self._release_evicted_agent_soft(previous_agent)
+        self._enforce_agent_cache_cap()
 
     def _enforce_agent_cache_cap(self) -> None:
         """Evict oldest cached agents when cache exceeds _AGENT_CACHE_MAX_SIZE.
@@ -14460,8 +14483,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
-                        _cache[session_key] = (agent, _sig, _current_msg_count)
-                        self._enforce_agent_cache_cap()
+                        self._store_cached_agent(session_key, agent, _sig, _current_msg_count)
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
             # Per-message state — callbacks and reasoning config change every
