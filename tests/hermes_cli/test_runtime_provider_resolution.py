@@ -59,6 +59,71 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
     assert resolved["base_url"] == "https://proxy.example.com/anthropic"
 
 
+def test_resolve_runtime_provider_codex_pool_respects_config_base_url(monkeypatch):
+    class _Entry:
+        access_token = "pool-token"
+        source = "manual"
+        base_url = "https://chatgpt.com/backend-api/codex"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "base_url": "http://127.0.0.1:2455/backend-api/codex",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_key"] == "pool-token"
+    assert resolved["base_url"] == "http://127.0.0.1:2455/backend-api/codex"
+
+
+def test_resolve_runtime_provider_codex_loopback_works_without_pool_token(monkeypatch):
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return None
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "base_url": "http://127.0.0.1:2455/backend-api/codex",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: (_ for _ in ()).throw(AssertionError("local proxy should not need Codex OAuth")),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_key"] == "no-key-required"
+    assert resolved["base_url"] == "http://127.0.0.1:2455/backend-api/codex"
+    assert resolved["source"] == "local-codex-proxy"
+
+
 def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
     def _unexpected_pool(provider):
         raise AssertionError(f"load_pool should not be called for {provider}")
