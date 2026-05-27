@@ -46,6 +46,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -651,6 +652,7 @@ class _CodexCompletionsAdapter:
         self._model = model
 
     def create(self, **kwargs) -> Any:
+        diagnostic_task = str(kwargs.pop("__hermes_aux_task", "") or "call")
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
@@ -777,15 +779,193 @@ class _CodexCompletionsAdapter:
         tool_calls_raw: List[Any] = []
         usage = None
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
-        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
+        total_timeout_s: Optional[float] = float(total_timeout) if total_timeout is not None else None
+        deadline = time.monotonic() + total_timeout_s if total_timeout_s is not None else None
         timed_out = threading.Event()
+        timeout_lock = threading.Lock()
+        timeout_message: Dict[str, Optional[str]] = {"value": None}
         timeout_timer: Optional[threading.Timer] = None
+        first_event_timer: Optional[threading.Timer] = None
+        seen_first_event = threading.Event()
+        stream_id = f"aux-{uuid.uuid4().hex[:8]}"
+        stream_started_at = time.monotonic()
+        base_url = str(getattr(self._client, "base_url", "") or "")
+        base_host = base_url_hostname(base_url) or "unknown"
+        diag_lock = threading.Lock()
+        diagnostics: Dict[str, Any] = {
+            "phase": "initializing",
+            "phase_since": stream_started_at,
+            "events": 0,
+            "first_event_type": None,
+            "last_event_type": None,
+            "response_id": None,
+        }
+
+        def _fmt_timeout(value: Optional[float]) -> str:
+            if value is None:
+                return "none"
+            if value == float("inf"):
+                return "disabled"
+            return f"{value:.1f}s"
+
+        def _diagnostic_suffix() -> str:
+            now = time.monotonic()
+            with diag_lock:
+                phase = diagnostics["phase"]
+                phase_elapsed = now - float(diagnostics["phase_since"])
+                events = int(diagnostics["events"])
+                first_event = diagnostics["first_event_type"] or "None"
+                last_event = diagnostics["last_event_type"] or "None"
+                response_id = diagnostics["response_id"] or "None"
+            return (
+                f"stream_id={stream_id} task={diagnostic_task} model={model} "
+                f"base_host={base_host} phase={phase} "
+                f"elapsed={now - stream_started_at:.1f}s phase_elapsed={phase_elapsed:.1f}s "
+                f"events={events} first_event={first_event} last_event={last_event} "
+                f"response_id={response_id}"
+            )
+
+        def _timeout_with_diagnostics(reason: str) -> str:
+            return f"{reason} [{_diagnostic_suffix()}]"
+
+        def _set_phase(phase: str, *, log: bool = False) -> None:
+            now = time.monotonic()
+            with diag_lock:
+                previous = diagnostics["phase"]
+                diagnostics["phase"] = phase
+                diagnostics["phase_since"] = now
+                events = int(diagnostics["events"])
+                first_event = diagnostics["first_event_type"] or "None"
+                last_event = diagnostics["last_event_type"] or "None"
+                response_id = diagnostics["response_id"] or "None"
+            if log:
+                logger.info(
+                    "Codex auxiliary Responses stream phase: stream_id=%s task=%s "
+                    "phase=%s previous=%s elapsed=%.1fs events=%d "
+                    "first_event=%s last_event=%s response_id=%s",
+                    stream_id,
+                    diagnostic_task,
+                    phase,
+                    previous,
+                    now - stream_started_at,
+                    events,
+                    first_event,
+                    last_event,
+                    response_id,
+                )
+
+        def _get_obj_value(obj: Any, key: str) -> Any:
+            if obj is None:
+                return None
+            value = getattr(obj, key, None)
+            if value is None and isinstance(obj, dict):
+                value = obj.get(key)
+            return value
+
+        def _event_response_id(event: Any) -> Optional[str]:
+            for candidate in (_get_obj_value(event, "response"), event):
+                for key in ("id", "response_id"):
+                    value = _get_obj_value(candidate, key)
+                    if value:
+                        return str(value)
+            return None
+
+        def _record_stream_event(event: Any) -> str:
+            event_type = str(_get_obj_value(event, "type") or "unknown")
+            response_id = _event_response_id(event)
+            now = time.monotonic()
+            with diag_lock:
+                diagnostics["events"] = int(diagnostics["events"]) + 1
+                event_count = int(diagnostics["events"])
+                first = diagnostics["first_event_type"] is None
+                if first:
+                    diagnostics["first_event_type"] = event_type
+                diagnostics["last_event_type"] = event_type
+                if response_id:
+                    diagnostics["response_id"] = response_id
+                if diagnostics["phase"] == "stream_open_waiting_first_event":
+                    diagnostics["phase"] = "streaming_after_first_event"
+                    diagnostics["phase_since"] = now
+            if first:
+                logger.info(
+                    "Codex auxiliary Responses stream first event: stream_id=%s "
+                    "task=%s event_type=%s response_id=%s elapsed=%.1fs",
+                    stream_id,
+                    diagnostic_task,
+                    event_type,
+                    response_id or "None",
+                    now - stream_started_at,
+                )
+            elif event_count % 50 == 0:
+                logger.debug(
+                    "Codex auxiliary Responses stream progress: stream_id=%s "
+                    "task=%s events=%d last_event=%s response_id=%s elapsed=%.1fs",
+                    stream_id,
+                    diagnostic_task,
+                    event_count,
+                    event_type,
+                    response_id or "None",
+                    now - stream_started_at,
+                )
+            return event_type
+
+        def _parse_positive_timeout_env(name: str) -> Optional[float]:
+            raw = os.getenv(name)
+            if raw is None:
+                return None
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                logger.warning("Invalid %s=%r; using default", name, raw)
+                return None
+            if value <= 0:
+                return float("inf")
+            return value
+
+        _first_event_timeout = _parse_positive_timeout_env(
+            "HERMES_CODEX_AUX_STREAM_FIRST_EVENT_TIMEOUT"
+        )
+        if _first_event_timeout is None:
+            _first_event_timeout = _parse_positive_timeout_env(
+                "HERMES_CODEX_STREAM_FIRST_EVENT_TIMEOUT"
+            )
+        if _first_event_timeout is None:
+            # Remote Codex streams occasionally hang before emitting any SSE
+            # event.  The main conversation path has a separate first-event
+            # guard; mirror that here so long auxiliary timeouts (compression,
+            # web_extract, vision) do not wait for the full total timeout when
+            # the provider connection is already wedged.  Local endpoints may
+            # spend minutes prefilling, so keep their historical behavior.
+            try:
+                from agent.model_metadata import is_local_endpoint as _is_local_endpoint
+                is_local = bool(base_url and _is_local_endpoint(base_url))
+            except Exception:
+                is_local = False
+            _first_event_timeout = float("inf") if is_local else 180.0
+        if total_timeout_s is not None and _first_event_timeout != float("inf"):
+            _first_event_timeout = min(total_timeout_s, float(_first_event_timeout))
+
+        def _set_timeout_message(message: str) -> None:
+            with timeout_lock:
+                if timeout_message["value"] is None:
+                    timeout_message["value"] = message
 
         def _timeout_message() -> str:
-            return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
+            with timeout_lock:
+                existing = timeout_message["value"]
+            if existing:
+                return existing
+            if total_timeout_s is not None:
+                return _timeout_with_diagnostics(
+                    f"Codex auxiliary Responses stream exceeded {total_timeout_s:.1f}s total timeout"
+                )
+            return _timeout_with_diagnostics("Codex auxiliary Responses stream timed out")
 
-        def _close_client_on_timeout() -> None:
+        def _close_client_on_timeout(reason: Optional[str] = None) -> None:
+            if reason:
+                _set_timeout_message(_timeout_with_diagnostics(reason))
             timed_out.set()
+            logger.warning("Codex auxiliary Responses stream timeout: %s", _timeout_message())
             close = getattr(self._client, "close", None)
             if callable(close):
                 try:
@@ -804,9 +984,14 @@ class _CodexCompletionsAdapter:
                 logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
+            if timed_out.is_set():
+                raise TimeoutError(_timeout_message())
             if deadline is not None and time.monotonic() >= deadline:
+                assert total_timeout_s is not None
                 if not timed_out.is_set():
-                    _close_client_on_timeout()
+                    _close_client_on_timeout(
+                        f"Codex auxiliary Responses stream exceeded {total_timeout_s:.1f}s total timeout"
+                    )
                 raise TimeoutError(_timeout_message())
             try:
                 from tools.interrupt import is_interrupted
@@ -820,12 +1005,42 @@ class _CodexCompletionsAdapter:
                 pass
 
         try:
-            if total_timeout:
-                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
+            if total_timeout_s is not None:
+                timeout_timer = threading.Timer(
+                    total_timeout_s,
+                    _close_client_on_timeout,
+                    args=(f"Codex auxiliary Responses stream exceeded {total_timeout_s:.1f}s total timeout",),
+                )
                 timeout_timer.daemon = True
                 timeout_timer.start()
+            if _first_event_timeout != float("inf"):
+                first_event_timer = threading.Timer(
+                    float(_first_event_timeout),
+                    _close_client_on_timeout,
+                    args=(
+                        "Codex auxiliary Responses stream timed out before first event "
+                        f"after {float(_first_event_timeout):.1f}s",
+                    ),
+                )
+                first_event_timer.daemon = True
+                first_event_timer.start()
             _check_cancelled()
 
+            final = None
+            _set_phase("before_stream_enter")
+            logger.info(
+                "Codex auxiliary Responses stream start: stream_id=%s task=%s "
+                "model=%s base_host=%s total_timeout=%s first_event_timeout=%s "
+                "messages=%d input_items=%d",
+                stream_id,
+                diagnostic_task,
+                model,
+                base_host,
+                _fmt_timeout(total_timeout_s),
+                _fmt_timeout(float(_first_event_timeout)),
+                len(messages),
+                len(input_msgs),
+            )
             # Event-driven Responses streaming via the low-level
             # ``responses.create(stream=True)`` path.  The high-level
             # ``responses.stream(...)`` helper does post-hoc typed
@@ -844,8 +1059,14 @@ class _CodexCompletionsAdapter:
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
+                if not seen_first_event.is_set():
+                    seen_first_event.set()
+                    if first_event_timer is not None:
+                        first_event_timer.cancel()
+                _record_stream_event(_event)
                 _check_cancelled()
 
+            _set_phase("stream_open_waiting_first_event", log=True)
             event_stream = self._client.responses.create(**stream_kwargs)
             try:
                 final = _consume_codex_event_stream(
@@ -853,6 +1074,7 @@ class _CodexCompletionsAdapter:
                     model=resp_kwargs.get("model"),
                     on_event=_on_each_event,
                 )
+                _set_phase("completed", log=True)
             finally:
                 close_fn = getattr(event_stream, "close", None)
                 if callable(close_fn):
@@ -903,11 +1125,17 @@ class _CodexCompletionsAdapter:
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
-            logger.debug("Codex auxiliary Responses API call failed: %s", exc)
+            logger.warning(
+                "Codex auxiliary Responses API call failed: %s [%s]",
+                exc,
+                _diagnostic_suffix(),
+            )
             raise
         finally:
             if timeout_timer is not None:
                 timeout_timer.cancel()
+            if first_event_timer is not None:
+                first_event_timer.cancel()
 
         content = "".join(text_parts).strip() or None
 
@@ -1004,6 +1232,20 @@ class AsyncCodexAuxiliaryClient:
         self._hermes_pool_provider = getattr(sync_wrapper, "_hermes_pool_provider", None)
         self._hermes_pool_entry_id = getattr(sync_wrapper, "_hermes_pool_entry_id", None)
         self._hermes_pool_entry_label = getattr(sync_wrapper, "_hermes_pool_entry_label", None)
+
+
+def _annotate_codex_auxiliary_kwargs(client: Any, call_kwargs: Dict[str, Any], task: Optional[str]) -> None:
+    """Attach diagnostics consumed only by Codex auxiliary adapters.
+
+    The marker must not be sent to normal OpenAI-compatible providers; the
+    Codex adapter pops it before building Responses API kwargs.
+    """
+    completions = getattr(getattr(client, "chat", None), "completions", None)
+    if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) or isinstance(
+        completions,
+        (_CodexCompletionsAdapter, _AsyncCodexCompletionsAdapter),
+    ):
+        call_kwargs["__hermes_aux_task"] = task or "call"
 
 
 class _AnthropicCompletionsAdapter:
@@ -2883,6 +3125,7 @@ def _retry_same_provider_sync(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+    _annotate_codex_auxiliary_kwargs(retry_client, retry_kwargs, task)
     return _validate_llm_response(
         retry_client.chat.completions.create(**retry_kwargs), task,
     )
@@ -2940,6 +3183,7 @@ async def _retry_same_provider_async(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+    _annotate_codex_auxiliary_kwargs(retry_client, retry_kwargs, task)
     return _validate_llm_response(
         await retry_client.chat.completions.create(**retry_kwargs), task,
     )
@@ -5454,6 +5698,7 @@ def _retry_codex_pool_once_sync(
         )
         if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
             retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+        _annotate_codex_auxiliary_kwargs(retry_client, retry_kwargs, task)
         return True, _validate_llm_response(
             retry_client.chat.completions.create(**retry_kwargs), task
         ), None
@@ -5520,6 +5765,7 @@ async def _retry_codex_pool_once_async(
         )
         if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
             retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+        _annotate_codex_auxiliary_kwargs(retry_client, retry_kwargs, task)
         return True, _validate_llm_response(
             await retry_client.chat.completions.create(**retry_kwargs), task
         ), None
@@ -5653,6 +5899,7 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+    _annotate_codex_auxiliary_kwargs(client, kwargs, task)
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
@@ -6016,6 +6263,7 @@ def call_llm(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
+                _annotate_codex_auxiliary_kwargs(fb_client, fb_kwargs, task)
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — emit a single user-visible
@@ -6185,6 +6433,7 @@ async def async_call_llm(
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+    _annotate_codex_auxiliary_kwargs(client, kwargs, task)
 
     try:
         # Retry ONCE on the same provider for a transient transport blip
@@ -6502,6 +6751,7 @@ async def async_call_llm(
                 )
                 if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                     fb_kwargs["model"] = async_fb_model
+                _annotate_codex_auxiliary_kwargs(async_fb, fb_kwargs, task)
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — warn before re-raising. (#26882)
