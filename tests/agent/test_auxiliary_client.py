@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -3068,6 +3069,96 @@ class TestCodexAuxiliaryAdapterTimeout:
             )
 
         assert time.monotonic() - started < 0.14
+
+    def test_first_event_timeout_kills_silent_stream_before_total_timeout(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CODEX_AUX_STREAM_FIRST_EVENT_TIMEOUT", "0.03")
+        closed = threading.Event()
+
+        class SilentStream:
+            def __iter__(self):
+                while not closed.wait(0.005):
+                    pass
+                raise ConnectionError("socket closed before first event")
+
+            def close(self):
+                pass
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                return SilentStream()
+
+        class FakeClient:
+            base_url = "https://chatgpt.com/backend-api/codex"
+
+            def __init__(self):
+                self.responses = FakeResponses()
+
+            def close(self):
+                closed.set()
+
+        adapter = _CodexCompletionsAdapter(FakeClient(), "aux-model")
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError) as excinfo:
+            adapter.create(
+                messages=[{"role": "user", "content": "summarize this"}],
+                timeout=5.0,
+                __hermes_aux_task="compression",
+            )
+
+        message = str(excinfo.value)
+        assert "timed out before first event" in message
+        assert "task=compression" in message
+        assert "phase=stream_open_waiting_first_event" in message
+        assert "events=0" in message
+        assert "last_event=None" in message
+        assert closed.is_set()
+        assert time.monotonic() - started < 0.20
+
+    def test_total_timeout_reports_streaming_phase_after_events(self):
+        closed = threading.Event()
+
+        class StreamingHangStream:
+            def __iter__(self):
+                yield SimpleNamespace(type="response.in_progress", response=SimpleNamespace(id="resp_123"))
+                while not closed.wait(0.005):
+                    pass
+                raise ConnectionError("socket closed while streaming")
+
+            def close(self):
+                pass
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                return StreamingHangStream()
+
+        class FakeClient:
+            base_url = "https://chatgpt.com/backend-api/codex"
+
+            def __init__(self):
+                self.responses = FakeResponses()
+
+            def close(self):
+                closed.set()
+
+        adapter = _CodexCompletionsAdapter(FakeClient(), "aux-model")
+
+        with pytest.raises(TimeoutError) as excinfo:
+            adapter.create(
+                messages=[{"role": "user", "content": "summarize this"}],
+                timeout=0.03,
+                __hermes_aux_task="compression",
+            )
+
+        message = str(excinfo.value)
+        assert "total timeout" in message
+        assert "task=compression" in message
+        assert "phase=streaming_after_first_event" in message
+        assert "events=1" in message
+        assert "first_event=response.in_progress" in message
+        assert "last_event=response.in_progress" in message
+        assert "response_id=resp_123" in message
+        assert closed.is_set()
 
 
 class TestCodexAuxiliaryToolMessageConversion:
