@@ -2768,6 +2768,54 @@ class TestCodexAuxiliaryAdapterTimeout:
 
         assert time.monotonic() - started < 0.14
 
+    def test_first_event_timeout_closes_isolated_request_client_only(self, monkeypatch):
+        """A stalled auxiliary Codex stream must not close the cached template client."""
+        monkeypatch.setenv("HERMES_CODEX_AUX_STREAM_FIRST_EVENT_TIMEOUT", "0.03")
+        template_closed = threading.Event()
+        request_closed = threading.Event()
+
+        class SilentStream:
+            def __iter__(self):
+                while not request_closed.wait(0.005):
+                    pass
+                raise ConnectionError("request socket closed before first event")
+
+            def close(self):
+                pass
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                return SilentStream()
+
+        request_client = SimpleNamespace(
+            base_url="https://chatgpt.com/backend-api/codex",
+            responses=FakeResponses(),
+            close=request_closed.set,
+        )
+        template_client = SimpleNamespace(
+            base_url="https://chatgpt.com/backend-api/codex",
+            close=template_closed.set,
+        )
+        adapter = _CodexCompletionsAdapter(
+            template_client,
+            "aux-model",
+            request_client_factory=lambda: request_client,
+        )
+
+        with pytest.raises(TimeoutError) as excinfo:
+            adapter.create(
+                messages=[{"role": "user", "content": "summarize this"}],
+                timeout=5.0,
+                __hermes_aux_task="compression",
+            )
+
+        assert "timed out before first event" in str(excinfo.value)
+        assert request_closed.is_set()
+        assert not template_closed.is_set(), (
+            "timeout handling closed the cached template client and can kill "
+            "other in-flight auxiliary streams"
+        )
+
     def test_first_event_timeout_kills_silent_stream_before_total_timeout(self, monkeypatch):
         monkeypatch.setenv("HERMES_CODEX_AUX_STREAM_FIRST_EVENT_TIMEOUT", "0.03")
         closed = threading.Event()
