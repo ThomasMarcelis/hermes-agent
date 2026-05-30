@@ -647,9 +647,49 @@ class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
 
-    def __init__(self, real_client: OpenAI, model: str):
+    def __init__(
+        self,
+        real_client: Any,
+        model: str,
+        *,
+        client_kwargs: Optional[Dict[str, Any]] = None,
+        request_client_factory: Optional[Any] = None,
+    ):
         self._client = real_client
         self._model = model
+        self._client_kwargs = dict(client_kwargs or {})
+        self._request_client_factory = request_client_factory
+
+    def _create_request_client(self) -> Tuple[Any, bool]:
+        """Return a client for one auxiliary Responses stream.
+
+        The cached ``CodexAuxiliaryClient`` can serve concurrent side tasks.
+        A timeout should close only the stalled request, not the cached
+        template client that unrelated in-flight streams may still be using.
+        """
+        if self._request_client_factory is not None:
+            try:
+                request_client = self._request_client_factory()
+            except Exception:
+                logger.debug(
+                    "Codex auxiliary: request client factory failed; using cached client",
+                    exc_info=True,
+                )
+                return self._client, False
+            if request_client is not None:
+                return request_client, request_client is not self._client
+            return self._client, False
+
+        if self._client_kwargs:
+            try:
+                return OpenAI(**dict(self._client_kwargs)), True
+            except Exception:
+                logger.debug(
+                    "Codex auxiliary: per-request client construction failed; using cached client",
+                    exc_info=True,
+                )
+
+        return self._client, False
 
     def create(self, **kwargs) -> Any:
         diagnostic_task = str(kwargs.pop("__hermes_aux_task", "") or "call")
@@ -788,8 +828,13 @@ class _CodexCompletionsAdapter:
         first_event_timer: Optional[threading.Timer] = None
         seen_first_event = threading.Event()
         stream_id = f"aux-{uuid.uuid4().hex[:8]}"
+        stream_client, isolated_stream_client = self._create_request_client()
         stream_started_at = time.monotonic()
-        base_url = str(getattr(self._client, "base_url", "") or "")
+        base_url = str(
+            getattr(stream_client, "base_url", "")
+            or getattr(self._client, "base_url", "")
+            or ""
+        )
         base_host = base_url_hostname(base_url) or "unknown"
         diag_lock = threading.Lock()
         diagnostics: Dict[str, Any] = {
@@ -966,22 +1011,22 @@ class _CodexCompletionsAdapter:
                 _set_timeout_message(_timeout_with_diagnostics(reason))
             timed_out.set()
             logger.warning("Codex auxiliary Responses stream timeout: %s", _timeout_message())
-            close = getattr(self._client, "close", None)
+            close = getattr(stream_client, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
                     logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
-            # The cached auxiliary client wraps this same ``self._client``
-            # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
-            # this instance).  After we close the httpx transport above, the
-            # cache must drop that entry — otherwise the next auxiliary call
-            # (compression retry, memory flush, etc.) reuses the dead client
-            # and fails fast with a connection error.  See issue #23432.
-            try:
-                _evict_cached_client_instance(self._client)
-            except Exception:
-                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
+            if not isolated_stream_client:
+                # The cached auxiliary client wraps this same ``self._client``
+                # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
+                # this instance). After closing a shared httpx transport, the
+                # cache must drop that entry. Request-scoped clients are not
+                # cached, so evicting the template would disrupt other streams.
+                try:
+                    _evict_cached_client_instance(self._client)
+                except Exception:
+                    logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
             if timed_out.is_set():
@@ -1067,7 +1112,7 @@ class _CodexCompletionsAdapter:
                 _check_cancelled()
 
             _set_phase("stream_open_waiting_first_event", log=True)
-            event_stream = self._client.responses.create(**stream_kwargs)
+            event_stream = stream_client.responses.create(**stream_kwargs)
             try:
                 final = _consume_codex_event_stream(
                     event_stream,
@@ -1136,6 +1181,13 @@ class _CodexCompletionsAdapter:
                 timeout_timer.cancel()
             if first_event_timer is not None:
                 first_event_timer.cancel()
+            if isolated_stream_client:
+                close = getattr(stream_client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.debug("Codex auxiliary: request client close failed", exc_info=True)
 
         content = "".join(text_parts).strip() or None
 
@@ -1173,14 +1225,19 @@ class CodexAuxiliaryClient:
 
     def __init__(
         self,
-        real_client: OpenAI,
+        real_client: Any,
         model: str,
         *,
+        client_kwargs: Optional[Dict[str, Any]] = None,
         pool_entry_id: Optional[str] = None,
         pool_entry_label: Optional[str] = None,
     ):
         self._real_client = real_client
-        adapter = _CodexCompletionsAdapter(real_client, model)
+        adapter = _CodexCompletionsAdapter(
+            real_client,
+            model,
+            client_kwargs=client_kwargs,
+        )
         self.chat = _CodexChatShim(adapter)
         self.api_key = real_client.api_key
         self.base_url = real_client.base_url
@@ -2300,14 +2357,16 @@ def _build_codex_client(
                 return None, None
         base_url = configured_base_url or _CODEX_AUX_BASE_URL
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
-    real_client = OpenAI(
-        api_key=codex_token,
-        base_url=base_url,
-        default_headers=_codex_cloudflare_headers(codex_token),
-    )
+    client_kwargs = {
+        "api_key": codex_token,
+        "base_url": base_url,
+        "default_headers": _codex_cloudflare_headers(codex_token),
+    }
+    real_client = OpenAI(**client_kwargs)
     return CodexAuxiliaryClient(
         real_client,
         model,
+        client_kwargs=client_kwargs,
         pool_entry_id=pool_entry_id,
         pool_entry_label=pool_entry_label,
     ), model
