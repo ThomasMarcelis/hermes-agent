@@ -329,4 +329,4 @@ def test_codex_first_event_guard_is_separate_from_total_stale_timeout(monkeypatc
     with pytest.raises(TimeoutError, match="before first Codex event"):
         agent._interruptible_api_call({"model": agent.model, "messages": []})
 
-    assert "stale_call_kill" in close_reasons
+    assert "codex_ttfb_kill" in close_reasons

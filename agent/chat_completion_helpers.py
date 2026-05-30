@@ -350,7 +350,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # reconnect promptly when the socket is genuinely wedged. Set
     # HERMES_CODEX_TTFB_TIMEOUT_SECONDS=0 to disable this watchdog entirely.
     _ttfb_enabled = _codex_watchdog_enabled
-    _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    if "HERMES_CODEX_TTFB_TIMEOUT_SECONDS" in os.environ:
+        _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    else:
+        _ttfb_timeout = _env_float("HERMES_CODEX_STREAM_FIRST_EVENT_TIMEOUT", 120.0)
     if _ttfb_timeout <= 0:
         _ttfb_enabled = False
     elif _openai_codex_backend:
