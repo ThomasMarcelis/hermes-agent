@@ -24,7 +24,7 @@ def agent(monkeypatch):
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.fetch_model_metadata", return_value={}),
+        patch("agent.agent_init.fetch_model_metadata", return_value={}),
         patch("run_agent.OpenAI"),
     ):
         monkeypatch.setattr("run_agent._hermes_home", hermes_home)
