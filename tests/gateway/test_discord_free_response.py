@@ -86,6 +86,7 @@ class FakeThread:
         self.parent_id = getattr(parent, "id", None)
         self.guild = getattr(parent, "guild", None) or SimpleNamespace(name=guild_name)
         self.topic = None
+        self.edit = AsyncMock()
 
     def history(self, *, limit, before, after=None, oldest_first=None):
         async def _iter():
@@ -960,3 +961,36 @@ async def test_discord_auto_thread_skips_backfill(adapter, monkeypatch):
 
     adapter._auto_create_thread.assert_awaited_once()
     adapter._fetch_channel_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retitle_generic_thread_from_transcript_renames_hermes_placeholder(adapter):
+    thread = FakeThread(channel_id=777, name="Hermes")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda channel_id: thread if channel_id == 777 else None
+
+    renamed = await adapter.retitle_generic_thread_from_transcript(
+        "777",
+        "<@999> Can we make Hermes voice thread names better somehow in <#123>?",
+    )
+
+    assert renamed is True
+    thread.edit.assert_awaited_once_with(
+        name="Can we make Hermes voice thread names better somehow in?",
+        reason="Retitling generic Hermes voice-message thread from transcription",
+    )
+
+
+@pytest.mark.asyncio
+async def test_retitle_generic_thread_from_transcript_preserves_specific_thread_name(adapter):
+    thread = FakeThread(channel_id=777, name="existing useful title")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda channel_id: thread if channel_id == 777 else None
+
+    renamed = await adapter.retitle_generic_thread_from_transcript(
+        "777",
+        "New transcript that should not overwrite a manual title",
+    )
+
+    assert renamed is False
+    thread.edit.assert_not_awaited()

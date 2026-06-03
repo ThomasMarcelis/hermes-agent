@@ -144,6 +144,25 @@ def _clean_discord_id(entry: str) -> str:
     return entry.strip()
 
 
+_GENERIC_AUTO_THREAD_NAMES = {"", "hermes", "new post"}
+_DISCORD_THREAD_NAME_LIMIT = 100
+
+
+def _sanitize_thread_title_from_transcript(transcript: str) -> str:
+    """Build a safe Discord thread title from a voice transcript."""
+    title = (transcript or "").strip()
+    # Remove raw Discord mention syntax from generated titles. The IDs are not
+    # useful in the thread list and can be ugly or misleading if rendered raw.
+    title = re.sub(r"<@[!&]?\d+>", "", title)
+    title = re.sub(r"<#\d+>", "", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    title = re.sub(r"\s+([?.!,;:])", r"\1", title)
+    title = title.strip(" \t\r\n\"'`“”‘’")
+    if len(title) > _DISCORD_THREAD_NAME_LIMIT:
+        title = title[: _DISCORD_THREAD_NAME_LIMIT - 3].rstrip() + "..."
+    return title[:_DISCORD_THREAD_NAME_LIMIT]
+
+
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available.
 
@@ -4390,6 +4409,69 @@ class DiscordAdapter(BasePlatformAdapter):
                     fallback_error,
                 )
                 return None
+
+    async def retitle_generic_thread_from_transcript(
+        self,
+        thread_id: str,
+        transcript: str,
+    ) -> bool:
+        """Rename generic auto-created voice-note threads from an STT transcript.
+
+        Only placeholder names are touched so manually named or already useful
+        threads are preserved.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return False
+
+        title = _sanitize_thread_title_from_transcript(transcript)
+        if not title:
+            return False
+
+        try:
+            numeric_thread_id = int(thread_id)
+        except (TypeError, ValueError):
+            return False
+
+        try:
+            thread = self._client.get_channel(numeric_thread_id)
+            if thread is None:
+                fetch_channel = getattr(self._client, "fetch_channel", None)
+                if fetch_channel is not None:
+                    thread = await fetch_channel(numeric_thread_id)
+            if thread is None:
+                return False
+
+            current_name = re.sub(
+                r"\s+",
+                " ",
+                (getattr(thread, "name", None) or "").strip(),
+            ).lower()
+            if current_name not in _GENERIC_AUTO_THREAD_NAMES:
+                return False
+
+            edit = getattr(thread, "edit", None)
+            if edit is None:
+                return False
+
+            await edit(
+                name=title,
+                reason="Retitling generic Hermes voice-message thread from transcription",
+            )
+            logger.info(
+                "[%s] Retitled generic Discord voice thread %s to %r",
+                self.name,
+                thread_id,
+                title,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to retitle Discord voice thread %s: %s",
+                self.name,
+                thread_id,
+                exc,
+            )
+            return False
 
     async def create_handoff_thread(
         self,
