@@ -182,3 +182,51 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     assert result is not None
     assert "queued voice transcript" in result
     assert "voice message" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inbound_message_text_retitles_discord_voice_thread_from_transcript():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+    discord_adapter = AsyncMock()
+    runner.adapters = {Platform.DISCORD: discord_adapter}
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="thread",
+        thread_id="999",
+    )
+    event = MessageEvent(
+        text="(The user sent a message with no text content)",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/discord-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "Can we make Hermes voice thread names better somehow?",
+            "provider": "local_command",
+        },
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert result is not None
+    assert "Can we make Hermes voice thread names better somehow?" in result
+    discord_adapter.retitle_generic_thread_from_transcript.assert_awaited_once_with(
+        "999",
+        "Can we make Hermes voice thread names better somehow?",
+    )
