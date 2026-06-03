@@ -1068,6 +1068,24 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+_DISCORD_VOICE_TRANSCRIPT_PREFIX = '[The user sent a voice message~ Here\'s what they said: "'
+
+
+def _extract_successful_voice_transcript(message_text: str) -> Optional[str]:
+    """Return the first successful STT transcript embedded in enriched text."""
+    if not message_text:
+        return None
+    start = message_text.find(_DISCORD_VOICE_TRANSCRIPT_PREFIX)
+    if start < 0:
+        return None
+    start += len(_DISCORD_VOICE_TRANSCRIPT_PREFIX)
+    end = message_text.find('"]', start)
+    if end < 0:
+        return None
+    transcript = message_text[start:end].strip()
+    return transcript or None
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -8149,6 +8167,39 @@ class GatewayRunner:
                 if hasattr(self, "_busy_ack_ts"):
                     self._busy_ack_ts.pop(_quick_key, None)
 
+    def _adapter_for_source(self, source: SessionSource) -> Optional[Any]:
+        """Return the platform adapter for a source, tolerating enum/string keys."""
+        adapter = self.adapters.get(source.platform)
+        if adapter is not None:
+            return adapter
+        source_platform = _gateway_platform_value(source.platform)
+        for platform, candidate in self.adapters.items():
+            if _gateway_platform_value(platform) == source_platform:
+                return candidate
+        return None
+
+    async def _maybe_retitle_discord_voice_thread_from_transcription(
+        self,
+        source: SessionSource,
+        message_text: str,
+    ) -> None:
+        """Retitle placeholder Discord voice-note threads after STT succeeds."""
+        if _gateway_platform_value(source.platform) != Platform.DISCORD.value:
+            return
+        if not source.thread_id:
+            return
+        transcript = _extract_successful_voice_transcript(message_text)
+        if not transcript:
+            return
+        adapter = self._adapter_for_source(source)
+        retitle = getattr(adapter, "retitle_generic_thread_from_transcript", None)
+        if retitle is None:
+            return
+        try:
+            await retitle(str(source.thread_id), transcript)
+        except Exception as exc:
+            logger.debug("Discord voice-thread retitle hook failed: %s", exc)
+
     async def _prepare_inbound_message_text(
         self,
         *,
@@ -8245,6 +8296,10 @@ class GatewayRunner:
                 message_text = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
+                )
+                await self._maybe_retitle_discord_voice_thread_from_transcription(
+                    source,
+                    message_text,
                 )
                 _stt_fail_markers = (
                     "No STT provider",
