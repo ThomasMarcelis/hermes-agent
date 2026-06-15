@@ -80,6 +80,7 @@ def test_invoke_tool_memory_provider_path_emits_post_tool_call(monkeypatch):
         hook_calls.append((name, kwargs))
         return []
 
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: name == "post_tool_call")
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _invoke_hook)
 
     result = AIAgent._invoke_tool(
@@ -120,6 +121,7 @@ def test_sequential_memory_provider_tool_pre_and_post_hooks(agent, monkeypatch):
         return []
 
     monkeypatch.setattr("hermes_cli.plugins.get_pre_tool_call_block_message", _pre)
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: name == "post_tool_call")
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _post)
 
     assistant_message = SimpleNamespace(tool_calls=[_tool_call()])

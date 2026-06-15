@@ -1084,7 +1084,7 @@ class _CodexCompletionsAdapter:
                 _fmt_timeout(total_timeout_s),
                 _fmt_timeout(float(_first_event_timeout)),
                 len(messages),
-                len(input_msgs),
+                len(input_items),
             )
             # Event-driven Responses streaming via the low-level
             # ``responses.create(stream=True)`` path.  The high-level

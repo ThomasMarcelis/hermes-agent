@@ -1040,7 +1040,7 @@ class TestAgentCacheSoftMemoryCleanup:
         while _t.time() < deadline and not released:
             _t.sleep(0.02)
 
-        assert runner._agent_cache["session-key"] == (new_agent, "new-sig")
+        assert runner._agent_cache["session-key"] == (new_agent, "new-sig", None)
         assert released == [old_agent]
         new_agent.release_memory_provider_resources.assert_not_called()
         new_agent.release_clients.assert_not_called()
@@ -1057,7 +1057,7 @@ class TestAgentCacheSoftMemoryCleanup:
 
         runner._store_cached_agent("session-key", new_agent, "new-sig")
 
-        assert runner._agent_cache["session-key"] == (new_agent, "new-sig")
+        assert runner._agent_cache["session-key"] == (new_agent, "new-sig", None)
         assert released == []
 
     def test_store_cached_agent_marks_replacement_mru_before_cap_enforcement(self, monkeypatch):
@@ -1080,7 +1080,7 @@ class TestAgentCacheSoftMemoryCleanup:
         runner._store_cached_agent("session-key", new_agent, "new-sig")
 
         assert "session-key" in runner._agent_cache
-        assert runner._agent_cache["session-key"] == (new_agent, "new-sig")
+        assert runner._agent_cache["session-key"] == (new_agent, "new-sig", None)
         assert list(runner._agent_cache.keys()) == ["other-b", "session-key"]
 
 
