@@ -19,6 +19,8 @@ Config via environment variables:
   HINDSIGHT_IDLE_TIMEOUT           — embedded daemon idle timeout seconds; 0 disables shutdown (default: 300)
   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
   HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: per_tag/combined/all_combinations, or a JSON list of tag-lists for custom scopes
+  HINDSIGHT_RETAIN_OBSERVATION_SCOPE_EXCLUDE_TAG_PREFIXES
+                                     — comma/JSON list of tag prefixes to drop when deriving observation scopes from retained tags
   HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories
   HINDSIGHT_RETAIN_USER_PREFIX     — label used before user turns in retained transcripts
   HINDSIGHT_RETAIN_ASSISTANT_PREFIX — label used before assistant turns in retained transcripts
@@ -376,6 +378,9 @@ def _load_config() -> dict:
         "idle_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_IDLE_TIMEOUT"), _DEFAULT_IDLE_TIMEOUT),
         "retain_tags": os.environ.get("HINDSIGHT_RETAIN_TAGS", ""),
         "observation_scopes": os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", ""),
+        "observation_scope_exclude_tag_prefixes": os.environ.get(
+            "HINDSIGHT_RETAIN_OBSERVATION_SCOPE_EXCLUDE_TAG_PREFIXES", ""
+        ),
         "retain_source": os.environ.get("HINDSIGHT_RETAIN_SOURCE", ""),
         "retain_user_prefix": os.environ.get("HINDSIGHT_RETAIN_USER_PREFIX", "User"),
         "retain_assistant_prefix": os.environ.get("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant"),
@@ -474,6 +479,68 @@ def _normalize_observation_scopes(value: Any) -> Any:
         return scopes or None
 
     return None
+
+
+def _normalize_tag_prefixes(value: Any) -> list[str]:
+    """Normalize a comma/JSON/list prefix config into a deduplicated list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            raw_items = parsed if isinstance(parsed, list) else text.split(",")
+        else:
+            raw_items = text.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    prefixes: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        prefix = str(item).strip()
+        if not prefix or prefix in seen:
+            continue
+        seen.add(prefix)
+        prefixes.append(prefix)
+    return prefixes
+
+
+def _derive_observation_scopes(
+    configured_scopes: Any,
+    tags: list[str],
+    excluded_prefixes: list[str],
+) -> Any:
+    """Return explicit observation scopes for a retained item.
+
+    Explicit ``observation_scopes`` config wins. Otherwise, when excluded
+    prefixes are configured, derive a single combined scope from retained tags
+    after dropping volatile lineage tags such as ``session:`` and ``parent:``.
+    This preserves useful facet tags (for example ``project:*``) while preventing
+    session lineage from fragmenting observations.
+    """
+    if configured_scopes:
+        return configured_scopes
+    if not excluded_prefixes or not tags:
+        return None
+
+    scope: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        if any(tag.startswith(prefix) for prefix in excluded_prefixes):
+            continue
+        if tag in seen:
+            continue
+        seen.add(tag)
+        scope.append(tag)
+    return [scope] if scope else None
 
 
 def _utc_timestamp() -> str:
@@ -629,6 +696,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
         self._prefetch_method = "recall"  # "recall" or "reflect"
         self._retain_tags: List[str] = []
+        self._observation_scope_exclude_tag_prefixes: list[str] = []
         self._retain_source = ""
         self._retain_user_prefix = "User"
         self._retain_assistant_prefix = "Assistant"
@@ -981,7 +1049,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
-            {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
+            {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default unless observation_scope_exclude_tag_prefixes derives a filtered combined scope.", "default": ""},
+            {"key": "observation_scope_exclude_tag_prefixes", "description": "Optional comma/JSON list of volatile tag prefixes (for example session:,parent:) to exclude when deriving a single observation scope from retained tags. Preserves facet tags while avoiding session-fragmented observations.", "default": ""},
             {"key": "retain_source", "description": "Metadata source value attached to retained memories", "default": ""},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
@@ -1311,6 +1380,10 @@ class HindsightMemoryProvider(MemoryProvider):
             self._config.get("observation_scopes")
             or os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "")
         )
+        self._observation_scope_exclude_tag_prefixes = _normalize_tag_prefixes(
+            self._config.get("observation_scope_exclude_tag_prefixes")
+            or os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPE_EXCLUDE_TAG_PREFIXES", "")
+        )
         self._recall_tags = _normalize_retain_tags(
             self._config.get("recall_tags")
             or os.environ.get("HINDSIGHT_RECALL_TAGS", "")
@@ -1625,8 +1698,13 @@ class HindsightMemoryProvider(MemoryProvider):
                 merged_tags.append(tag)
         if merged_tags:
             kwargs["tags"] = merged_tags
-        if self._observation_scopes:
-            kwargs["observation_scopes"] = self._observation_scopes
+        observation_scopes = _derive_observation_scopes(
+            self._observation_scopes,
+            merged_tags,
+            self._observation_scope_exclude_tag_prefixes,
+        )
+        if observation_scopes:
+            kwargs["observation_scopes"] = observation_scopes
         return kwargs
 
     def _build_recall_kwargs(self, query: str, *, budget: str | None = None, max_tokens: Any = None) -> Dict[str, Any]:

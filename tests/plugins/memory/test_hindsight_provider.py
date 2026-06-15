@@ -23,8 +23,10 @@ from plugins.memory.hindsight import (
     RETAIN_SCHEMA,
     _load_config,
     _build_embedded_profile_env,
+    _derive_observation_scopes,
     _normalize_observation_scopes,
     _normalize_retain_tags,
+    _normalize_tag_prefixes,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
 )
@@ -43,6 +45,7 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_OBSERVATION_SCOPES",
+        "HINDSIGHT_RETAIN_OBSERVATION_SCOPE_EXCLUDE_TAG_PREFIXES",
         "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
         "HINDSIGHT_RECALL_TAGS",
@@ -255,6 +258,30 @@ def test_normalize_observation_scopes_list_of_lists():
     ]
 
 
+def test_normalize_tag_prefixes_accepts_csv_and_json():
+    assert _normalize_tag_prefixes("session:, parent:, session:") == ["session:", "parent:"]
+    assert _normalize_tag_prefixes(json.dumps(["thread:", "parent:"])) == ["thread:", "parent:"]
+
+
+def test_derive_observation_scopes_excludes_lineage_but_preserves_facets():
+    tags = [
+        "scope:jd-default",
+        "source:auto-retain",
+        "project:vasparo",
+        "session:abc",
+        "parent:def",
+    ]
+    assert _derive_observation_scopes(None, tags, ["session:", "parent:"]) == [[
+        "scope:jd-default",
+        "source:auto-retain",
+        "project:vasparo",
+    ]]
+
+
+def test_derive_observation_scopes_explicit_config_wins():
+    assert _derive_observation_scopes("per_tag", ["scope:jd-default", "session:abc"], ["session:"]) == "per_tag"
+
+
 # ---------------------------------------------------------------------------
 # Schema tests
 # ---------------------------------------------------------------------------
@@ -309,6 +336,7 @@ class TestConfig:
         assert provider._recall_max_input_chars == 800
         assert provider._tags is None
         assert provider._observation_scopes is None
+        assert provider._observation_scope_exclude_tag_prefixes == []
         assert provider._recall_tags is None
         # Default recall narrowed to observation-only; world/experience are
         # aggregate facts that often crowd out concrete-event signal during
@@ -345,6 +373,12 @@ class TestConfig:
             observation_scopes=[["user:alice"], ["team:eng"]]
         )
         assert p._observation_scopes == [["user:alice"], ["team:eng"]]
+
+    def test_observation_scope_exclude_tag_prefixes_config(self, provider_with_config):
+        p = provider_with_config(
+            observation_scope_exclude_tag_prefixes=["session:", "parent:"]
+        )
+        assert p._observation_scope_exclude_tag_prefixes == ["session:", "parent:"]
 
     def test_custom_config_values(self, provider_with_config):
         p = provider_with_config(
@@ -680,6 +714,29 @@ class TestToolHandlers:
         p.handle_tool_call("hindsight_retain", {"content": "likes dark mode"})
         item = p._client.aretain_batch.call_args.kwargs["items"][0]
         assert item["observation_scopes"] == "per_tag"
+
+    def test_retain_derives_observation_scopes_without_lineage_tags(self, provider_with_config):
+        p = provider_with_config(
+            retain_tags=["scope:jd-default", "source:auto-retain"],
+            observation_scope_exclude_tag_prefixes=["session:", "parent:"],
+        )
+        p.handle_tool_call(
+            "hindsight_retain",
+            {"content": "likes dark mode", "tags": ["project:vasparo", "session:s1", "parent:p1"]},
+        )
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert item["tags"] == [
+            "scope:jd-default",
+            "source:auto-retain",
+            "project:vasparo",
+            "session:s1",
+            "parent:p1",
+        ]
+        assert item["observation_scopes"] == [[
+            "scope:jd-default",
+            "source:auto-retain",
+            "project:vasparo",
+        ]]
 
     def test_retain_omits_observation_scopes_by_default(self, provider):
         provider.handle_tool_call("hindsight_retain", {"content": "hello"})
