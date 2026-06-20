@@ -155,10 +155,16 @@ def _meets_minimum_version(actual: str | None, required: str) -> bool:
 
 
 def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
-                                 timeout: float = 5.0) -> str | None:
-    """GET ``<api_url>/version`` and return the version string (or None on failure).
+                                 timeout: float = 5.0) -> Any:
+    """GET ``<api_url>/version`` and return version metadata (or None).
 
-    Hindsight's `/version` endpoint returns ``{"version": "0.5.6", ...}``.
+    Hindsight's `/version` endpoint historically returned
+    ``{"version": "0.5.6", ...}``; current self-hosted builds return
+    ``{"api_version": "0.8.1", "features": {...}}``.  Keep the legacy
+    function name because tests and downstream patches monkeypatch it as the
+    capability probe seam, but return the full dict when available so callers
+    can inspect feature flags.
+
     Any failure (timeout, 404, malformed JSON, missing key) → None, which
     the caller treats as "legacy API, no update_mode support".
     """
@@ -180,7 +186,9 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
     if not isinstance(data, dict):
         return None
     version = data.get("version") or data.get("api_version")
-    return str(version) if version else None
+    if not version:
+        return None
+    return data
 
 
 def _check_api_supports_update_mode_append(api_url: str,
@@ -196,8 +204,24 @@ def _check_api_supports_update_mode_append(api_url: str,
     with _append_capability_lock:
         if api_url in _append_capability_cache:
             return _append_capability_cache[api_url]
-    version = _fetch_hindsight_api_version(api_url, api_key)
-    supported = _meets_minimum_version(version, _MIN_VERSION_FOR_UPDATE_MODE_APPEND)
+    metadata = _fetch_hindsight_api_version(api_url, api_key)
+    features: dict[str, Any] = {}
+    if isinstance(metadata, dict):
+        version = metadata.get("version") or metadata.get("api_version")
+        raw_features = metadata.get("features")
+        if isinstance(raw_features, dict):
+            features = raw_features
+    else:
+        # Backward-compatible test/downstream seam: older monkeypatches return
+        # just the version string.  Treat those as append-capable when the
+        # version is new enough because pre-STORE_DOCUMENT_TEXT APIs had no
+        # feature flag and did store source text by default.
+        version = metadata
+    source_text_stored = features.get("store_document_text", True) is not False
+    supported = (
+        _meets_minimum_version(str(version) if version else None, _MIN_VERSION_FOR_UPDATE_MODE_APPEND)
+        and source_text_stored
+    )
     with _append_capability_lock:
         # Re-check after acquiring the lock in case a concurrent probe filled it.
         cached = _append_capability_cache.get(api_url)
@@ -206,6 +230,15 @@ def _check_api_supports_update_mode_append(api_url: str,
         else:
             supported = cached
     if not supported:
+        if version and not source_text_stored:
+            logger.warning(
+                "Hindsight API at %s reports version %r with "
+                "store_document_text=false; update_mode='append' is not "
+                "usable because append requires the prior stored document "
+                "body. Falling back to per-process document_id.",
+                api_url, version,
+            )
+            return supported
         logger.warning(
             "Hindsight API at %s reports version %r, older than %s. "
             "Falling back to per-process document_id — retains across "

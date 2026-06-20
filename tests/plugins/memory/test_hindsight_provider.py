@@ -1496,6 +1496,34 @@ class TestUpdateModeAppendCapability:
         item = kw["items"][0]
         assert item["update_mode"] == "append"
 
+    def test_modern_api_without_stored_text_disables_append(self, provider, monkeypatch):
+        """Hindsight rejects append when source document text is not stored.
+
+        Modern self-hosted JD runs deliberately set
+        HINDSIGHT_API_STORE_DOCUMENT_TEXT=false. The API version is still new
+        enough for append in general, but append requires reading back the
+        prior document body; without stored text it fails asynchronously. The
+        provider must fall back to the per-process document id and omit
+        update_mode so auto-retain keeps working.
+        """
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: {
+                "api_version": "0.8.1",
+                "features": {"store_document_text": False},
+            },
+        )
+        old_doc = provider._document_id
+        provider.sync_turn("hello", "hi")
+        provider._retain_queue.join()
+
+        kw = provider._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == old_doc
+        assert kw["document_id"].startswith("test-session-")
+        item = kw["items"][0]
+        assert "update_mode" not in item
+
     def test_capability_cached_per_url(self, provider, monkeypatch):
         """The /version probe must run at most once per (process, api_url)."""
         self._clear_capability_cache()
