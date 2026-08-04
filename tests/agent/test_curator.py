@@ -617,6 +617,15 @@ def test_state_atomic_write_no_tmp_leftovers(curator_env):
 
 
 
+def test_curator_review_policy_is_quality_driven_not_quota_driven():
+    from agent.curator import CURATOR_REVIEW_PROMPT
+
+    assert "zero archives" in CURATOR_REVIEW_PROMPT
+    assert "DO NOT archive or merge simply to hit a numeric target" in CURATOR_REVIEW_PROMPT
+    assert "distinct class-level operating domains" in CURATOR_REVIEW_PROMPT
+    assert "fewer than 10 archives" not in CURATOR_REVIEW_PROMPT
+
+
 
 
 
