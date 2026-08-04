@@ -13,6 +13,7 @@ from agent.display import (
     prepare_tool_preview,
     redact_tool_args_for_display,
     set_tool_preview_max_len,
+    truncate_tool_preview,
     _render_inline_unified_diff,
     _summarize_rendered_diff_sections,
     render_edit_diff_with_delta,
@@ -100,6 +101,38 @@ class TestBuildToolPreview:
         assert result == "2 tasks: AAAAAAAAAAAAAAAAAA..."
         assert len(result) == 30
 
+    def test_long_read_path_preserves_meaningful_tail(self):
+        path = (
+            "/home/example/.hermes/skills/research/references/"
+            "important-target-file.md"
+        )
+
+        result = build_tool_preview("read_file", {"path": path}, max_len=40)
+
+        assert result is not None
+        assert len(result) == 40
+        assert result.startswith("...")
+        assert result.endswith("important-target-file.md")
+        assert "/home/example" not in result
+
+    def test_path_cap_preserves_tail_for_file_tools(self):
+        path = "/home/example/workspace/project/deep/path/final-report.md"
+
+        result = truncate_tool_preview("write_file", path, 36)
+
+        assert len(result) == 36
+        assert result.startswith("...")
+        assert result.endswith("final-report.md")
+
+    def test_non_path_cap_keeps_command_front(self):
+        command = "python scripts/really-long-command-name.py --with --many --flags"
+
+        result = truncate_tool_preview("terminal", command, 40)
+
+        assert result.startswith("python scripts/")
+        assert result.endswith("...")
+        assert "--many --flags" not in result
+
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""
         assert build_tool_preview("terminal", 0) is None
@@ -108,6 +141,18 @@ class TestBuildToolPreview:
 
 
 class TestPrepareToolPreview:
+    def test_file_path_preserves_filename_tail(self):
+        path = "/home/example/workspace/project/deep/path/final-report.md"
+
+        preview = prepare_tool_preview(
+            "write_file", {"path": path}, fallback=path, max_len=36,
+        )
+
+        assert preview.text.startswith("...")
+        assert preview.text.endswith("final-report.md")
+        assert preview.truncated is True
+        assert preview.url is None
+
     def test_recovers_and_describes_truncated_url(self):
         url = "https://example.com/a/very/long/path/to/a/page"
         set_tool_preview_max_len(20)

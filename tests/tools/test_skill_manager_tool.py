@@ -134,6 +134,14 @@ class TestValidateFilePath:
         err = _validate_file_path("references/../../../etc/passwd")
         assert err == "Path traversal ('..') is not allowed."
 
+    @pytest.mark.parametrize(
+        "file_path",
+        ("SKILL.md", "./SKILL.md", "my-skill/SKILL.md"),
+    )
+    def test_skill_md_aliases_rejected_for_supporting_file_actions(self, file_path):
+        err = _validate_file_path(file_path)
+        assert "File must be under one of:" in err
+
 
     def test_skill_md_traversal_still_rejected(self):
         # The SKILL.md exception must not weaken the traversal guard.
@@ -243,6 +251,69 @@ class TestEditSkill:
         assert "A test skill" in content
 
 class TestPatchSkill:
+    @pytest.mark.parametrize(
+        "file_path_alias",
+        ("SKILL.md", "./SKILL.md", "my-skill/SKILL.md"),
+    )
+    def test_primary_document_aliases_keep_primary_validation(
+        self, tmp_path, file_path_alias
+    ):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _patch_skill(
+                "my-skill",
+                "Do the thing.",
+                "Do the aliased thing.",
+                file_path=file_path_alias,
+            )
+
+        assert result["success"] is True, result
+        assert "Do the aliased thing." in (
+            tmp_path / "my-skill" / "SKILL.md"
+        ).read_text()
+        assert "SKILL.md" in result["message"]
+
+    def test_explicit_whitespace_file_path_is_rejected(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _patch_skill(
+                "my-skill",
+                "Do the thing.",
+                "Do the wrong thing.",
+                file_path=" \t ",
+            )
+
+        assert result["success"] is False
+        assert "file_path cannot be blank" in result["error"]
+        assert (
+            tmp_path / "my-skill" / "SKILL.md"
+        ).read_text() == VALID_SKILL_CONTENT
+
+    @pytest.mark.parametrize(
+        "file_path",
+        (
+            "references/guide.md",
+            "templates/message.txt",
+            "scripts/check.py",
+            "assets/labels.txt",
+        ),
+    )
+    def test_supporting_paths_resolve_from_skill_root(self, tmp_path, file_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            target = tmp_path / "my-skill" / file_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("old supporting content", encoding="utf-8")
+            result = _patch_skill(
+                "my-skill",
+                "old supporting content",
+                "new supporting content",
+                file_path=file_path,
+            )
+
+        assert result["success"] is True, result
+        assert target.read_text(encoding="utf-8") == "new supporting content"
+
     def test_patch_unique_match(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
@@ -333,6 +404,18 @@ class TestDeleteSkill:
 
 
 class TestWriteFile:
+    @pytest.mark.parametrize(
+        "file_path",
+        ("SKILL.md", "./SKILL.md", "my-skill/SKILL.md"),
+    )
+    def test_write_cannot_overwrite_primary_skill_file(self, tmp_path, file_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _write_file("my-skill", file_path, "replacement")
+
+        assert result["success"] is False
+        assert (tmp_path / "my-skill" / "SKILL.md").read_text() == VALID_SKILL_CONTENT
+
     def test_write_reference_file(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
@@ -361,6 +444,18 @@ class TestWriteFile:
 
 
 class TestRemoveFile:
+    @pytest.mark.parametrize(
+        "file_path",
+        ("SKILL.md", "./SKILL.md", "my-skill/SKILL.md"),
+    )
+    def test_remove_cannot_delete_primary_skill_file(self, tmp_path, file_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _remove_file("my-skill", file_path)
+
+        assert result["success"] is False
+        assert (tmp_path / "my-skill" / "SKILL.md").exists()
+
     def test_remove_existing_file(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
@@ -417,6 +512,32 @@ class TestSkillManageDispatcher:
         assert "read" in err.lower(), "must tell the model to read the file first"
         assert "write_file" in err, "must name the escape hatch it is forbidding"
         assert "exact" in err.lower()
+    @pytest.mark.parametrize(
+        "file_path",
+        ("SKILL.md", "./SKILL.md", "test-skill/SKILL.md"),
+    )
+    def test_patch_dispatch_accepts_primary_document_alias(
+        self, tmp_path, file_path
+    ):
+        with _skill_dir(tmp_path):
+            skill_manage(
+                action="create",
+                name="test-skill",
+                content=VALID_SKILL_CONTENT,
+            )
+            raw = skill_manage(
+                action="patch",
+                name="test-skill",
+                old_string="Do the thing.",
+                new_string="Do the dispatched thing.",
+                file_path=file_path,
+            )
+
+        result = json.loads(raw)
+        assert result["success"] is True, result
+        assert "Do the dispatched thing." in (
+            tmp_path / "test-skill" / "SKILL.md"
+        ).read_text()
 
     def test_full_create_via_dispatcher(self, tmp_path):
         """Foreground create does NOT mark the skill as agent-created.

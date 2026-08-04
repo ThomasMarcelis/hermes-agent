@@ -164,8 +164,8 @@ def _tail_trunc(text: str, limit: int) -> str:
 
 
 def _truncate_preview(text: str, max_len: int | None) -> str:
-    if max_len and max_len > 0 and len(text) > max_len:
-        return "." * max_len if max_len <= 3 else text[:max_len - 3] + "..."
+    if max_len and max_len > 0:
+        return _truncate_with_ellipsis(text, max_len)
     return text
 
 
@@ -183,7 +183,48 @@ class ToolPreview:
     url: str | None = None
 
 
-# ── Shell command summarisation ──────────────────────────────────────────
+_PATH_PREVIEW_TOOLS = frozenset({"read_file", "write_file", "patch"})
+
+
+def _should_preserve_preview_end(tool_name: str, key: str | None = None) -> bool:
+    """Return true when a preview's suffix carries the useful identity."""
+    return key == "path" or tool_name in _PATH_PREVIEW_TOOLS
+
+
+def _truncate_with_ellipsis(
+    text: str,
+    max_len: int,
+    *,
+    preserve_end: bool = False,
+) -> str:
+    """Truncate to ``max_len`` while optionally retaining the suffix."""
+    try:
+        limit = int(max_len)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if limit <= 3:
+        return "." * limit
+    if preserve_end:
+        return "..." + text[-(limit - 3):]
+    return text[:limit - 3] + "..."
+
+
+def truncate_tool_preview(
+    tool_name: str,
+    preview: str,
+    max_len: int,
+    *,
+    key: str | None = None,
+) -> str:
+    """Apply the preview cap while retaining long path tails."""
+    return _truncate_with_ellipsis(
+        str(preview),
+        max_len,
+        preserve_end=_should_preserve_preview_end(tool_name, key),
+    )
+
 
 _SHELL_SILENT_HEADS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", "false", ":"}
 _SHELL_PIPE_TAIL_HEADS = {"head", "tail", "wc", "sort", "uniq"}
@@ -413,8 +454,16 @@ def _preview_shell(key: str):
 
 def _preview_read_file(args: dict, max_len: int) -> str | None:
     path = args.get("path") or args.get("file") or args.get("filepath")
-    label = (Path(str(path).replace("\\", "/")).name or str(path)) if path is not None else None
-    return None if label is None else _truncate_preview(f"{label} {_read_file_line_label(args)}".strip(), max_len) or None
+    if path is None:
+        return None
+    path_text = str(path)
+    label = Path(path_text.replace("\\", "/")).name or path_text
+    line_label = _read_file_line_label(args)
+    short_preview = f"{label} {line_label}".strip()
+    full_preview = f"{path_text} {line_label}".strip()
+    if max_len > 0 and len(full_preview) > max_len:
+        return truncate_tool_preview("read_file", full_preview, max_len, key="path")
+    return short_preview or None
 
 
 def _preview_memory(args: dict, _max_len: int) -> str:
@@ -468,14 +517,14 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         return None
     value = args[key]
     preview = _oneline(str((value[0] if value else "") if isinstance(value, list) else value))
-    return _tail_trunc(preview, max_len) if preview else None
+    return truncate_tool_preview(tool_name, preview, max_len, key=key) if preview else None
 
 
 def prepare_tool_preview(tool_name: str, args: dict | None, *, fallback: str, max_len: int) -> ToolPreview:
     """Compact preview plus explicit truncation/URL facts (the uncapped preview is
     rebuilt from the arguments so an upstream display cap cannot drop its link target)."""
     full_text = build_tool_preview(tool_name, args, max_len=0) or fallback
-    text = _truncate_preview(full_text, max_len)
+    text = truncate_tool_preview(tool_name, full_text, max_len)
     truncated = text != full_text
     url = _http_url(_display_url(full_text)) if truncated else None
     return ToolPreview(text=text, truncated=truncated, url=url)

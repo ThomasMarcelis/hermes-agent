@@ -294,12 +294,9 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     if not file_path:
         return "file_path is required."
     parts = Path(file_path).parts
-    # Traversal first, so the SKILL.md exception is unreachable by a traversal-laden path.
+    # Supporting-file actions cannot bypass primary-document validation.
     if has_traversal_component(file_path):
         return "Path traversal ('..') is not allowed."
-    # SKILL.md lives at the skill root; accept 'SKILL.md' and '<skill>/SKILL.md'.
-    if parts and parts[-1] == "SKILL.md" and len(parts) in (1, 2):
-        return None
     if not parts or parts[0] not in ALLOWED_SUBDIRS:
         allowed = ", ".join(sorted(ALLOWED_SUBDIRS))
         return f"File must be under one of: {allowed}. Got: '{file_path}'"
@@ -328,6 +325,33 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
     guard = ((org_guard and _org_mirror_write_guard(name, skill_dir, action))
              or _background_review_write_guard(name, skill_dir, action))
     return (None, guard) if guard else (skill_dir, None)
+def _normalize_patch_file_path(
+    file_path: Optional[str],
+    skill_name: str,
+) -> Optional[str]:
+    """Normalize explicit aliases for the primary ``SKILL.md`` document.
+
+    Supporting-file actions stay constrained to their allowlisted
+    subdirectories. Only ``patch`` accepts these aliases, routing them through
+    the primary-document validation path rather than treating them as files
+    that may be created or removed independently.
+    """
+    if not isinstance(file_path, str):
+        return file_path
+    normalized = file_path.strip()
+    path = Path(normalized)
+    if normalized in {"SKILL.md", "./SKILL.md"} or (
+        len(path.parts) == 2
+        and path.parts[0] == skill_name
+        and path.parts[1] == "SKILL.md"
+    ):
+        return None
+    return normalized
+
+
+# =============================================================================
+# Core actions
+# =============================================================================
 
 
 def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label: str,
@@ -429,7 +453,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     return _add_description_prompt_preview(_attach_org_note(result, name, skill_dir), content)
 
 
-def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = None,
+def _patch_skill(name: str, old_string: str, new_string: str, file_path: Optional[str] = None,
                  replace_all: bool = False) -> Dict[str, Any]:
     """Targeted find-and-replace in SKILL.md (default) or a supporting file; unique match unless replace_all."""
     if not old_string:
@@ -444,9 +468,12 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
         return _err("new_string is required for 'patch'. Use an empty string to delete matched text.")
     # No old_string == new_string guard here: fuzzy_find_and_replace rejects that with a
     # richer error (file_preview) this layer cannot produce.
+    if isinstance(file_path, str) and not file_path.strip():
+        return _err("file_path cannot be blank when explicitly provided for 'patch'.")
     skill_dir, guard = _locate_for_write(name, "patch")
     if guard:
         return guard
+    file_path = _normalize_patch_file_path(file_path, name)
     target_label = file_path or "SKILL.md"
     if file_path:
         target, err = _resolve_supporting_file(skill_dir, file_path)
