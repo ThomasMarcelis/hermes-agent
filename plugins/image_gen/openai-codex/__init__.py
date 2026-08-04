@@ -33,7 +33,7 @@ from plugins.image_gen._common import (
 
 logger = logging.getLogger(__name__)
 
-_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+_CODEX_BASE_URL = "http://127.0.0.1:2455/backend-api/codex"
 _MAX_ERROR_BODY_CHARS = 500
 
 _MAX_REFERENCE_IMAGES = 16
