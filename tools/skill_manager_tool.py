@@ -853,18 +853,9 @@ def _validate_file_path(file_path: str) -> Optional[str]:
 
     normalized = Path(file_path)
 
-    # Prevent path traversal (checked before any allow-listing so the SKILL.md
-    # exception below can never be reached by a traversal-laden path).
+    # Prevent path traversal before applying the supporting-directory allowlist.
     if has_traversal_component(file_path):
         return "Path traversal ('..') is not allowed."
-
-    # SKILL.md is the canonical skill file and lives at the skill root, not
-    # under an allowed subdirectory. Accept its two natural spellings —
-    # 'SKILL.md' and '<skill-name>/SKILL.md' — so callers can target the main
-    # file. The traversal guard above still applies, so this can't escape.
-    if normalized.parts and normalized.name == "SKILL.md":
-        if len(normalized.parts) == 1 or len(normalized.parts) == 2:
-            return None
 
     # Must be under an allowed subdirectory
     if not normalized.parts or normalized.parts[0] not in ALLOWED_SUBDIRS:
@@ -887,6 +878,30 @@ def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Pat
     if error:
         return None, error
     return target, None
+
+
+def _normalize_patch_file_path(
+    file_path: Optional[str],
+    skill_name: str,
+) -> Optional[str]:
+    """Normalize explicit aliases for the primary ``SKILL.md`` document.
+
+    Supporting-file actions stay constrained to their allowlisted
+    subdirectories. Only ``patch`` accepts these aliases, routing them through
+    the primary-document validation path rather than treating them as files
+    that may be created or removed independently.
+    """
+    if not isinstance(file_path, str):
+        return file_path
+    normalized = file_path.strip()
+    path = Path(normalized)
+    if normalized in {"SKILL.md", "./SKILL.md"} or (
+        len(path.parts) == 2
+        and path.parts[0] == skill_name
+        and path.parts[1] == "SKILL.md"
+    ):
+        return None
+    return normalized
 
 
 # =============================================================================
@@ -1070,7 +1085,7 @@ def _patch_skill(
     name: str,
     old_string: str,
     new_string: str,
-    file_path: str = None,
+    file_path: Optional[str] = None,
     replace_all: bool = False,
 ) -> Dict[str, Any]:
     """Targeted find-and-replace within a skill file.
@@ -1082,6 +1097,11 @@ def _patch_skill(
         return {"success": False, "error": "old_string is required for 'patch'."}
     if new_string is None:
         return {"success": False, "error": "new_string is required for 'patch'. Use an empty string to delete matched text."}
+    if isinstance(file_path, str) and not file_path.strip():
+        return {
+            "success": False,
+            "error": "file_path cannot be blank when explicitly provided for 'patch'.",
+        }
 
     existing = _find_skill(name)
     if not existing:
@@ -1094,6 +1114,7 @@ def _patch_skill(
     guard = _background_review_write_guard(name, skill_dir, "patch")
     if guard:
         return guard
+    file_path = _normalize_patch_file_path(file_path, name)
 
     if file_path:
         # Patching a supporting file
