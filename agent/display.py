@@ -181,10 +181,8 @@ def _oneline(text: str) -> str:
 
 
 def _truncate_preview(text: str, max_len: int | None) -> str:
-    if max_len and max_len > 0 and len(text) > max_len:
-        if max_len <= 3:
-            return "." * max_len
-        return text[:max_len - 3] + "..."
+    if max_len and max_len > 0:
+        return _truncate_with_ellipsis(text, max_len)
     return text
 
 
@@ -195,6 +193,49 @@ class ToolPreview:
     text: str
     truncated: bool = False
     url: str | None = None
+
+
+_PATH_PREVIEW_TOOLS = frozenset({"read_file", "write_file", "patch"})
+
+
+def _should_preserve_preview_end(tool_name: str, key: str | None = None) -> bool:
+    """Return true when a preview's suffix carries the useful identity."""
+    return key == "path" or tool_name in _PATH_PREVIEW_TOOLS
+
+
+def _truncate_with_ellipsis(
+    text: str,
+    max_len: int,
+    *,
+    preserve_end: bool = False,
+) -> str:
+    """Truncate to ``max_len`` while optionally retaining the suffix."""
+    try:
+        limit = int(max_len)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if limit <= 3:
+        return "." * limit
+    if preserve_end:
+        return "..." + text[-(limit - 3):]
+    return text[:limit - 3] + "..."
+
+
+def truncate_tool_preview(
+    tool_name: str,
+    preview: str,
+    max_len: int,
+    *,
+    key: str | None = None,
+) -> str:
+    """Apply the preview cap while retaining long path tails."""
+    return _truncate_with_ellipsis(
+        str(preview),
+        max_len,
+        preserve_end=_should_preserve_preview_end(tool_name, key),
+    )
 
 
 _SHELL_SILENT_HEADS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", "false", ":"}
@@ -533,10 +574,19 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         path = args.get("path") or args.get("file") or args.get("filepath")
         if path is None:
             return None
-        label = Path(str(path).replace("\\", "/")).name or str(path)
+        path_text = str(path)
+        label = Path(path_text.replace("\\", "/")).name or path_text
         line_label = _read_file_line_label(args)
-        preview = f"{label} {line_label}".strip()
-        return _truncate_preview(preview, max_len) if preview else None
+        short_preview = f"{label} {line_label}".strip()
+        full_preview = f"{path_text} {line_label}".strip()
+        if max_len > 0 and len(full_preview) > max_len:
+            return truncate_tool_preview(
+                tool_name,
+                full_preview,
+                max_len,
+                key="path",
+            )
+        return short_preview if short_preview else None
 
     if tool_name == "session_search":
         query = _oneline(args.get("query", ""))
@@ -591,7 +641,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     if not preview:
         return None
     if max_len > 0 and len(preview) > max_len:
-        preview = preview[:max_len - 3] + "..."
+        preview = truncate_tool_preview(tool_name, preview, max_len, key=key)
     return preview
 
 
@@ -610,7 +660,7 @@ def prepare_tool_preview(
     fact from the rendered text.
     """
     full_text = build_tool_preview(tool_name, args, max_len=0) or fallback
-    text = _truncate_preview(full_text, max_len)
+    text = truncate_tool_preview(tool_name, full_text, max_len)
     truncated = text != full_text
     url = None
     if truncated:

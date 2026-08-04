@@ -519,6 +519,15 @@ def test_curator_does_not_instruct_model_to_pin():
     )
 
 
+def test_curator_review_policy_is_quality_driven_not_quota_driven():
+    from agent.curator import CURATOR_REVIEW_PROMPT
+
+    assert "zero archives" in CURATOR_REVIEW_PROMPT
+    assert "DO NOT archive or merge simply to hit a numeric target" in CURATOR_REVIEW_PROMPT
+    assert "distinct class-level operating domains" in CURATOR_REVIEW_PROMPT
+    assert "fewer than 10 archives" not in CURATOR_REVIEW_PROMPT
+
+
 
 
 
