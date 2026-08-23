@@ -1894,6 +1894,9 @@ def _open_continuable_cron_thread(
     adapter,
     chat_id: str,
     loop,
+    *,
+    thread_name: Optional[str] = None,
+    thread_auto_archive_duration: Optional[int] = None,
 ) -> Optional[str]:
     """Open a dedicated thread for a continuable cron job (thread-preferred).
 
@@ -1907,11 +1910,27 @@ def _open_continuable_cron_thread(
     if not callable(create_thread) or loop is None:
         return None
     task_name = job.get("name") or job.get("id", "cron")
-    thread_name = f"Hermes — {task_name}"
+    resolved_thread_name = thread_name or f"Hermes — {task_name}"
     try:
         from agent.async_utils import safe_schedule_threadsafe
+        import inspect
 
-        coro = create_thread(str(chat_id), thread_name)
+        create_params = inspect.signature(create_thread).parameters
+        accepts_archive = (
+            "auto_archive_duration" in create_params
+            or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in create_params.values()
+            )
+        )
+        if thread_auto_archive_duration is not None and accepts_archive:
+            coro = create_thread(
+                str(chat_id),
+                resolved_thread_name,
+                auto_archive_duration=thread_auto_archive_duration,
+            )
+        else:
+            coro = create_thread(str(chat_id), resolved_thread_name)
         future = safe_schedule_threadsafe(coro, loop)  # type: ignore[arg-type]
         if future is None:
             return None
@@ -2885,6 +2904,69 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _truthy_delivery_option(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _format_discord_cron_thread_name(job: dict, template: str) -> str:
+    """Render a Discord-safe title for one cron run."""
+    now = _hermes_now()
+    values = {
+        "job_id": str(job.get("id", "")),
+        "job_name": str(job.get("name") or job.get("id") or "Cron job"),
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M"),
+        "datetime": now.strftime("%Y-%m-%d %H:%M"),
+    }
+    try:
+        name = str(template or "").format(**values)
+    except (KeyError, ValueError, IndexError):
+        name = values["job_name"]
+    name = " ".join(name.split()).strip() or values["job_name"]
+    return name[:100]
+
+
+def _discord_thread_per_run_options(job: dict) -> Optional[dict]:
+    """Resolve the retained Discord thread-per-run delivery settings."""
+    delivery_options = job.get("delivery_options")
+    delivery_options = delivery_options if isinstance(delivery_options, dict) else {}
+    discord_options = delivery_options.get("discord")
+    discord_options = discord_options if isinstance(discord_options, dict) else {}
+
+    enabled = discord_options.get("thread_per_run", job.get("discord_thread_per_run"))
+    if not _truthy_delivery_option(enabled):
+        return None
+
+    template = (
+        discord_options.get("thread_name_template")
+        or discord_options.get("thread_title_template")
+        or job.get("discord_thread_name_template")
+        or job.get("discord_thread_title_template")
+        or "{job_name} — {date} {time}"
+    )
+    raw_archive = (
+        discord_options.get("thread_auto_archive_duration")
+        or job.get("discord_thread_auto_archive_duration")
+        or 1440
+    )
+    try:
+        archive = int(raw_archive)
+    except (TypeError, ValueError):
+        archive = 1440
+    if archive not in {60, 1440, 4320, 10080}:
+        archive = 1440
+    return {
+        "discord_thread_name": _format_discord_cron_thread_name(job, template),
+        "discord_thread_auto_archive_duration": archive,
+    }
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -3181,6 +3263,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        discord_thread_options = None
+        if str(platform_name).lower() == "discord" and not thread_id:
+            discord_thread_options = _discord_thread_per_run_options(job)
 
         # bot-chat targets don't ride a gateway adapter: the output becomes a
         # real inbound turn in the target profile's canonical Bot Chat via the
@@ -3430,6 +3515,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         thread_seeded = False
         opened_thread_id: Optional[str] = None
         if (
+            discord_thread_options
+            and runtime_adapter is not None
+            and loop is not None
+            and not thread_id
+        ):
+            new_thread_id = _open_continuable_cron_thread(
+                job,
+                runtime_adapter,
+                chat_id,
+                loop,
+                thread_name=discord_thread_options["discord_thread_name"],
+                thread_auto_archive_duration=discord_thread_options[
+                    "discord_thread_auto_archive_duration"
+                ],
+            )
+            if new_thread_id:
+                thread_id = new_thread_id
+                if mirror_this_target:
+                    opened_thread_id = new_thread_id
+        if (
             mirror_this_target
             and not in_channel_surface
             and runtime_adapter is not None
@@ -3448,7 +3553,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 thread_id = new_thread_id
                 opened_thread_id = new_thread_id
 
-        if live_adapter_ready:
+        if live_adapter_ready and not (discord_thread_options and not thread_id):
             # Telegram topic routing (#22773, regression fixed #52060): a
             # ``telegram:<positive_chat_id>:<numeric_thread_id>`` cron target is
             # ambiguous — a forum-style topic in a private chat and a genuine
@@ -3826,7 +3931,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            send_kwargs = {}
+            if discord_thread_options and not thread_id:
+                send_kwargs.update(discord_thread_options)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                **send_kwargs,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:

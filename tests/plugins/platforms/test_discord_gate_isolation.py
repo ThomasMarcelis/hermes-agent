@@ -35,6 +35,11 @@ GATE_VARS = [
     "GATEWAY_ALLOWED_USERS",
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_THREAD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_REQUIRE_MENTION",
+    "DISCORD_THREAD_REQUIRE_MENTION",
+    "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
+    "DISCORD_AUTO_THREAD",
     "DISCORD_ALLOW_BOTS",
 ]
 
@@ -113,6 +118,35 @@ class TestTwoAdapterChannelIsolation:
         _snapshot(b, {"DISCORD_IGNORED_CHANNELS": "322"})
         assert a._get_ignored_channels() == {"311"}
         assert b._get_ignored_channels() == {"322"}
+
+    def test_conversation_and_thread_gates_are_isolated(self):
+        restrictive = _adapter()
+        permissive = _adapter()
+        _snapshot(restrictive, {
+            "DISCORD_REQUIRE_MENTION": "true",
+            "DISCORD_THREAD_REQUIRE_MENTION": "true",
+            "DISCORD_BOTS_REQUIRE_INLINE_MENTION": "true",
+            "DISCORD_AUTO_THREAD": "false",
+            "DISCORD_THREAD_FREE_RESPONSE_CHANNELS": "111",
+        })
+        _snapshot(permissive, {
+            "DISCORD_REQUIRE_MENTION": "false",
+            "DISCORD_THREAD_REQUIRE_MENTION": "false",
+            "DISCORD_BOTS_REQUIRE_INLINE_MENTION": "false",
+            "DISCORD_AUTO_THREAD": "true",
+            "DISCORD_THREAD_FREE_RESPONSE_CHANNELS": "222",
+        })
+
+        assert restrictive._discord_require_mention() is True
+        assert permissive._discord_require_mention() is False
+        assert restrictive._discord_thread_require_mention() is True
+        assert permissive._discord_thread_require_mention() is False
+        assert restrictive._discord_bots_require_inline_mention() is True
+        assert permissive._discord_bots_require_inline_mention() is False
+        assert restrictive._discord_auto_thread() is False
+        assert permissive._discord_auto_thread() is True
+        assert restrictive._discord_thread_free_response_channels() == {"111"}
+        assert permissive._discord_thread_free_response_channels() == {"222"}
 
 
 class TestTwoAdapterUserRoleIsolation:
@@ -327,17 +361,35 @@ class TestYamlBridgeSeeding:
         token = secret_scope.set_secret_scope({"SOME": "scope"})
         try:
             seeded = _apply_yaml_config(
-                {}, {"allowed_channels": "222", "allow_from": "2001"},
+                {},
+                {
+                    "allowed_channels": "222",
+                    "allow_from": "2001",
+                    "require_mention": False,
+                    "thread_require_mention": True,
+                    "bots_require_inline_mention": True,
+                    "auto_thread": False,
+                    "thread_free_response_channels": ["444", "445"],
+                },
             )
         finally:
             secret_scope.reset_secret_scope(token)
 
         # Gates still seeded per-adapter...
+        assert seeded is not None
         assert seeded["allowed_channels"] == "222"
         assert seeded["allow_from"] == "2001"
+        assert seeded["require_mention"] == "false"
+        assert seeded["thread_require_mention"] == "true"
+        assert seeded["bots_require_inline_mention"] == "true"
+        assert seeded["auto_thread"] == "false"
+        assert seeded["thread_free_response_channels"] == "444,445"
         # ...but process-global env stays clean: no cross-profile leak.
         assert os.getenv("DISCORD_ALLOWED_CHANNELS") is None
         assert os.getenv("DISCORD_ALLOWED_USERS") is None
+        assert os.getenv("DISCORD_REQUIRE_MENTION") is None
+        assert os.getenv("DISCORD_AUTO_THREAD") is None
+        assert os.getenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS") is None
 
     def test_first_writer_env_does_not_mask_second_profile_extras(self, monkeypatch):
         """End-to-end shape of the original repro: profile A bridges env first;

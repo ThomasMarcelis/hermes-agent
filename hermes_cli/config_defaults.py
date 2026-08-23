@@ -3301,6 +3301,12 @@ DEFAULT_CONFIG = {
         # (gateway/platforms/base.py), so the cap holds across every platform
         # adapter. ``0`` disables the cap. Default 128 MiB.
         "max_inbound_media_bytes": 134217728,
+        # Decode limits for inbound images. These complement the byte cap:
+        # compressed images and animations can expand far beyond wire size.
+        # Non-positive values fall back to these safe defaults.
+        "max_inbound_image_pixels": 40000000,
+        "max_inbound_image_total_pixels": 100000000,
+        "max_inbound_image_frames": 256,
 
         # When false (default), any file path the agent emits is delivered
         # as a native attachment as long as it isn't under the credential /
