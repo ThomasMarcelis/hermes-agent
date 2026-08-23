@@ -1042,6 +1042,10 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # Separate liveness guard for Codex Responses streams that have not
+        # emitted their first event. None uses 180s for remote endpoints and
+        # disables the extra deadline for local endpoints.
+        "codex_first_event_timeout": None,
         # Restrict the auxiliary auto-chain's OpenRouter fallback to free
         # (:free) SKUs. When true, the OpenRouter step is skipped entirely
         # unless the resolved fallback model ends in ":free" — a PAID lane

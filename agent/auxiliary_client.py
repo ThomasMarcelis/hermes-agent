@@ -52,6 +52,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -1484,6 +1485,56 @@ def _scoped_key_env(name: str) -> str:
 # calls to the Codex Responses API so callers don't need any changes.
 
 
+def _codex_first_event_timeout_seconds(base_url: str) -> Optional[float]:
+    """Return the configured first-event deadline for Codex Responses calls."""
+    configured: Any = None
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        configured = cfg_get(
+            load_config_readonly(),
+            "auxiliary",
+            "codex_first_event_timeout",
+        )
+    except Exception:
+        logger.debug(
+            "Codex auxiliary: could not read first-event timeout config",
+            exc_info=True,
+        )
+
+    if configured is None:
+        for name in (
+            "HERMES_CODEX_AUX_STREAM_FIRST_EVENT_TIMEOUT",
+            "HERMES_CODEX_STREAM_FIRST_EVENT_TIMEOUT",
+        ):
+            raw = os.getenv(name)
+            if raw is not None:
+                configured = raw
+                break
+
+    if configured is not None:
+        try:
+            value = float(configured)
+        except (TypeError, ValueError):
+            value = 0.0
+        if math.isfinite(value) and value > 0:
+            return value
+        logger.warning(
+            "Ignoring invalid auxiliary.codex_first_event_timeout=%r; "
+            "using endpoint default",
+            configured,
+        )
+
+    try:
+        from agent.model_metadata import is_local_endpoint
+
+        if base_url and is_local_endpoint(base_url):
+            return None
+    except Exception:
+        pass
+    return 180.0
+
+
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
@@ -1699,9 +1750,15 @@ class _CodexCompletionsAdapter:
         tool_calls_raw: List[Any] = []
         usage = None
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
-        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
+        total_timeout_s = float(total_timeout) if total_timeout else None
+        deadline = time.monotonic() + total_timeout_s if total_timeout_s else None
         timed_out = threading.Event()
+        attempt_finished = threading.Event()
+        timeout_lock = threading.Lock()
+        timeout_reason: Dict[str, Optional[str]] = {"value": None}
         timeout_timer: Optional[threading.Timer] = None
+        first_event_timer: Optional[threading.Timer] = None
+        seen_first_event = threading.Event()
         # A protected provider call may outlive its owning compression attempt:
         # the owner returns promptly on hard cancellation while this adapter is
         # still blocked in the SDK stream on its isolated worker. Timer threads
@@ -1714,9 +1771,27 @@ class _CodexCompletionsAdapter:
         attempt_stream: List[Any] = []
 
         def _timeout_message() -> str:
-            return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
+            with timeout_lock:
+                reason = timeout_reason["value"]
+            if reason:
+                return reason
+            return (
+                "Codex auxiliary Responses stream exceeded "
+                f"{total_timeout_s:.1f}s total timeout"
+            )
 
-        def _close_client_on_timeout() -> None:
+        def _close_client_on_timeout(
+            reason: str,
+            *,
+            first_event_only: bool = False,
+        ) -> None:
+            with timeout_lock:
+                if (
+                    timed_out.is_set()
+                    or attempt_finished.is_set()
+                    or (first_event_only and seen_first_event.is_set())
+                ):
+                    return
             begin_timeout_cleanup = getattr(
                 protected_cancel_check, "begin_timeout_cleanup", None
             )
@@ -1727,9 +1802,16 @@ class _CodexCompletionsAdapter:
                     callable(protected_cancel_check)
                     and _captured_aux_cancel_requested(protected_cancel_check)
                 )
-            # Publish transport timeout only after the attempt-local decision is
-            # fixed, so owner polling cannot observe completion in between.
-            timed_out.set()
+            # Publish timeout only after the attempt-local decision is fixed.
+            with timeout_lock:
+                if (
+                    timed_out.is_set()
+                    or attempt_finished.is_set()
+                    or (first_event_only and seen_first_event.is_set())
+                ):
+                    return
+                timeout_reason["value"] = reason
+                timed_out.set()
             if not timeout_won:
                 # The request owner already hard-cancelled this attempt. The
                 # OpenAI client is process-shared, so closing/evicting it here
@@ -1766,10 +1848,27 @@ class _CodexCompletionsAdapter:
             except Exception:
                 logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
+        def _first_event_timeout() -> None:
+            _close_client_on_timeout(
+                "Codex auxiliary Responses stream timed out before first event",
+                first_event_only=True,
+            )
+
+        first_event_timeout = _codex_first_event_timeout_seconds(
+            str(getattr(self._client, "base_url", "") or "")
+        )
+        if total_timeout_s is not None and first_event_timeout is not None:
+            first_event_timeout = min(total_timeout_s, first_event_timeout)
+
         def _check_cancelled() -> None:
+            if timed_out.is_set():
+                raise TimeoutError(_timeout_message())
             if deadline is not None and time.monotonic() >= deadline:
                 if not timed_out.is_set():
-                    _close_client_on_timeout()
+                    _close_client_on_timeout(
+                        "Codex auxiliary Responses stream exceeded "
+                        f"{total_timeout_s:.1f}s total timeout"
+                    )
                 raise TimeoutError(_timeout_message())
             try:
                 from tools.interrupt import is_interrupted
@@ -1791,9 +1890,23 @@ class _CodexCompletionsAdapter:
 
         try:
             if total_timeout:
-                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
+                timeout_timer = threading.Timer(
+                    float(total_timeout),
+                    _close_client_on_timeout,
+                    args=(
+                        "Codex auxiliary Responses stream exceeded "
+                        f"{total_timeout_s:.1f}s total timeout",
+                    ),
+                )
                 timeout_timer.daemon = True
                 timeout_timer.start()
+            if first_event_timeout is not None:
+                first_event_timer = threading.Timer(
+                    first_event_timeout,
+                    _first_event_timeout,
+                )
+                first_event_timer.daemon = True
+                first_event_timer.start()
             _check_cancelled()
 
             # Event-driven Responses streaming via the low-level
@@ -1814,6 +1927,10 @@ class _CodexCompletionsAdapter:
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
+                if not seen_first_event.is_set():
+                    seen_first_event.set()
+                    if first_event_timer is not None:
+                        first_event_timer.cancel()
                 # Each SSE event is also forward progress for hosts watching
                 # a progress hook (gateway session hygiene): a reasoning
                 # model streaming a long summary must not look hung.
@@ -1847,6 +1964,9 @@ class _CodexCompletionsAdapter:
                 # (and compatibility shims such as SimpleNamespace) are not
                 # event streams and may not be iterable at all.
                 if hasattr(event_stream, "output"):
+                    seen_first_event.set()
+                    if first_event_timer is not None:
+                        first_event_timer.cancel()
                     final = event_stream
                 else:
                     final = _consume_codex_event_stream(
@@ -1909,8 +2029,12 @@ class _CodexCompletionsAdapter:
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
         finally:
+            with timeout_lock:
+                attempt_finished.set()
             if timeout_timer is not None:
                 timeout_timer.cancel()
+            if first_event_timer is not None:
+                first_event_timer.cancel()
 
         content = "".join(text_parts).strip() or None
 

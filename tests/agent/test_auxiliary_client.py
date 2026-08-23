@@ -3,6 +3,8 @@
 import base64
 import json
 import logging
+import os
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -3137,6 +3139,59 @@ class TestVisionAutoSkipsKimiCoding:
 
 
 class TestCodexAuxiliaryAdapterTimeout:
+    @pytest.mark.parametrize(
+        "configured",
+        [float("nan"), float("inf"), float("-inf"), "malformed", 0, -1],
+    )
+    def test_first_event_timeout_rejects_invalid_values(self, configured):
+        from agent.auxiliary_client import _codex_first_event_timeout_seconds
+
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value={}),
+            patch("hermes_cli.config.cfg_get", return_value=configured),
+            patch("agent.model_metadata.is_local_endpoint", return_value=False),
+        ):
+            assert (
+                _codex_first_event_timeout_seconds(
+                    "https://chatgpt.com/backend-api/codex"
+                )
+                == 180.0
+            )
+
+    def test_first_event_timeout_interrupts_a_silent_remote_stream(self):
+        release = threading.Event()
+        close = MagicMock(side_effect=release.set)
+
+        class _BlockedStream:
+            def __iter__(self):
+                release.wait(timeout=1)
+                raise RuntimeError("closed while waiting")
+
+            def close(self):
+                pass
+
+        fake_client = SimpleNamespace(
+            base_url="https://chatgpt.com/backend-api/codex",
+            responses=SimpleNamespace(create=lambda **_kwargs: _BlockedStream()),
+            close=close,
+        )
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        with (
+            patch(
+                "agent.auxiliary_client._codex_first_event_timeout_seconds",
+                return_value=0.02,
+            ),
+            patch("agent.auxiliary_client._evict_cached_client_instance"),
+            pytest.raises(TimeoutError, match="before first event"),
+        ):
+            adapter.create(
+                messages=[{"role": "user", "content": "summarize this"}],
+                timeout=1,
+            )
+
+        close.assert_called_once()
+
     def test_forwards_timeout_to_responses_create(self):
         message_item = SimpleNamespace(
             type="message",
