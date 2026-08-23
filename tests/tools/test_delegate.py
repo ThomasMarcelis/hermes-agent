@@ -1345,7 +1345,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         """A slow in-flight model wait (api_call_count frozen, no tool) must
         stay alive when last_activity_ts keeps advancing.
 
-        Top-level delegate_task runs in the background; the async stall
+        Detached delegate_task calls use the async stall
         monitor already treats ticking last_activity_ts as progress. The sync
         heartbeat path must use the same signal so slow local / long-prefill
         completions are not mistaken for a wedged idle child.

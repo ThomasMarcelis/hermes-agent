@@ -3,21 +3,26 @@
 import json
 from dataclasses import fields
 
+import pytest
+
 from tools.delegate_tool import DELEGATE_TASK_SCHEMA, _strip_model_hidden_task_fields
 from tools.delegate_tool_dispatch import _Batch, _units_of
 from tools.delegate_tool_tasks import _normalize_task_list
 from tools.registry import registry
 
 
-def test_group_schema_tracks_delivery_policy_without_mutating_previous_definitions(monkeypatch):
+@pytest.mark.parametrize("mode", ["join", "detach"])
+def test_group_schema_tracks_delivery_policy_without_mutating_previous_definitions(monkeypatch, mode):
     from tools import delegate_tool_config
 
     original = json.dumps(DELEGATE_TASK_SCHEMA)
     snapshots = []
-    for config in ({}, {"independent_completions": True}, {"independent_completions": False}):
+    for config in ({"top_level_completion": mode},
+                   {"top_level_completion": mode, "independent_completions": True},
+                   {"top_level_completion": mode, "independent_completions": False}):
         monkeypatch.setattr(delegate_tool_config, "_cfg", lambda: config)
         definition = registry.get_definitions({"delegate_task"})[0]
-        enabled = config.get("independent_completions", False)
+        enabled = mode == "detach" and config.get("independent_completions", False)
         task = definition["function"]["parameters"]["properties"]["tasks"]["items"]
         assert ("group" in task["properties"]) == enabled
         assert ("group" in definition["function"]["description"]) == enabled

@@ -8,7 +8,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
 
-Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
+Top-level model calls **join by default**. Children in a batch still run in parallel, but the parent turn remains open until every child reaches a terminal outcome; all results return together for one final synthesis. Set `delegation.top_level_completion: detach` to return a handle immediately and deliver completion in a later turn. Orchestrator subagents always join their own workers. The deprecated model-facing `background` argument is ignored; configuration owns this policy.
 
 ## Completion delivery
 
@@ -183,11 +183,11 @@ delegate_task(
 
 ## Batch Mode Details
 
-When a top-level agent provides a `tasks` array, Hermes returns one background handle and runs the subagents in parallel. By default the call returns **one** consolidated message once every task has finished. Results are delivered only between the parent's turns: the parent should finish anything that does not depend on the children, then end its turn rather than polling transcripts, artifacts, or CI while it waits.
+When a top-level agent provides a `tasks` array, Hermes runs its children in parallel. In the default `join` mode, the call returns one consolidated result in the same parent turn after every child settles, allowing one final synthesis. In explicit `detach` mode, it returns a background handle and delivers completion between the parent's turns: finish work that does not depend on the children, then end the turn without polling transcripts, artifacts, or CI.
 
 ### Independent completions (opt-in)
 
-Set `delegation.independent_completions: true` to have results land **per completion unit** as each finishes instead. The model-facing `group` field and grouping guidance are only advertised when this option is enabled. Start a new session after changing it so the tool schema can reflect the setting without changing an existing conversation's cached prefix. Old calls containing `group` remain accepted; with the option off, the whole call still returns together.
+With `delegation.top_level_completion: detach`, set `delegation.independent_completions: true` to have results land **per completion unit** as each finishes instead. Joined calls always return their whole batch together. The model-facing `group` field and grouping guidance are only advertised when independent completions are enabled. Start a new session after changing it to preserve the cached prefix. Old calls containing `group` remain accepted; with the option off, the whole call still returns together.
 
 When independent completions are enabled:
 
@@ -212,13 +212,13 @@ The dispatch handle lists each unit (`units[].delegation_id`, `group`, `task_ind
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
 - **Progress display:** In CLI mode, a tree-view shows tool calls from each subagent in real-time with per-task completion lines. In gateway mode, progress is batched and relayed to the parent's progress callback. CLI and TUI completion notices use task-first titles such as `Subagent Task Completed: Review changes`; multi-task groups use the group name and task count. Unsuccessful or incomplete work gets a corresponding status label. These compact notices do not replace the full results delivered to the parent agent.
 - **Result ordering:** Within a unit, results are sorted by task index to match input order regardless of completion order; `TASK i/N` labels index the whole call
-- **Cancellation:** Follow-up messages do not cancel a top-level background batch. `/stop` (gateway `/stop`, CLI `/stop`, the Desktop/TUI Stop button, an ACP cancel) or closing/resetting the owning session ends its background children and every synchronous descendant beneath them; each stopped child still returns as a completion with `status="interrupted"` and its partial output
+- **Cancellation:** Joined children follow the parent turn's interrupt state. In detach mode, follow-up messages do not cancel the batch; `/stop` (gateway `/stop`, CLI `/stop`, Desktop/TUI Stop, ACP cancel) or closing/resetting the owning session interrupts its detached children and their synchronous descendants. Each stopped child returns `status="interrupted"` with partial output.
 
-Synchronous single-task delegation from an orchestrator runs directly without thread pool overhead.
+Joined single-task delegation runs directly without thread pool overhead.
 
-### Durable background completions
+### Durable detached completions
 
-When a background delegation finishes, Hermes stores its completion event in
+When a detached delegation finishes, Hermes stores its completion event in
 the active profile's `state.db` before publishing it to the normal fresh-turn
 queue. If Hermes restarts after completion but before delivery, the pending
 event is restored and routed through the same ownership checks. Competing
@@ -396,7 +396,7 @@ With a hard cap configured, if a subagent times out having made **zero** API cal
 
 ## Stall Detection for Background Subagents
 
-Background delegations (`delegate_task(background=true)`) are watched by a
+Detached model delegations (`delegation.top_level_completion: detach`) are watched by a
 **progress-based stall monitor** — on by default, zero config. Unlike a
 wall-clock timeout, it never touches a child that is making progress, no
 matter how long it runs.
@@ -553,8 +553,8 @@ delegate_task(
 
 ## Lifetime and Durability
 
-:::warning Background completion durability is not durable execution
-Top-level model-facing `delegate_task` calls run in the background automatically where the session supports later delivery. Hermes returns a handle immediately, and the result re-enters the conversation after the child or batch finishes. Orchestrator subagents wait for their workers in the current turn because they must synthesize those results before returning. Stateless request/response endpoints fall back to synchronous execution when they cannot deliver a detached result later.
+:::warning Detached completion durability is not durable execution
+Top-level model-facing `delegate_task` calls join in the current turn by default. Explicit `delegation.top_level_completion: detach` returns a handle immediately and re-enters completion later, using the session's existing delivery path. Orchestrator subagents always join their workers. Sessions that cannot deliver detached completions retain their synchronous fallback.
 
 - Normal follow-up messages do not cancel background children. `/stop` on any surface (gateway `/stop` — also when the session is idle after the dispatching turn ended — CLI `/stop`, the Desktop/TUI Stop button, an ACP cancel) ends the session's running background delegations, and closing or resetting the owning session does the same.
 - Explicit session close/reset interrupts that session's background children. Closing a TUI viewer of a gateway-owned session does not kill the gateway's work.
@@ -574,7 +574,7 @@ For **durable execution** that must survive session closure or process restart, 
 - Subagents inherit the parent's enabled toolsets; the model cannot select or widen them per call
 - **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, and only when `max_spawn_depth` is raised from its default of 1 (flat). Disable globally with `orchestrator_enabled: false`.
 - Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`. Orchestrator subagents retain `delegate_task` but keep the other blocks. Both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work instead of burning reasoning iterations.
-- **Cancellation follows ownership** — `/stop` or closing/resetting the owning session ends its background children and the synchronous descendants beneath them; each returns an interrupted completion carrying its partial output
+- **Cancellation follows ownership** — joined children follow the parent turn's interrupt state; `/stop` or closing/resetting an owning detached session interrupts its background children and their synchronous descendants, with partial output in each interrupted completion
 - Only the final summary enters the parent's context, keeping token usage efficient
 - Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
 
@@ -633,9 +633,10 @@ error.
 ```yaml
 # In ~/.hermes/config.yaml
 delegation:
+  top_level_completion: join              # join (default) or detach
   max_iterations: 250                       # Max turns per child (default: 250)
   # max_concurrent_children: 10             # Parallel children per batch (default: 10)
-  # independent_completions: false          # true = each task/group returns as it finishes (default: one message per call)
+  # independent_completions: false          # detach only: each task/group returns as it finishes
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.

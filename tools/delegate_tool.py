@@ -5,8 +5,8 @@ Delegate Tool -- Subagent Architecture
 Spawns child AIAgent instances with a fresh conversation, their own task_id
 (terminal session, file-ops cache), the parent's toolsets minus child-blocked
 tools, and a focused system prompt built from goal + context. Single-task and
-batch (parallel) modes; top-level model calls run in the background while
-orchestrator children wait for their own workers. The parent only ever sees
+batch (parallel) modes; top-level model calls join unless configuration
+selects detach, while orchestrator children always join their workers. The parent only ever sees
 the delegation call and the summary result, never the child's intermediate
 tool calls or reasoning.
 """
@@ -551,28 +551,38 @@ def _build_top_level_description(*, independent_completions=None) -> str:
         )
     else:
         restrictions_rule = "- Children cannot call delegate_task, clarify, memory, or cronjob.\n"
+    from tools.delegate_tool_config import _get_top_level_completion_mode
     from tools.delegate_tool_config import _get_independent_completions
-
     if independent_completions is None:
         independent_completions = _get_independent_completions()
-    delivery = (
-        "each ungrouped task / `group` returns on its own"
-        if independent_completions else "one message per call"
-    )
-    return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
+    delivery = ("each ungrouped task / `group` returns on its own"
+                if independent_completions else "one message per call")
+    completion = _COMPLETION_CONTRACTS[_get_top_level_completion_mode()].format(delivery=delivery)
+    return _DESCRIPTION_INTRO + completion + _DESCRIPTION_HEAD + restrictions_rule + _DESCRIPTION_TAIL
 
-_DESCRIPTION_HEAD = (
+_DESCRIPTION_INTRO = (
     "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
     "final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel "
     "(limit in the tasks description).\n\n"
-    "Sessions without a later-result consumer (including one-shot CLI and cron) join parallel children "
-    "and return results in this tool call. "
-    "Otherwise runs in the background: dispatch returns live transcript paths and results re-enter "
-    "as a new message when subagents finish ({delivery}). Background results are delivered only "
-    "BETWEEN your turns: finish whatever does not depend on them, then give a one-line status and END YOUR TURN. Never "
-    "wait or poll on transcripts, artifact files, or CI for a child. "
-    "While children run, `action` (list/steer/stop) controls them live.\n\n"
-    "USE FOR: reasoning-heavy subtasks, work that would flood your context, or independent parallel workstreams.\n"
+)
+_COMPLETION_CONTRACTS = {
+    "join": (
+        "Runs joined: children still execute in parallel, but this call returns only after every child reaches a "
+        "terminal outcome. Use all results for one final answer; do not answer before this tool returns. "
+        "User/session interrupts remain responsive. CONTROL: action='list', 'steer', or 'stop' manages an "
+        "already-running detached child; a joined spawn occupies this call until its cohort settles.\n\n"
+    ),
+    "detach": (
+        "Runs detached when a later-result consumer exists: returns live transcript paths immediately; "
+        "completion re-enters as a new message ({delivery}) BETWEEN your turns. One-shot CLI and cron "
+        "join in this call. Finish independent work, then give a one-line status and END YOUR TURN. "
+        "Never wait or poll on child transcripts, artifacts, or CI. `action` (list/steer/stop) controls "
+        "detached children.\n\n"
+    ),
+}
+_DESCRIPTION_HEAD = (
+    "USE FOR: reasoning-heavy subtasks, work that would flood your context with intermediate data, or independent "
+    "parallel workstreams.\n"
     "DO NOT USE FOR (use these instead):\n"
     "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
     "- A single tool call -> call the tool directly\n"
@@ -609,9 +619,10 @@ def _build_tasks_param_description() -> str:
 def _build_dynamic_schema_overrides() -> dict:
     """Per-call schema overrides (ToolEntry.dynamic_schema_overrides): every
     get_definitions() pass rewrites the descriptions to the user's actual limits."""
-    from tools.delegate_tool_config import _get_independent_completions
+    from tools.delegate_tool_config import _get_independent_completions, _get_top_level_completion_mode
 
-    independent_completions = _get_independent_completions()
+    independent_completions = (_get_top_level_completion_mode() == "detach"
+                               and _get_independent_completions())
     overrides_params = {**DELEGATE_TASK_SCHEMA["parameters"]}
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
@@ -690,8 +701,8 @@ DELEGATE_TASK_SCHEMA = {
                 },
                 "description": "(rebuilt at get_definitions() time)",
             },
-            # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
-            # delegations always run in the background. Unadvertised; do not re-add.
+            # `background` is deprecated and ignored for model calls: delegation.top_level_completion
+            # owns the root lifecycle (join by default, detach opt-in). Keep it unadvertised.
             "action": _p(
                 "string",
                 "Default 'spawn'. Live control of running children: "
@@ -718,12 +729,11 @@ DELEGATE_TASK_SCHEMA = {
 from tools.registry import registry, tool_error
 
 def _model_background_value(args: dict, parent_agent=None) -> bool:
-    """Background flag for the MODEL-facing dispatch path (registry fallback). Top-level delegations always run in the
-    background — the model does not choose — for single tasks and fan-out batches alike (one async unit, one
-    consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
-    within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
-    the intercept is bypassed. Direct Python callers keep the synchronous default."""
-    return not getattr(parent_agent, "_delegate_depth", 0) > 0
+    """Model-facing root policy, shared by AIAgent and registry dispatch. The model's deprecated
+    background flag is ignored; nested orchestrators and direct Python defaults remain joined."""
+    from tools.delegate_tool_config import _get_top_level_completion_mode
+    return (not getattr(parent_agent, "_delegate_depth", 0) > 0
+            and _get_top_level_completion_mode() == "detach")
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 
