@@ -114,6 +114,37 @@ class TestReadAttachmentBytes:
         result = await adapter._read_attachment_bytes(att)
 
         assert result is None
+    @pytest.mark.asyncio
+    async def test_unknown_declared_size_avoids_unbounded_authenticated_read(self):
+        adapter = _make_adapter()
+        att = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/file.bin",
+            filename="file.bin",
+            size=None,
+            read=AsyncMock(return_value=b"x" * 1024),
+        )
+        assert await adapter._read_attachment_bytes(att, max_bytes=64) is None
+        att.read.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_declared_and_actual_size_use_effective_cap(self):
+        adapter = _make_adapter()
+        oversized = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/file.bin",
+            filename="file.bin",
+            size=65,
+            read=AsyncMock(return_value=b"x" * 65),
+        )
+        with pytest.raises(ValueError, match="Inbound media payload is too large"):
+            await adapter._read_attachment_bytes(oversized, max_bytes=64)
+        oversized.read.assert_not_awaited()
+
+        lying = SimpleNamespace(
+            url=oversized.url, filename="file.bin", size=8,
+            read=AsyncMock(return_value=b"x" * 65),
+        )
+        with pytest.raises(ValueError, match="Inbound media payload is too large"):
+            await adapter._read_attachment_bytes(lying, max_bytes=64)
 
 
 # ---------------------------------------------------------------------------
@@ -176,25 +207,22 @@ class TestCacheDiscordAudio:
 class TestCacheDiscordDocument:
 
     @pytest.mark.asyncio
-    async def test_fallback_blocked_by_ssrf_guard(self):
-        """Document fallback path now honors is_safe_url — was missing before.
-
-        Regression guard for #11345: the old aiohttp block skipped the
-        SSRF check entirely; a non-CDN ``att.url`` could have reached
-        internal-looking hosts. The fallback must now refuse unsafe URLs.
-        """
+    async def test_fallback_uses_shared_bounded_ssrf_safe_downloader(self):
         adapter = _make_adapter()
-        att = _make_attachment_without_read()  # no .read → forces fallback
+        att = _make_attachment_without_read()
 
         with patch(
-            "plugins.platforms.discord.adapter.is_safe_url", return_value=False
-        ) as mock_safe, patch("aiohttp.ClientSession") as mock_session:
+            "plugins.platforms.discord.adapter.download_media_bytes_from_url",
+            new_callable=AsyncMock,
+            side_effect=ValueError("Blocked unsafe URL (SSRF protection)"),
+        ) as downloader:
             with pytest.raises(ValueError, match="SSRF"):
                 await adapter._cache_discord_document(att, ".pdf")
 
-        mock_safe.assert_called_once_with(att.url)
-        # aiohttp must NOT be contacted when the URL is blocked.
-        mock_session.assert_not_called()
+        downloader.assert_awaited_once()
+        assert downloader.await_args is not None
+        assert downloader.await_args.kwargs["media_type"] == "document"
+        assert downloader.await_args.kwargs["max_bytes"] == adapter._discord_attachment_limit()
 
 
 # ---------------------------------------------------------------------------
@@ -254,5 +282,51 @@ class TestHandleMessageUsesAuthenticatedRead:
         event = adapter.handle_message.call_args[0][0]
         assert event.media_urls == ["/tmp/img_from_read.png"]
         assert event.media_types == ["image/png"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_image_is_not_forwarded_as_cdn_url(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+        adapter.handle_message = AsyncMock()
+
+        with patch(
+            "plugins.platforms.discord.adapter.cache_image_from_bytes_async",
+            side_effect=ValueError("invalid image data"),
+        ), patch(
+            "plugins.platforms.discord.adapter.cache_image_from_url",
+            new_callable=AsyncMock,
+            side_effect=ValueError("invalid image data"),
+        ):
+            att = SimpleNamespace(
+                url="https://cdn.discordapp.com/attachments/fake/broken.png",
+                filename="broken.png",
+                content_type="image/png",
+                size=24,
+                read=AsyncMock(return_value=b"\x89PNG\r\n\x1a\ntruncated"),
+            )
+            from datetime import datetime, timezone
+
+            class _FakeDMChannel:
+                id = 100
+                name = "dm"
+
+            monkeypatch.setattr(
+                "plugins.platforms.discord.adapter.discord.DMChannel",
+                _FakeDMChannel,
+            )
+            msg = SimpleNamespace(
+                id=1, content="why is it doing this?", attachments=[att],
+                mentions=[], reference=None,
+                created_at=datetime.now(timezone.utc), channel=_FakeDMChannel(),
+                author=SimpleNamespace(id=42, display_name="U", name="U"),
+            )
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == []
+        assert event.media_types == []
+        assert "fresh screenshot or JPEG" in event.text
+        assert "why is it doing this?" in event.text
+        assert att.url not in event.text
 
 

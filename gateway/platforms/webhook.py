@@ -156,6 +156,9 @@ def _validate_svix_signature(body: bytes, secret: str, msg_id: str, timestamp: s
 class WebhookAdapter(BasePlatformAdapter):
     """Generic webhook receiver that triggers agent runs from HTTP POSTs."""
 
+    # Immutable deliveries cannot carry editable progress or partial responses.
+    FINAL_ONLY_DELIVERY = True
+
     # Event-triggered, no human present: startup auto-resume must FINISH the interrupted work, not ask "what next?".
     # The startup auto-resume turn must instruct the model to FINISH the interrupted work instead of
     # emitting an interactive acknowledgement that abandons the task (#57056).
@@ -324,6 +327,26 @@ class WebhookAdapter(BasePlatformAdapter):
             self._prune_seen_deliveries(now)
         return True
 
+    def _effective_delivery_profile(
+        self, request_profile: Optional[str] = None
+    ) -> str:
+        """Resolve the profile owning ingress, egress, and idempotency state."""
+        if request_profile:
+            return str(request_profile)
+        runner = self.gateway_runner
+        active_name = getattr(runner, "_active_profile_name", None)
+        if callable(active_name):
+            try:
+                return str(active_name() or "default")
+            except Exception:
+                pass
+        return "default"
+
+    @staticmethod
+    def _delivery_claim_key(profile: str, route_name: str, delivery_id: str) -> str:
+        """Build the full idempotency namespace for a provider delivery."""
+        return f"{profile}:{route_name}:{delivery_id}"
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
@@ -479,12 +502,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 return _UNPARSEABLE
 
     async def _handle_deliver_only(self, prompt: str, payload: Any, route_config: dict, route_name: str,
-                                   event_type: str, delivery_id: str, profile: Optional[str] = None) -> "web.Response":
+                                   event_type: str, delivery_id: str, delivery_profile: str,
+                                   delivery_key: str) -> "web.Response":
         """deliver_only: the rendered prompt IS the message — skip the agent, reuse the same
         auth/rate-limit/idempotency/template pipeline."""
-        delivery = {"deliver": route_config.get("deliver", "log"), "payload": payload, "profile": profile,
+        delivery = {"deliver": route_config.get("deliver", "log"), "payload": payload,
+                    "profile": delivery_profile, "route": route_name,
                     "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload),
-                    "route": route_name,
                     "mirror": route_config.get("mirror_to_session") is True}
         logger.info("[webhook] direct-deliver event=%s route=%s target=%s msg_len=%d delivery=%s", event_type,
                     route_name, delivery["deliver"], len(prompt), delivery_id)
@@ -492,12 +516,14 @@ class WebhookAdapter(BasePlatformAdapter):
         try:
             result = await self._direct_deliver(prompt, delivery)
         except Exception:
+            self._seen_deliveries.pop(delivery_key, None)
             logger.exception("[webhook] direct-deliver failed route=%s delivery=%s", route_name, delivery_id)
             return web.json_response(failed, status=502)
         if result.success:
             return web.json_response({"status": "delivered", "route": route_name, "target": delivery["deliver"],
                                       "delivery_id": delivery_id}, status=200)
-        # Target rejected it — 502 with a generic error (don't leak adapter detail).
+        # Failed deliveries release the claim so provider retries can succeed.
+        self._seen_deliveries.pop(delivery_key, None)
         logger.warning("[webhook] direct-deliver target rejected route=%s target=%s error=%s", route_name,
                        delivery["deliver"], result.error)
         return web.json_response(failed, status=502)
@@ -618,14 +644,16 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
             "webhook-id", headers.get("X-Request-ID", str(int(time.time() * 1000))))))
         now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
-        if not self._record_delivery_id(delivery_id, now):
+        delivery_profile = self._effective_delivery_profile(profile if isinstance(profile, str) else None)
+        delivery_key = self._delivery_claim_key(delivery_profile, route_name, delivery_id)
+        if not self._record_delivery_id(delivery_key, now):
             logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
             return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
         if route_config.get("cron_job"):
             return self._handle_cron_trigger(prompt, route_config, route_name, event_type, delivery_id, profile)
         if route_config.get("deliver_only"):
-            return await self._handle_deliver_only(prompt, payload, route_config, route_name, event_type, delivery_id,
-                                                   profile)
+            return await self._handle_deliver_only(
+                prompt, payload, route_config, route_name, event_type, delivery_id, delivery_profile, delivery_key)
         coalesce = route_config.get("coalesce")
         if isinstance(coalesce, dict) and self._coalescer.enqueue(
                 route_name=route_name, coalesce=coalesce, payload=payload, event_type=event_type, prompt=prompt,
@@ -653,10 +681,11 @@ class WebhookAdapter(BasePlatformAdapter):
         # ``profile`` rides along so the reply leg (``send`` → ``_deliver_cross_platform``) egresses through
         # THIS profile's adapter, home channel and secrets — not the first profile that has the platform.
         self._delivery_info[session_chat_id] = {
-            "deliver": route_config.get("deliver", "log"), "profile": profile,
+            "deliver": route_config.get("deliver", "log"),
+            "profile": self._effective_delivery_profile(profile if isinstance(profile, str) else None),
+            "route": route_name, "payload": payload,
             "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload),
-            "route": route_name,
-            "mirror": route_config.get("mirror_to_session") is True}
+                    "mirror": route_config.get("mirror_to_session") is True}
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
@@ -816,9 +845,6 @@ class WebhookAdapter(BasePlatformAdapter):
         try:
             # Off-loop: `gh` does network I/O up to its 30s timeout; inline it froze every adapter and
             # timer on the gateway event loop.
-            # Running it inline froze every adapter and timer on the gateway event loop for the duration
-            # (Pattern A, #91912 class). asyncio.to_thread keeps the loop serving while the subprocess runs;
-            # the worker thread is bounded by the subprocess timeout below.
             result = await asyncio.to_thread(
                 subprocess.run, ["gh", "pr", "comment", str(pr_int), "--repo", repo, "--body", content],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30,
@@ -850,11 +876,11 @@ class WebhookAdapter(BasePlatformAdapter):
                     env[name] = value
         return env
 
-    def _find_adapter(self, target_platform: Platform, profile: Optional[str]):
-        """The routed profile's own adapter, fail-closed. A ``/p/<profile>/`` route must never post as
-        another profile's bot, and a bare (default-bound) route must not borrow a platform parked only on
-        a secondary profile — both directions leaked before #65939."""
-        return self.gateway_runner._authorization_adapter(target_platform, profile)
+    def _find_adapter(self, target_platform: Platform, delivery_profile: str):
+        """Resolve within the ingress profile, including shared-bot satellites."""
+        return self.gateway_runner._authorization_adapter(
+            target_platform, delivery_profile,
+        )
 
     async def _deliver_cross_platform(self, platform_name: str, content: str, delivery: dict) -> SendResult:
         """Route response to another platform (telegram, discord, etc.)."""
@@ -864,17 +890,16 @@ class WebhookAdapter(BasePlatformAdapter):
             target_platform = Platform(platform_name)
         except ValueError:
             return SendResult(success=False, error=f"Unknown platform: {platform_name}")
-        profile = delivery.get("profile")
-        if not (adapter := self._find_adapter(target_platform, profile)):
-            return SendResult(success=False, error=f"Platform {platform_name} not connected")
+        delivery_profile = self._effective_delivery_profile(delivery.get("profile"))
+        if not (adapter := self._find_adapter(target_platform, delivery_profile)):
+            return SendResult(success=False, error=f"Platform {platform_name} not connected for profile {delivery_profile}")
         extra = delivery.get("deliver_extra", {})
         chat_id = extra.get("chat_id", "")
-        # Whole leg under the routed profile's scope: the home channel comes from THAT profile's config
-        # (``self.gateway_runner.config`` is the default profile's), and the adapter's send reads its
-        # credentials through the profile secret scope.
-        with self._profile_scope(profile):
+        with self._profile_scope(delivery_profile):
             if not chat_id:
-                home = self._delivery_config(profile).get_home_channel(target_platform)
+                home = self._delivery_config(delivery_profile).get_home_channel(
+                    target_platform,
+                )
                 if not home:
                     return SendResult(success=False, error=f"No chat_id or home channel for {platform_name}")
                 chat_id = home.chat_id
@@ -885,8 +910,8 @@ class WebhookAdapter(BasePlatformAdapter):
             return result
 
     def _delivery_config(self, profile: Optional[str]):
-        """Gateway config of the profile a delivery is bound to (call inside ``_profile_scope``)."""
-        if not profile or not isinstance(profile, str):
+        """Load the delivery profile's config inside its captured scope."""
+        if not profile or profile == "default":
             return self.gateway_runner.config
         from gateway.config import load_gateway_config
         return load_gateway_config()

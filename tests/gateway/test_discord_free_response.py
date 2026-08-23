@@ -478,11 +478,35 @@ def test_discord_free_response_auto_thread_yaml_bridge(adapter, monkeypatch):
     # Present: seeded into `extra` and bridged to the env var the adapter reads.
     seeded = discord_platform._apply_yaml_config({}, {"free_response_auto_thread": True})
 
-    assert seeded is not None and seeded["free_response_auto_thread"] is True
+    assert seeded is not None and seeded["free_response_auto_thread"] == "true"
     assert os.environ["DISCORD_FREE_RESPONSE_AUTO_THREAD"] == "true"
     adapter.config.extra["free_response_auto_thread"] = True
     assert adapter._discord_free_response_auto_thread() is True
 
+
+@pytest.mark.asyncio
+async def test_discord_thread_free_response_channel_keeps_auto_thread(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+
+    fake_thread = SimpleNamespace(id=9001, name="task")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="new task without a mention",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "new task without a mention"
+    assert event.source.thread_id == "9001"
 
 @pytest.mark.asyncio
 async def test_fetch_channel_context_stops_at_self_message_and_reverses_to_chronological_order(adapter, monkeypatch):

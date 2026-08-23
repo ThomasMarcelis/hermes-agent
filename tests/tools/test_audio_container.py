@@ -134,7 +134,7 @@ class TestInboundCacheUsesSniffer:
             async def __aexit__(self, *exc):
                 return False
 
-        async def _fake_read(response, media_type):
+        async def _fake_read(response, media_type, max_bytes=None):
             return MP3_ID3  # server sent MP3 bytes despite the .ogg claim
 
         monkeypatch.setattr(base, "_read_httpx_body_with_limit", _fake_read)

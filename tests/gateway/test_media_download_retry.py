@@ -14,10 +14,12 @@ in this environment.
 import asyncio
 import socket
 import sys
+from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import httpx
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Helpers for building httpx exceptions
@@ -27,13 +29,20 @@ def _make_timeout_error() -> httpx.TimeoutException:
     return httpx.TimeoutException("timed out")
 
 
-def _make_stream_response(content: bytes = b"\xff\xd8\xff fake media"):
+def _valid_image_bytes(fmt: str = "JPEG") -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), "white").save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+def _make_stream_response(content: bytes | None = None):
     """Build a mock httpx response suitable for ``client.stream()`` usage.
 
     Exposes ``raise_for_status``, an empty ``headers`` mapping (no
     Content-Length), and an ``aiter_bytes`` async iterator yielding the body
     in one chunk — matching how ``_read_httpx_body_with_limit`` consumes it.
     """
+    content = _valid_image_bytes() if content is None else content
     resp = MagicMock()
     resp.raise_for_status = MagicMock()
     resp.headers = {}
@@ -88,7 +97,7 @@ class TestCacheImageFromBytes:
     def test_caches_valid_jpeg(self, tmp_path, monkeypatch):
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
         from gateway.platforms.base import cache_image_from_bytes
-        path = cache_image_from_bytes(b"\xff\xd8\xff fake jpeg data", ".jpg")
+        path = cache_image_from_bytes(_valid_image_bytes(), ".jpg")
         assert path.endswith(".jpg")
 
 
@@ -107,13 +116,31 @@ class TestCacheImageFromBytes:
 class TestCacheImageFromUrl:
     """Tests for gateway.platforms.base.cache_image_from_url"""
 
+    def test_success_on_first_attempt(self, _mock_safe, tmp_path, monkeypatch):
+        """A clean 200 response caches the image and returns a path."""
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+
+        mock_client = _make_stream_client(
+            responses=[_make_stream_response()]
+        )
+
+        async def run():
+            with patch("httpx.AsyncClient", return_value=mock_client):
+                from gateway.platforms.base import cache_image_from_url
+                return await cache_image_from_url(
+                    "http://example.com/img.jpg", ext=".jpg"
+                )
+
+        path = asyncio.run(run())
+        assert path.endswith(".jpg")
+        mock_client.stream.assert_called_once()
 
     def test_retries_on_timeout_then_succeeds(self, _mock_safe, tmp_path, monkeypatch):
         """A timeout on the first attempt is retried; second attempt succeeds."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
 
         mock_client = _make_stream_client(
-            responses=[_make_timeout_error(), _make_stream_response(b"\xff\xd8\xff image data")]
+            responses=[_make_timeout_error(), _make_stream_response()]
         )
         mock_sleep = AsyncMock()
 
@@ -347,7 +374,7 @@ class TestSlackDownloadSlackFile:
         adapter = _make_slack_adapter()
 
         fake_response = MagicMock()
-        fake_response.content = b"\x89PNG\r\n\x1a\n fake png"
+        fake_response.content = _valid_image_bytes("PNG")
         fake_response.raise_for_status = MagicMock()
         fake_response.headers = {"content-type": "image/png"}
 
@@ -363,7 +390,7 @@ class TestSlackDownloadSlackFile:
                 )
 
         path = asyncio.run(run())
-        assert path.endswith(".jpg")
+        assert path.endswith(".png")
         mock_client.get.assert_called_once()
 
     def test_rejects_html_response(self, tmp_path, monkeypatch):
