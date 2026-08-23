@@ -50,6 +50,8 @@ def _clean_env(tmp_path, monkeypatch):
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_OBSERVATION_SCOPES",
+        "HINDSIGHT_RETAIN_OBSERVATION_SCOPE_EXCLUDE_TAG_PREFIXES",
+        "HINDSIGHT_RECALL_TAGS",
         "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
     ):
@@ -247,6 +249,26 @@ class TestSchemas:
         p = provider_with_config(memory_mode="context")
         assert p.get_tool_schemas() == []
 
+    def test_retain_tool_can_be_hidden_without_disabling_auto_retain(
+        self, provider_with_config
+    ):
+        p = provider_with_config(expose_retain_tool=False, retain_async=False)
+
+        assert [schema["name"] for schema in p.get_tool_schemas()] == [
+            "hindsight_recall",
+            "hindsight_reflect",
+        ]
+        assert "hindsight_retain" not in p.system_prompt_block()
+        denied = json.loads(
+            p.handle_tool_call("hindsight_retain", {"content": "do not store"})
+        )
+        assert "error" in denied
+        p._client.aretain_batch.assert_not_called()
+
+        p.sync_turn("automatic user", "automatic assistant")
+        p._retain_queue.join()
+        p._client.aretain_batch.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Config tests
@@ -283,6 +305,86 @@ class TestConfig:
     def test_observation_scopes_keyword_config(self, provider_with_config):
         p = provider_with_config(observation_scopes="per_tag")
         assert p._observation_scopes == "per_tag"
+
+    def test_recall_and_scope_filters_fall_back_to_environment(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setenv("HINDSIGHT_RECALL_TAGS", "profile:one, shared")
+        monkeypatch.setenv(
+            "HINDSIGHT_RETAIN_OBSERVATION_SCOPE_EXCLUDE_TAG_PREFIXES",
+            "session:, parent:",
+        )
+
+        p = provider_with_config()
+
+        assert p._recall_tags == ["profile:one", "shared"]
+        assert p._observation_scope_exclude_tag_prefixes == [
+            "session:",
+            "parent:",
+        ]
+
+    def test_present_empty_recall_and_scope_config_override_environment(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setenv("HINDSIGHT_RECALL_TAGS", "profile:environment")
+        monkeypatch.setenv(
+            "HINDSIGHT_RETAIN_OBSERVATION_SCOPE_EXCLUDE_TAG_PREFIXES",
+            "session:",
+        )
+
+        p = provider_with_config(
+            recall_tags="",
+            observation_scope_exclude_tag_prefixes="",
+        )
+
+        assert p._recall_tags is None
+        assert p._observation_scope_exclude_tag_prefixes == []
+
+    def test_quoted_boolean_values_use_shared_truth_parser(self, provider_with_config):
+        p = provider_with_config(
+            auto_retain="false",
+            auto_recall="false",
+            recall_sync="false",
+            recall_indicator="false",
+            retain_indicator="false",
+            retain_async="false",
+            prefetch_waits_for_retain="false",
+            expose_retain_tool="false",
+        )
+
+        assert p._auto_retain is False
+        assert p._auto_recall is False
+        assert p._recall_sync is False
+        assert p._recall_indicator is False
+        assert p._retain_indicator is False
+        assert p._retain_async is False
+        assert p._prefetch_waits_for_retain is False
+        assert p._expose_retain_tool is False
+
+    def test_quoted_true_boolean_values_remain_enabled(self, provider_with_config):
+        p = provider_with_config(
+            auto_retain="true",
+            auto_recall="yes",
+            recall_sync="on",
+            recall_indicator="1",
+            retain_indicator="true",
+            retain_async="yes",
+            prefetch_waits_for_retain="on",
+            expose_retain_tool="1",
+        )
+
+        assert all(
+            (
+                p._auto_retain,
+                p._auto_recall,
+                p._recall_sync,
+                p._recall_indicator,
+                p._retain_indicator,
+                p._retain_async,
+                p._prefetch_waits_for_retain,
+                p._expose_retain_tool,
+            )
+        )
 
 
     def test_custom_config_values(self, provider_with_config):
@@ -501,6 +603,59 @@ class TestToolHandlers:
         # The description must steer the model to pass event times.
         assert "event" in props["occurred_at"]["description"].lower()
         assert "occurred_at" not in RETAIN_SCHEMA["parameters"]["required"]
+    def test_retain_derives_scopes_from_merged_tags_without_volatile_lineage(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            retain_tags=["scope:default", "source:auto"],
+            observation_scope_exclude_tag_prefixes=["session:", "parent:"],
+        )
+
+        p.handle_tool_call(
+            "hindsight_retain",
+            {
+                "content": "likes dark mode",
+                "tags": ["project:hermes", "session:s1", "parent:p1"],
+            },
+        )
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert item["tags"] == [
+            "scope:default",
+            "source:auto",
+            "project:hermes",
+            "session:s1",
+            "parent:p1",
+        ]
+        assert item["observation_scopes"] == [[
+            "scope:default",
+            "source:auto",
+            "project:hermes",
+        ]]
+
+    def test_all_excluded_tags_send_explicit_empty_scope(self, provider_with_config):
+        p = provider_with_config(
+            observation_scope_exclude_tag_prefixes=["session:", "parent:"],
+        )
+
+        item = p._build_retain_kwargs(
+            "fact",
+            tags=["session:s1", "parent:p1"],
+        )
+
+        assert item["observation_scopes"] == [[]]
+
+    def test_explicit_observation_scopes_override_derived_filtering(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            observation_scopes=[["session:s1"]],
+            observation_scope_exclude_tag_prefixes=["session:"],
+        )
+
+        item = p._build_retain_kwargs("fact", tags=["session:s1", "stable"])
+
+        assert item["observation_scopes"] == [["session:s1"]]
 
 
     def test_recall_success(self, provider):
@@ -748,11 +903,9 @@ class TestPrefetchServerRetainVisibility:
         assert order == ["recall"], "prefetch should recall after the timeout"
         assert elapsed < 3.0, "prefetch must not block well past the drain budget"
 
-    def test_timed_out_ops_are_dropped_not_repolled(self, provider_with_config):
-        """Ops unresolved at deadline must be EVICTED so a permanently failing
-        status endpoint can't make every later prefetch re-burn the full
-        timeout on a growing pending set (unbounded session-wide degradation
-        + reply-path join penalty)."""
+    def test_timed_out_ops_remain_retryable_without_reburning_timeout(self, provider_with_config):
+        """Accepted ops survive timeout while persistent backoff keeps the
+        next prefetch from immediately re-burning the full wait budget."""
         p = provider_with_config(prefetch_retain_drain_timeout=0.3)
         p._client = self._client_with_ops(["pending"])  # never completes
         p._client.arecall = AsyncMock(
@@ -763,22 +916,29 @@ class TestPrefetchServerRetainVisibility:
         p._retain_queue.join()
         assert p._pending_retain_ops, "op should be tracked before the wait"
 
-        # First prefetch burns the budget and must DROP the wedged op.
+        # First prefetch leaves the accepted-but-unresolved op durable state.
         p.queue_prefetch("q1")
         if p._prefetch_thread:
             p._prefetch_thread.join(timeout=5.0)
-        assert p._pending_retain_ops == set(), (
-            "unresolved ops must be evicted at deadline, not retained"
-        )
+        assert p._pending_retain_ops == {"op-1"}
+        first_poll_count = p._client.operations.get_operation_status.await_count
 
-        # A later prefetch with nothing pending must be near-instant.
+        # Persistent next-poll backoff makes an immediate later prefetch cheap.
         start = time.monotonic()
         p.queue_prefetch("q2")
         if p._prefetch_thread:
             p._prefetch_thread.join(timeout=5.0)
         assert time.monotonic() - start < 0.25, (
-            "second prefetch re-polled dropped ops — eviction regressed"
+            "second prefetch re-burned the unresolved operation timeout"
         )
+        assert p._client.operations.get_operation_status.await_count == first_poll_count
+
+        # A later durability barrier can settle the very same operation.
+        p._client.operations.get_operation_status = AsyncMock(
+            return_value=SimpleNamespace(status="completed")
+        )
+        assert p.drain_pending(timeout=1.0) is True
+        assert p._pending_retain_ops == set()
 
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
@@ -803,6 +963,112 @@ class TestPrefetchServerRetainVisibility:
         provider._client = client
 
         assert provider._is_retain_op_complete("bank", "op-1") is False
+
+    def test_operation_polling_preserves_each_immutable_bank(self, provider):
+        seen = []
+
+        async def _status(**kwargs):
+            seen.append((kwargs["bank_id"], kwargs["operation_id"]))
+            return SimpleNamespace(status="completed")
+
+        provider._client.operations = MagicMock()
+        provider._client.operations.get_operation_status = AsyncMock(
+            side_effect=_status
+        )
+        provider._track_retain_ops(
+            SimpleNamespace(operation_id="op-a", operation_ids=None),
+            "bank-a",
+        )
+        provider._track_retain_ops(
+            SimpleNamespace(operation_id="op-b", operation_ids=None),
+            "bank-b",
+        )
+
+        assert provider._wait_for_server_retain_ops(
+            time.monotonic() + 1.0,
+            1.0,
+        )
+        assert set(seen) == {("bank-a", "op-a"), ("bank-b", "op-b")}
+
+    def test_operation_status_poll_respects_shared_drain_budget(self, provider):
+        import asyncio
+
+        async def _slow_status(**_kwargs):
+            await asyncio.sleep(0.35)
+            return SimpleNamespace(status="pending")
+
+        provider._client.operations = MagicMock()
+        provider._client.operations.get_operation_status = AsyncMock(
+            side_effect=_slow_status
+        )
+        provider._track_retain_ops(
+            SimpleNamespace(operation_id="op-slow", operation_ids=None),
+            "bank-slow",
+        )
+
+        started = time.monotonic()
+        assert provider.drain_pending(timeout=0.05) is False
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.2
+        assert provider._pending_retain_ops == {"op-slow"}
+
+    def test_append_watermark_advances_only_after_remote_completion(
+        self, provider, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        provider._client = self._client_with_ops(["completed"])
+
+        provider.sync_turn("hello", "world")
+        provider._retain_queue.join()
+
+        state = provider._active_delivery_state
+        assert state.committed == 0
+        assert state.queued == 1
+        assert provider._last_retained_turn_count == 0
+        assert provider._queued_retained_turn_count == 1
+
+        assert provider.drain_pending(timeout=1.0)
+        assert state.committed == 1
+        assert provider._last_retained_turn_count == 1
+
+    def test_failed_remote_append_retries_bounded_and_remains_retryable(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        p = provider_with_config(retain_async=True)
+        client = MagicMock()
+        sequence = iter(range(1, 20))
+        client.aretain_batch.side_effect = lambda **_kwargs: SimpleNamespace(
+            operation_id=f"op-{next(sequence)}",
+            operation_ids=None,
+        )
+        client.operations.get_operation_status.return_value = SimpleNamespace(
+            status="failed"
+        )
+        p._run_hindsight_operation = (
+            lambda operation, **_kwargs: operation(client)
+        )
+        p._client = None
+
+        p.sync_turn("first user", "first assistant")
+        p._retain_queue.join()
+        started = time.monotonic()
+        assert p.drain_pending(timeout=0.75) is False
+
+        state = p._active_delivery_state
+        assert time.monotonic() - started < 1.0
+        assert 2 <= client.aretain_batch.call_count <= 5
+        assert state.committed == 0
+        assert state.queued == 0
+        assert state.failed is True
+        assert p._pending_retain_ops == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1098,6 +1364,246 @@ class TestShutdownRace:
         assert client.aretain_batch.call_count == 2
         assert provider._retain_queue.empty()
 
+    @pytest.mark.parametrize("retain_async", [False, True])
+    def test_shutdown_flushes_below_threshold_buffer_once(
+        self, provider_with_config, monkeypatch, retain_async
+    ):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: False,
+        )
+        p = provider_with_config(
+            retain_every_n_turns=3,
+            retain_async=retain_async,
+        )
+        client = MagicMock()
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+        p.sync_turn("first user", "first assistant")
+        p.sync_turn("second user", "second assistant")
+        client.aretain_batch.assert_not_called()
+
+        p.shutdown(settlement_timeout=1.0)
+
+        client.aretain_batch.assert_called_once()
+        kwargs = client.aretain_batch.call_args.kwargs
+        assert kwargs["retain_async"] is retain_async
+        assert len(json.loads(kwargs["items"][0]["content"])) == 2
+
+    def test_shutdown_does_not_duplicate_exact_boundary_retain(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: False,
+        )
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        client = MagicMock()
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+
+        p.sync_turn("first user", "first assistant")
+        p.sync_turn("second user", "second assistant")
+        p.shutdown(settlement_timeout=1.0)
+
+        client.aretain_batch.assert_called_once()
+
+    def test_shutdown_retries_failed_legacy_write_without_losing_full_document(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: False,
+        )
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        client = MagicMock()
+        client.aretain_batch.side_effect = [RuntimeError("temporary"), None]
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+
+        p.sync_turn("first user", "first assistant")
+        p.sync_turn("second user", "second assistant")
+        p.shutdown(settlement_timeout=1.0)
+
+        assert client.aretain_batch.call_count == 2
+        retry_content = json.loads(
+            client.aretain_batch.call_args_list[1].kwargs["items"][0]["content"]
+        )
+        assert len(retry_content) == 2
+
+    def test_shutdown_retains_unresolved_remote_operation_with_bounded_result(
+        self, provider_with_config, monkeypatch, caplog
+    ):
+        import logging
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        p = provider_with_config(retain_async=True)
+        client = MagicMock()
+        client.aretain_batch.return_value = SimpleNamespace(
+            operation_id="op-never",
+            operation_ids=None,
+        )
+        client.operations.get_operation_status.return_value = SimpleNamespace(
+            status="pending"
+        )
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+        p.sync_turn("user", "assistant")
+        p._retain_queue.join()
+
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            p.shutdown(settlement_timeout=0.1)
+
+        assert time.monotonic() - started < 0.75
+        assert p._last_drain_ok is False
+        assert p._pending_retain_ops == {"op-never"}
+        assert any(
+            "keeping 1 accepted operation" in record.getMessage()
+            for record in caplog.records
+        )
+
+
+class TestDeliveryLedger:
+    def test_failed_local_append_retries_full_uncommitted_suffix_once(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        p = provider_with_config(retain_async=False)
+        client = MagicMock()
+        client.aretain_batch.side_effect = [RuntimeError("temporary"), None]
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+
+        p.sync_turn("first user", "first assistant")
+        p._retain_queue.join()
+        state = p._active_delivery_state
+        assert state.committed == 0
+        assert state.queued == 0
+
+        p.sync_turn("second user", "second assistant")
+        p._retain_queue.join()
+
+        assert client.aretain_batch.call_count == 2
+        retry_content = json.loads(
+            client.aretain_batch.call_args_list[1].kwargs["items"][0]["content"]
+        )
+        assert len(retry_content) == 2
+        assert state.committed == 2
+        assert state.queued == 2
+
+    def test_completed_active_ledger_is_pruned_then_reowned_for_partial_suffix(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        client = p._client
+
+        p.sync_turn("user 1", "assistant 1")
+        p.sync_turn("user 2", "assistant 2")
+        p._retain_queue.join()
+        completed_state = p._active_delivery_state
+        assert completed_state not in p._delivery_states
+
+        # The same active buffer gains a below-threshold suffix after its
+        # completed ledger was pruned.  Shutdown must re-own and flush it.
+        p.sync_turn("user 3", "assistant 3")
+        p.shutdown(settlement_timeout=1.0)
+
+        assert client.aretain_batch.call_count == 2
+        suffix = json.loads(
+            client.aretain_batch.call_args_list[1].kwargs["items"][0]["content"]
+        )
+        assert len(suffix) == 1
+
+    def test_failed_delivery_exhaustion_is_not_reburned_by_later_drains(
+        self, provider_with_config, monkeypatch
+    ):
+        """A permanently failed suffix keeps explicit unresolved state, but a
+        later flush/shutdown barrier must not start the retry budget over."""
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        p = provider_with_config(retain_async=False)
+        client = MagicMock()
+        client.aretain_batch.side_effect = RuntimeError("permanent")
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+
+        # Initial turn admission fails.  A durability drain then gets one
+        # lifecycle admission plus the two configured automatic retries.
+        p.sync_turn("user", "assistant")
+        p._retain_queue.join()
+        assert p.drain_pending(timeout=1.0) is False
+        exhausted_call_count = client.aretain_batch.call_count
+        assert exhausted_call_count == 4
+
+        # Neither another explicit drain nor shutdown may re-admit the same
+        # failed immutable range after the retry budget has been exhausted.
+        assert p.drain_pending(timeout=0.2) is False
+        p.shutdown(settlement_timeout=0.2)
+        assert client.aretain_batch.call_count == exhausted_call_count
+        assert p._active_delivery_state.failed is True
+        assert p._last_drain_ok is False
+
+    def test_switch_settles_old_remote_range_then_only_remaining_suffix(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        p = provider_with_config(retain_every_n_turns=2, retain_async=True)
+        client = MagicMock()
+        client.aretain_batch.side_effect = [
+            SimpleNamespace(operation_id="op-first", operation_ids=None),
+            SimpleNamespace(operation_id=None, operation_ids=None),
+        ]
+        client.operations.get_operation_status.return_value = SimpleNamespace(
+            status="completed"
+        )
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+
+        p.sync_turn("first user", "first assistant")
+        p.sync_turn("second user", "second assistant")
+        p._retain_queue.join()
+        old_state = p._active_delivery_state
+        p.sync_turn("third user", "third assistant")
+
+        p.on_session_switch(
+            "new-session",
+            parent_session_id="test-session",
+            reset=True,
+        )
+        assert client.aretain_batch.call_count == 1
+        assert old_state.bank_id == "test-bank"
+        assert old_state.document_id == "test-session"
+
+        assert p.drain_pending(timeout=1.0)
+
+        assert client.aretain_batch.call_count == 2
+        first = json.loads(
+            client.aretain_batch.call_args_list[0].kwargs["items"][0]["content"]
+        )
+        remainder = json.loads(
+            client.aretain_batch.call_args_list[1].kwargs["items"][0]["content"]
+        )
+        assert len(first) == 2
+        assert len(remainder) == 1
+        assert old_state.committed == 3
+        assert p._session_id == "new-session"
+
 
 # ---------------------------------------------------------------------------
 # on_session_switch — flush + prefetch reset behavior
@@ -1170,6 +1676,135 @@ class TestSessionSwitchBufferFlush:
 
         assert finished.is_set(), "switch returned before prefetch thread settled"
         assert provider._prefetch_result == ""
+
+    def test_switch_to_root_session_clears_stale_parent(self, provider):
+        provider._parent_session_id = "old-parent"
+
+        provider.on_session_switch("root-session", parent_session_id="")
+
+        assert provider._parent_session_id == ""
+
+    def test_rewind_discards_active_suffix_without_flushing(self, provider_with_config):
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        old_document_id = p._document_id
+        p.sync_turn("removed user 1", "removed assistant 1")
+        p.sync_turn("removed user 2", "removed assistant 2")
+
+        p.on_session_switch("test-session", rewound=True)
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_not_called()
+        assert p._session_id == "test-session"
+        assert p._document_id == old_document_id
+        assert p._session_turns == []
+
+    def test_rewind_invalidates_append_job_blocked_in_writer_queue(
+        self, provider_with_config, monkeypatch
+    ):
+        import threading
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        p = provider_with_config(retain_async=False)
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+
+        def _block_writer():
+            blocker_started.set()
+            release_blocker.wait(timeout=2.0)
+
+        p._ensure_writer()
+        p._retain_queue.put(_block_writer)
+        assert blocker_started.wait(timeout=1.0)
+        p.sync_turn("removed user", "removed assistant")
+        removed_state = p._active_delivery_state
+
+        p.on_session_switch("test-session", rewound=True)
+        release_blocker.set()
+        p._retain_queue.join()
+
+        assert removed_state.invalidated is True
+        p._client.aretain_batch.assert_not_called()
+
+    def test_sync_turn_rejects_mismatched_session_ownership(self, provider):
+        provider.sync_turn(
+            "wrong user",
+            "wrong assistant",
+            session_id="different-session",
+        )
+
+        assert provider._session_turns == []
+        provider._client.aretain_batch.assert_not_called()
+
+    def test_prefetch_completing_after_switch_cannot_publish_or_set_indicator(
+        self, provider
+    ):
+        import threading
+
+        started = threading.Event()
+        release = threading.Event()
+        old_client = SimpleNamespace(
+            arecall=MagicMock(
+                return_value=SimpleNamespace(
+                    results=[SimpleNamespace(text="old-session recall")]
+                )
+            )
+        )
+
+        def _blocked_operation(operation, **_kwargs):
+            started.set()
+            release.wait(timeout=2.0)
+            return operation(old_client)
+
+        provider._prefetch_waits_for_retain = False
+        provider._run_hindsight_operation = _blocked_operation
+        provider.queue_prefetch("old query", session_id="test-session")
+        old_worker = provider._prefetch_thread
+        assert started.wait(timeout=1.0)
+        threading.Timer(0.05, release.set).start()
+
+        provider.on_session_switch("new-session")
+        old_worker.join(timeout=1.0)
+
+        assert provider.prefetch("new query", session_id="new-session") == ""
+        assert provider.recall_status() is None
+
+    def test_newest_same_session_prefetch_wins_and_preserves_count(self, provider):
+        import threading
+
+        older_started = threading.Event()
+        release_older = threading.Event()
+
+        def _recall(**kwargs):
+            if kwargs["query"] == "older":
+                older_started.set()
+                release_older.wait(timeout=2.0)
+                text = "older-result"
+            else:
+                text = "newer-result"
+            return SimpleNamespace(results=[SimpleNamespace(text=text)])
+
+        fake = SimpleNamespace(arecall=_recall)
+        provider._run_hindsight_operation = lambda operation, **_kwargs: operation(fake)
+        provider._prefetch_waits_for_retain = False
+
+        provider.queue_prefetch("older", session_id="test-session")
+        older_worker = provider._prefetch_thread
+        assert older_started.wait(timeout=1.0)
+        provider.queue_prefetch("newer", session_id="test-session")
+        newer_worker = provider._prefetch_thread
+        newer_worker.join(timeout=1.0)
+        release_older.set()
+        older_worker.join(timeout=1.0)
+
+        context = provider.prefetch("next", session_id="test-session")
+        status = provider.recall_status()
+        assert "newer-result" in context
+        assert "older-result" not in context
+        assert status is not None
+        assert status.count == 1
 
     def test_flush_serializes_behind_pending_retains_via_writer_queue(
         self, provider_with_config
@@ -1272,6 +1907,58 @@ class TestUpdateModeAppendCapability:
         item = kw["items"][0]
         assert item["update_mode"] == "append"
 
+    def test_version_probe_returns_metadata_through_credential_safe_opener(
+        self, monkeypatch
+    ):
+        from plugins.memory import hindsight as hindsight_mod
+
+        response = MagicMock()
+        response.read.return_value = json.dumps(
+            {
+                "version": "0.5.6",
+                "features": {"store_document_text": True},
+            }
+        ).encode()
+        response.__enter__.return_value = response
+        captured = {}
+
+        def _open(request, *, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return response
+
+        monkeypatch.setattr(hindsight_mod, "open_credentialed_url", _open)
+
+        metadata = hindsight_mod._fetch_hindsight_api_version(
+            "https://memory.example/api/",
+            "secret-token",
+            timeout=1.25,
+        )
+
+        assert metadata["features"]["store_document_text"] is True
+        assert captured["request"].full_url == "https://memory.example/api/version"
+        assert captured["request"].get_header("Authorization") == "Bearer secret-token"
+        assert captured["timeout"] == 1.25
+
+    def test_modern_api_without_stored_document_text_uses_safe_create(
+        self, provider, monkeypatch
+    ):
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *args, **kwargs: {
+                "version": "0.5.6",
+                "features": {"store_document_text": False},
+            },
+        )
+
+        provider.sync_turn("hello", "hi")
+        provider._retain_queue.join()
+
+        kwargs = provider._client.aretain_batch.call_args.kwargs
+        assert kwargs["document_id"].startswith("test-session-")
+        assert "update_mode" not in kwargs["items"][0]
+
 
     def test_session_switch_flush_picks_capability_against_old_session(
         self, provider_with_config, monkeypatch
@@ -1324,12 +2011,32 @@ class TestConfigSchema:
             "retain_tags", "retain_source",
             "retain_user_prefix", "retain_assistant_prefix",
             "recall_tags", "recall_tags_match",
-            "auto_recall", "auto_retain",
+            "observation_scopes", "observation_scope_exclude_tag_prefixes",
+            "auto_recall", "recall_sync", "recall_indicator",
+            "auto_retain", "expose_retain_tool", "retain_indicator",
             "retain_every_n_turns", "retain_async", "retain_context",
+            "prefetch_waits_for_retain",
             "recall_max_tokens", "recall_max_input_chars",
             "recall_prompt_preamble",
         }
         assert expected_keys.issubset(keys), f"Missing: {expected_keys - keys}"
+
+    def test_declarative_schema_exposes_isolation_and_tool_controls(self):
+        from plugins.memory.config_schema import get_provider_config_schema
+
+        schema = get_provider_config_schema("hindsight")
+        fields = {field.key: field for field in schema.fields}
+
+        assert fields["bank_id_template"].default == ""
+        assert fields["recall_tags"].default == ""
+        assert fields["recall_tags"].env_fallbacks == ("HINDSIGHT_RECALL_TAGS",)
+        assert fields["observation_scope_exclude_tag_prefixes"].default == ""
+        assert fields[
+            "observation_scope_exclude_tag_prefixes"
+        ].env_fallbacks == (
+            "HINDSIGHT_RETAIN_OBSERVATION_SCOPE_EXCLUDE_TAG_PREFIXES",
+        )
+        assert fields["expose_retain_tool"].default is True
 
 
 # ---------------------------------------------------------------------------
@@ -1382,6 +2089,20 @@ class TestBankIdTemplate:
         )
         assert p._bank_id == "hermes-coder"
         assert p._bank_id_template == "hermes-{profile}"
+
+    def test_session_placeholder_and_static_fallback_are_recomputed_on_switch(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            bank_id="fallback-bank",
+            bank_id_template="hermes-{session}",
+        )
+        assert p._bank_id == "hermes-test-session"
+
+        p.on_session_switch("next-session")
+
+        assert p._bank_id == "hermes-next-session"
+        assert p._bank_id_fallback == "fallback-bank"
 
 
 # ---------------------------------------------------------------------------

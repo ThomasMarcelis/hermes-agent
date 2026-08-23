@@ -739,7 +739,7 @@ def _cmd_undo(rid, params, session, name, arg):
         # See #6672 + #21910.
         mm = getattr(agent, "_memory_manager", None)
         for step in (
-            lambda: mm is not None and mm.on_session_switch(
+            lambda: mm is not None and mm.queue_session_switch(
                 session_key, parent_session_id="", reset=False, rewound=True),
             lambda: hasattr(agent, "_invalidate_system_prompt") and agent._invalidate_system_prompt(),
             lambda: hasattr(agent, "_last_flushed_db_idx") and setattr(agent, "_last_flushed_db_idx", len(active)),

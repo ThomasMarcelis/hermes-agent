@@ -1429,7 +1429,7 @@ def _adopt_live_compression_child(
                 bind_state(session_db=session_db, session_id=child_session_id)
     with _swallow('memory manager compression-child adoption failed: %s'):
         if agent._memory_manager:
-            agent._memory_manager.on_session_switch(
+            agent._memory_manager.queue_session_switch(
                 child_session_id, parent_session_id=parent_session_id, reset=False, reason="compression"
             )
     return recovered
@@ -3071,7 +3071,7 @@ def _finish_compaction_boundary(
     # Fires in BOTH modes so buffers don't double-count dropped turns in-place.
     with _swallow('memory manager on_session_switch (compression): %s'):
         if (bool(_old_sid) or in_place) and agent._memory_manager:
-            agent._memory_manager.on_session_switch(
+            agent._memory_manager.queue_session_switch(
                 agent.session_id or "", parent_session_id=_boundary_parent, reset=False, reason="compression"
             )
 

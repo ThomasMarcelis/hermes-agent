@@ -175,6 +175,41 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
+def test_new_without_history_queues_serialized_memory_switch(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    cli.conversation_history = []
+    manager = MagicMock()
+    cli.agent._memory_manager = manager
+
+    cli.process_command("/new")
+
+    manager.queue_session_switch.assert_called_once_with(
+        cli.session_id,
+        parent_session_id=old_session_id,
+        reset=True,
+        reason="new_session",
+    )
+    manager.commit_session_boundary_async.assert_not_called()
+
+
+def test_new_with_history_preserves_combined_boundary_commit(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    manager = MagicMock()
+    cli.agent._memory_manager = manager
+
+    cli.process_command("/new")
+
+    manager.commit_session_boundary_async.assert_called_once_with(
+        [{"role": "user", "content": "hello"}],
+        new_session_id=cli.session_id,
+        parent_session_id=old_session_id,
+        reason="new_session",
+    )
+    manager.queue_session_switch.assert_not_called()
+
+
 
 
 
@@ -295,5 +330,4 @@ def test_new_session_with_title(capsys):
 
     captured = capsys.readouterr()
     assert "My Test Session" in captured.out
-
 

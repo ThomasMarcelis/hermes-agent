@@ -575,7 +575,7 @@ class CLISessionMixin:
             # Tell memory providers the session_id rotated (reset=True flushes per-session
             # state) BEFORE the plugin on_session_reset hook. With old history, end-of-session
             # extraction and this switch are queued as ONE task on the serialized worker —
-            # end strictly before switch, without blocking /new. No history → switch inline.
+            # end strictly before switch, without blocking /new. No history → queue the switch behind prior writes.
             _mm = getattr(self.agent, "_memory_manager", None)
             with contextlib.suppress(Exception):
                 if _mm is not None and _boundary_snapshot:
@@ -583,7 +583,7 @@ class CLISessionMixin:
                         _boundary_snapshot, new_session_id=self.session_id,
                         parent_session_id=old_session_id or "", reason="new_session")
                 elif _mm is not None:
-                    _mm.on_session_switch(
+                    _mm.queue_session_switch(
                         self.session_id, parent_session_id=old_session_id or "",
                         reset=True, reason="new_session")
             self._notify_session_boundary("on_session_reset")
@@ -901,7 +901,7 @@ class CLISessionMixin:
         # See #21910, #6672.
         if _mm is not None and self.session_id:
             with contextlib.suppress(Exception):
-                _mm.on_session_switch(self.session_id, parent_session_id="", reset=False, rewound=True)
+                _mm.queue_session_switch(self.session_id, parent_session_id="", reset=False, rewound=True)
 
         turn_word = "turn" if turns_undone == 1 else "turns"
         print(

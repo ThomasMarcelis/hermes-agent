@@ -126,3 +126,59 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
                        template, exc, fallback)
         return fallback
     return re.sub(r"([-_])\1+", r"\1", rendered).strip("-_") or fallback
+
+
+def _normalize_tag_prefixes(value: Any) -> list[str]:
+    """Normalize comma/JSON/list prefix config into a deduplicated list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            raw_items = parsed if isinstance(parsed, list) else text.split(",")
+        else:
+            raw_items = text.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    prefixes: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        prefix = str(item).strip()
+        if not prefix or prefix in seen:
+            continue
+        seen.add(prefix)
+        prefixes.append(prefix)
+    return prefixes
+
+
+def _derive_observation_scopes(
+    configured_scopes: Any,
+    tags: list[str],
+    excluded_prefixes: list[str],
+) -> Any:
+    """Derive a filtered combined scope unless explicit scope config wins."""
+    if configured_scopes is not None:
+        return configured_scopes
+    if not excluded_prefixes or not tags:
+        return None
+
+    scope: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        if any(tag.startswith(prefix) for prefix in excluded_prefixes):
+            continue
+        if tag not in seen:
+            seen.add(tag)
+            scope.append(tag)
+    # ``[[]]`` is intentional when every merged tag was excluded. Passing
+    # None would delegate to Hindsight's default and reintroduce those tags.
+    return [scope]

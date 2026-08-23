@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
@@ -543,15 +544,56 @@ class MemoryManager:
             self._background_futures.pop(future, None)
 
     def flush_pending(self, timeout: Optional[float] = None) -> bool:
-        """Block until queued sync/prefetch work has drained (False on timeout).
-        With a single worker, a sentinel task completing proves every earlier task ran."""
+        """Block until manager and provider-owned background work has drained.
+
+        Single-worker executor means submitting a sentinel and waiting on
+        it guarantees every previously-submitted manager task has run. Some
+        providers accept work into their own writer/remote-operation queues,
+        so the same deadline is then forwarded to an optional duck-typed
+        ``drain_pending(timeout=remaining)`` hook. Returns False on any
+        timeout/error; one provider cannot silently extend the caller's budget.
+        """
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+
+        def _remaining() -> Optional[float]:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.monotonic())
+
         executor = self._sync_executor
-        if executor is None:
-            return True
-        try:
-            executor.submit(lambda: None).result(timeout=timeout)
-        except Exception as e:
-            return isinstance(e, RuntimeError)  # executor already shut down — nothing pending
+        if executor is not None:
+            try:
+                fut = executor.submit(lambda: None)
+            except RuntimeError:
+                # Executor already shut down — its queue is no longer an
+                # admissible source of work, but provider-owned queues may
+                # still need their durability barrier below.
+                fut = None
+            if fut is not None:
+                try:
+                    fut.result(timeout=_remaining())
+                except Exception as exc:
+                    logger.warning("Memory manager drain timed out or failed: %s", exc)
+                    return False
+
+        for provider in list(self._providers):
+            drain = getattr(provider, "drain_pending", None)
+            if not callable(drain):
+                continue
+            try:
+                if drain(timeout=_remaining()) is False:
+                    logger.warning(
+                        "Memory provider '%s' did not drain pending durable work",
+                        provider.name,
+                    )
+                    return False
+            except Exception as exc:
+                logger.warning(
+                    "Memory provider '%s' drain_pending failed: %s",
+                    provider.name,
+                    exc,
+                )
+                return False
         return True
 
     def get_all_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -633,6 +675,39 @@ class MemoryManager:
                 logger.warning("Session-boundary switch failed: %s", e)
 
         self._submit_background(_run)
+
+    def queue_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Serialize a provider rebind behind all previously queued writes.
+
+        Providers cache session ownership internally. Calling their switch hook
+        inline can therefore overtake an end-of-turn write already admitted to
+        the manager executor and retarget it to the new session. Session-only
+        contextvars are captured by :meth:`_submit_background` at admission.
+        """
+        if not new_session_id or not self._providers:
+            return
+
+        def _run() -> None:
+            switch_kwargs = dict(kwargs)
+            if rewound:
+                switch_kwargs["rewound"] = True
+            self.on_session_switch(
+                new_session_id,
+                parent_session_id=parent_session_id,
+                reset=reset,
+                **switch_kwargs,
+            )
+
+        self._submit_background(_run, kind="write")
+
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
                           rewound: bool = False, **kwargs) -> None:

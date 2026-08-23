@@ -346,7 +346,7 @@ def _sync_agent_to_session(cli, session_id: str, *, parent_session_id: str, reas
         # carries the transcript forward, so provider state tracks the lineage. parent_session_id links the
         # branch back to the original. See #6672.
         if _mm is not None:
-            _mm.on_session_switch(
+            _mm.queue_session_switch(
                 session_id, parent_session_id=parent_session_id or "", reset=False, reason=reason)
 
 
