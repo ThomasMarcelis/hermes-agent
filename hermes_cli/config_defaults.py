@@ -133,6 +133,9 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Timeout for the sync-to-async tool bridge when Hermes is already
+        # running inside an event loop. Long-running tools may raise this.
+        "async_tool_timeout_seconds": 300,
         # Empty-response retry guard (NS-503).  The empty-retry loop
         # re-sends the full conversation input at full price on every
         # attempt; these settings stop it from re-billing *deterministic*
