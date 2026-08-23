@@ -2095,6 +2095,12 @@ DEFAULT_CONFIG = {
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
     "delegation": {
+        # Root-agent completion policy. "join" (default) keeps the parent turn
+        # open until every child in the delegated unit settles, so the model
+        # synthesizes once from all outcomes. "detach" restores coordinator
+        # mode: return immediately and deliver completion in a later turn.
+        # Nested orchestrator children always join.
+        "top_level_completion": "join",
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents

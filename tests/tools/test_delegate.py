@@ -90,6 +90,14 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_shipped_completion_policy_defaults_to_join(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        self.assertEqual(
+            DEFAULT_CONFIG["delegation"]["top_level_completion"],
+            "join",
+        )
+
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
         contract that exists nowhere else in the schema (keyword-level, not
@@ -102,7 +110,6 @@ class TestDelegateRequirements(unittest.TestCase):
         # Contracts only the top-level text carries:
         for keyword in (
             "background",          # async semantics
-            "wait or poll",        # no-poll rule
             "execute_code",        # mechanical-work routing
             "cronjob",             # durable-work routing
             "/stop",               # non-durability warning
@@ -116,6 +123,40 @@ class TestDelegateRequirements(unittest.TestCase):
         # send_message must NOT be named: gateway-internal vocabulary most
         # sessions never see (still enforced via DELEGATE_BLOCKED_TOOLS).
         self.assertNotIn("send_message", desc)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_top_level_description_advertises_joined_default(self, _mock_cfg):
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        self.assertIn("Runs joined", desc)
+        self.assertIn("only after every child reaches a terminal outcome", desc)
+        self.assertIn("one final answer", desc)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"top_level_completion": "detach"},
+    )
+    def test_top_level_description_advertises_explicit_detach(self, _mock_cfg):
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        self.assertIn("Runs detached", desc)
+        self.assertIn("re-enters the conversation", desc)
+        self.assertIn("wait or poll", desc)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"top_level_completion": "typo"},
+    )
+    def test_invalid_completion_policy_fails_closed_to_join(self, _mock_cfg):
+        from tools.delegate_tool import _get_top_level_completion_mode
+
+        with self.assertLogs("tools.delegate_tool", level="WARNING") as captured:
+            mode = _get_top_level_completion_mode()
+
+        self.assertEqual(mode, "join")
+        self.assertIn("is invalid", "\n".join(captured.output))
 
     def test_dynamic_limits_moved_to_param_descriptions(self):
         """Concurrency reaches the model through the tasks parameter
@@ -271,6 +312,42 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("depth limit", result["error"].lower())
 
+    def test_joined_batch_preserves_parallel_fanout(self):
+        """Joining the parent must not serialize independent child workers."""
+        parent = _make_mock_parent(depth=0)
+        rendezvous = threading.Barrier(2)
+        started = []
+        started_lock = threading.Lock()
+
+        def fake_run(*, task_index, **_kwargs):
+            with started_lock:
+                started.append(task_index)
+            rendezvous.wait(timeout=2.0)
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": f"result-{task_index}",
+                "api_calls": 1,
+                "duration_seconds": 0.01,
+                "_child_role": "leaf",
+            }
+
+        with patch("tools.delegate_tool._run_single_child", side_effect=fake_run):
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {"goal": "Investigate worker one"},
+                        {"goal": "Investigate worker two"},
+                    ],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertCountEqual(started, [0, 1])
+        self.assertEqual(
+            [entry["status"] for entry in result["results"]],
+            ["completed", "completed"],
+        )
 
     def test_child_inherits_runtime_credentials(self):
         parent = _make_mock_parent(depth=0)
@@ -1517,10 +1594,11 @@ class TestDelegateHeartbeat(unittest.TestCase):
         """A slow in-flight model wait (api_call_count frozen, no tool) must
         stay alive when last_activity_ts keeps advancing.
 
-        Top-level delegate_task runs in the background; the async stall
-        monitor already treats ticking last_activity_ts as progress. The sync
-        heartbeat path must use the same signal so slow local / long-prefill
-        completions are not mistaken for a wedged idle child.
+        The detached-path stall monitor already treats ticking
+        last_activity_ts as progress. Joined top-level calls and nested
+        orchestrators use the sync heartbeat path, which must use the same
+        signal so slow local / long-prefill completions are not mistaken for a
+        wedged idle child.
         """
         from tools.delegate_tool import _run_single_child
 
@@ -1654,6 +1732,102 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_top_level_model_delegation_joins_by_default(self, _mock_cfg):
+        """The root turn must receive child results before it can finalize."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(parent, {"goal": "test"})
+
+        self.assertFalse(captured["background"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_top_level_dispatch_does_not_return_before_joined_result(self, _mock_cfg):
+        """The model cannot reach a provisional final while its child is live."""
+        import run_agent
+
+        started = threading.Event()
+        release = threading.Event()
+        returned = threading.Event()
+        outcome = {}
+
+        def fake_delegate_task(**kwargs):
+            if kwargs["background"]:
+                return '{"status":"dispatched"}'
+            started.set()
+            release.wait(timeout=2.0)
+            return '{"results":[{"status":"completed"}]}'
+
+        def dispatch():
+            outcome["value"] = run_agent.AIAgent._dispatch_delegate_task(
+                _make_mock_parent(depth=0),
+                {"goal": "test"},
+            )
+            returned.set()
+
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            worker = threading.Thread(target=dispatch)
+            worker.start()
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertFalse(returned.is_set())
+            release.set()
+            worker.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(
+            outcome["value"],
+            '{"results":[{"status":"completed"}]}',
+        )
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"top_level_completion": "detach"},
+    )
+    def test_top_level_model_delegation_can_explicitly_detach(self, _mock_cfg):
+        """Coordinator-style fire-and-forget remains an explicit config opt-out."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(parent, {"goal": "test"})
+
+        self.assertTrue(captured["background"])
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"top_level_completion": "detach"},
+    )
+    def test_nested_orchestrator_still_joins_in_detach_mode(self, _mock_cfg):
+        """A child has no gateway-owned continuation route for detached results."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=1)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(parent, {"goal": "test"})
+
+        self.assertFalse(captured["background"])
+
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""

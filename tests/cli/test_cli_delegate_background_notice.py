@@ -1,9 +1,10 @@
-"""The CLI spells out auto-resume when a delegate_task goes to the background.
+"""The CLI spells out auto-resume when delegate_task explicitly detaches.
 
-A top-level ``delegate_task`` returns a handle immediately and runs the subagent
-in the background; the result re-enters the conversation as a fresh turn when it
-finishes. ``_on_tool_complete`` prints a one-line, no-spinner reassurance at
-dispatch so the idle prompt doesn't read as "nothing happened".
+With ``delegation.top_level_completion: detach``, a top-level ``delegate_task``
+returns a handle immediately and runs the subagent in the background; the result
+re-enters the conversation as a fresh turn when it finishes. ``_on_tool_complete``
+prints a one-line, no-spinner reassurance at dispatch so the idle prompt does not
+read as "nothing happened". Joined results do not emit this notice.
 """
 
 import json

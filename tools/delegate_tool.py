@@ -941,6 +941,34 @@ def _get_max_concurrent_children() -> int:
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
 
 
+_TOP_LEVEL_COMPLETION_JOIN = "join"
+_TOP_LEVEL_COMPLETION_DETACH = "detach"
+
+
+def _get_top_level_completion_mode() -> str:
+    """Return the root-agent delegation completion policy.
+
+    ``join`` is deliberately the safe default: the model-facing tool call does
+    not return until the child or parallel batch settles, so the root model has
+    every result before it can produce its final answer.  ``detach`` preserves
+    the coordinator-style background behavior where completion re-enters as a
+    later synthetic turn.
+
+    Nested orchestrator children always join regardless of this setting; they
+    do not own the gateway route needed for detached completion delivery.
+    """
+    value = _load_config().get("top_level_completion", _TOP_LEVEL_COMPLETION_JOIN)
+    normalized = str(value or _TOP_LEVEL_COMPLETION_JOIN).strip().lower()
+    if normalized in {_TOP_LEVEL_COMPLETION_JOIN, _TOP_LEVEL_COMPLETION_DETACH}:
+        return normalized
+    logger.warning(
+        "delegation.top_level_completion=%r is invalid; using %r",
+        value,
+        _TOP_LEVEL_COMPLETION_JOIN,
+    )
+    return _TOP_LEVEL_COMPLETION_JOIN
+
+
 def _get_worktree_isolation() -> bool:
     """Read delegation.worktree_isolation from config (bool, default False).
 
@@ -4993,17 +5021,40 @@ def _build_top_level_description() -> str:
             "cronjob.\n"
         )
 
+    if _get_top_level_completion_mode() == _TOP_LEVEL_COMPLETION_DETACH:
+        completion_contract = (
+            "Runs detached: dispatch returns immediately with live transcript "
+            "paths, and the completed result (one consolidated message for a "
+            "batch) re-enters the conversation on its own. Continue other work; "
+            "do not wait or poll."
+        )
+        control_contract = (
+            "LIVE ORCHESTRATION: while children run, this tool also controls "
+            "them — action='list' (live children + ids), action='steer' "
+            "(subagent_id + message, redirect without stopping), action='stop' "
+            "(subagent_id, end early; partial result still returns). Steer when "
+            "a live transcript shows a child drifting."
+        )
+    else:
+        completion_contract = (
+            "Runs joined: children in a batch still execute in parallel, but "
+            "this tool call returns only after every child reaches a terminal "
+            "outcome. Use the result to produce one final answer; "
+            "do not answer before the tool returns."
+        )
+        control_contract = (
+            "CONTROL: action='list', 'steer', or 'stop' manages an already-"
+            "running detached child. A joined spawn occupies this call until "
+            "its cohort settles; user/session interrupts remain responsive."
+        )
+
     return (
         "Spawn subagents in isolated contexts; each gets its own conversation, "
         "terminal session, and toolset, and only its final summary returns to "
         "you. Pass every task in `tasks` — one entry spawns one subagent, "
         "several run in parallel (limit in the tasks description).\n\n"
-        "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message, "
-        "results in task order) re-enters the conversation on its own. Do NOT "
-        "wait or poll; continue other work. While children run, `action` "
-        "(list/steer/stop) controls them live — steer when a transcript shows "
-        "a child drifting.\n\n"
+        f"{completion_contract}\n\n"
+        f"{control_contract}\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -5155,9 +5206,10 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             # NOTE: the handler also accepts `background` (bool) — DEPRECATED,
-            # ignored: top-level delegations always run in the background.
-            # Deliberately unadvertised (old transcripts/callers only); do not
-            # re-add to the schema.
+            # ignored: the root lifecycle is governed by
+            # delegation.top_level_completion (join | detach), never by the
+            # model. Deliberately unadvertised (old transcripts/callers only);
+            # do not re-add to the schema.
             "action": {
                 "type": "string",
                 "enum": ["spawn", "list", "steer", "stop"],
@@ -5199,18 +5251,20 @@ from tools.registry import registry, tool_error
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback).
 
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (the whole batch is one async unit that joins on all children and
-    returns one consolidated result). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
+    The model does not choose. Root calls follow
+    ``delegation.top_level_completion`` (``join`` by default; ``detach`` is the
+    explicit coordinator-style opt-out). A delegation from an orchestrator
+    subagent (depth > 0) always joins because it needs its workers' results
+    within its own turn. The live path is
     ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
     case the intercept is bypassed. Direct Python callers of ``delegate_task``
     keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    return (
+        not is_subagent
+        and _get_top_level_completion_mode() == _TOP_LEVEL_COMPLETION_DETACH
+    )
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

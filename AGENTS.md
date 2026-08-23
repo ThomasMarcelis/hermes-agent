@@ -1121,10 +1121,13 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
 ## Delegation (`delegate_task`)
 
 `tools/delegate_tool.py` spawns a subagent with an isolated
-context + terminal session. By default the parent waits for the
-child's summary before continuing its own loop. With `background=true`,
-Hermes returns a delegation id immediately and the result re-enters the
-conversation later through the async-delegation completion queue.
+context + terminal session. Model-facing root calls follow
+`delegation.top_level_completion`: `join` (default) keeps the tool call open
+until every child outcome is available to the parent for one synthesis;
+`detach` returns a delegation id immediately and routes the consolidated
+result through the async-completion queue as a later turn. Nested orchestrator
+children always join. The schema-level `background` argument is deprecated and
+ignored; lifecycle policy is configuration-owned.
 
 Two shapes:
 
@@ -1143,11 +1146,11 @@ Roles:
   and bounded by `delegation.max_spawn_depth` (default 2).
 
 Key config knobs (under `delegation:` in `config.yaml`):
-`max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
+`top_level_completion`, `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
 `orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
 `max_iterations`.
 
-Durability rule: background `delegate_task` is detached from the current
+Durability rule: `top_level_completion: detach` is detached from the current
 turn but still process-local. For work that must survive process restart, use
 `cronjob` or `terminal(background=True, notify_on_complete=True)` instead.
 
