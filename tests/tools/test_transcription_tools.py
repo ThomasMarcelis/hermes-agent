@@ -948,6 +948,30 @@ class TestTranscribeElevenLabs:
 
 
 class TestElevenLabsKeyterms:
+    def test_scribe_v1_omits_false_no_verbatim(self):
+        from tools.transcription_cloud import _build_elevenlabs_scribe_form
+
+        form = _build_elevenlabs_scribe_form(
+            "scribe_v1",
+            {"no_verbatim": False, "keyterms": []},
+        )
+
+        assert "no_verbatim" not in dict(form)
+        assert not [value for name, value in form if name == "keyterms"]
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"no_verbatim": True},
+            {"keyterms": ["Hermes"]},
+        ],
+    )
+    def test_scribe_v1_rejects_v2_only_fields(self, config):
+        from tools.transcription_cloud import _build_elevenlabs_scribe_form
+
+        with pytest.raises(ValueError, match="require the scribe_v2 model"):
+            _build_elevenlabs_scribe_form("scribe_v1", config)
+
     def test_normalize_dedupes_case_insensitively_and_preserves_order(self):
         from tools.transcription_cloud import _normalize_elevenlabs_keyterms
 

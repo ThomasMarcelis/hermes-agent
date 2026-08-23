@@ -414,13 +414,19 @@ def _build_elevenlabs_scribe_form(
         if value not in (None, ""):
             form.append((name, str(value)))
 
-    if "no_verbatim" in elevenlabs_config:
+    is_scribe_v2 = model_name.strip().lower() == "scribe_v2"
+    no_verbatim = is_truthy_value(elevenlabs_config.get("no_verbatim", False))
+    keyterms = _load_elevenlabs_keyterms(elevenlabs_config)
+    if not is_scribe_v2 and (no_verbatim or keyterms):
+        raise ValueError(
+            "ElevenLabs no_verbatim and keyterms require the scribe_v2 model"
+        )
+
+    if is_scribe_v2 and "no_verbatim" in elevenlabs_config:
         form.append(
             (
                 "no_verbatim",
-                "true"
-                if is_truthy_value(elevenlabs_config.get("no_verbatim"))
-                else "false",
+                "true" if no_verbatim else "false",
             )
         )
 
@@ -428,7 +434,7 @@ def _build_elevenlabs_scribe_form(
     if num_speakers not in (None, ""):
         form.append(("num_speakers", str(int(num_speakers))))
 
-    for keyterm in _load_elevenlabs_keyterms(elevenlabs_config):
+    for keyterm in keyterms:
         form.append(("keyterms", keyterm))
     return form
 
