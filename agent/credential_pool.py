@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 
+import hmac
 import logging
 import os
 import random
@@ -19,6 +20,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
 from agent.secret_scope import get_secret as _get_secret
+from hermes_cli.auth_pool_selection import select_and_increment_credential_pool_entry
 from agent.credential_persistence import (
     fingerprint_secret_value,
     is_borrowed_credential_source,
@@ -1024,6 +1026,20 @@ class CredentialPool(CredentialPoolAdminMixin):
 
     # ---- mutation primitives (self-locking) --------------------------------
 
+    def runtime_api_key_matches(self, entry_id: str, api_key: str) -> Optional[bool]:
+        """Compare a selected id's current token without returning the token."""
+        normalized_id = str(entry_id or "").strip()
+        if not normalized_id:
+            return None
+        with self._lock:
+            entry = self._find(lambda candidate: candidate.id == normalized_id)
+            if entry is None:
+                return None
+            return hmac.compare_digest(
+                str(entry.runtime_api_key or "").encode("utf-8"),
+                str(api_key or "").encode("utf-8"),
+            )
+
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
         """Swap an entry in-place by id, preserving sort order.
 
@@ -1043,14 +1059,16 @@ class CredentialPool(CredentialPoolAdminMixin):
         removed_ids: Optional[List[str]] = None,
         status_cleared_ids: Optional[List[str]] = None,
     ) -> None:
-        # Self-locking: snapshotting self._entries must not race a rotation.
+        # Snapshot under the process-local pool lock, then release it before the
+        # auth-store transaction. OAuth refresh uses auth-store -> pool ordering.
         with self._lock:
-            persist_pool_entries(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=removed_ids,
-                status_cleared_ids=status_cleared_ids,
-            )
+            payloads = [entry.to_dict() for entry in self._entries]
+        persist_pool_entries(
+            self.provider,
+            payloads,
+            removed_ids=removed_ids,
+            status_cleared_ids=status_cleared_ids,
+        )
 
     def _adopt(self, entry: PooledCredential, *, persist: bool = True, **updates: Any) -> PooledCredential:
         """``replace(entry, **updates)``, swap it into the pool, optionally persist."""
@@ -1781,15 +1799,60 @@ class CredentialPool(CredentialPoolAdminMixin):
     # ---- selection ---------------------------------------------------------
 
     def select(self) -> Optional[PooledCredential]:
+        if self._strategy == STRATEGY_LEAST_USED:
+            return self._select_least_used()
         entry, pending_refresh = self._select_under_lock()
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
-            # Re-select now that the refreshed entries are back in the pool.
             if entry is None:
                 entry, _ = self._select_under_lock()
         if entry is not None:
             self._unmatched_rotation_streak = 0
         return entry
+
+    def _select_least_used(self) -> Optional[PooledCredential]:
+        """Choose and count against current durable state without lock inversion."""
+        # Availability and deferred refresh may enter the auth store; this path
+        # intentionally does not hold self._lock across either operation.
+        available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
+        candidates = list(available)
+        if pending_refresh:
+            self._refresh_pending_entries(pending_refresh)
+        if not candidates and pending_refresh:
+            candidates, _ = self._available_entries(clear_expired=True, refresh=False)
+        if not candidates:
+            with self._lock:
+                self._current_id = None
+                self._log_no_available_entries()
+            return None
+
+        persisted = select_and_increment_credential_pool_entry(
+            self.provider, [entry.to_dict() for entry in candidates],
+        )
+        if persisted is None:
+            with self._lock:
+                self._current_id = None
+                self._log_no_available_entries()
+            return None
+
+        selected_id = str(persisted.get("id") or "")
+        runtime_entry = next((entry for entry in candidates if entry.id == selected_id), None)
+        updated = PooledCredential.from_dict(self.provider, persisted)
+        if runtime_entry is not None and is_borrowed_credential_source(runtime_entry.source, self.provider):
+            updated = replace(
+                updated,
+                access_token=runtime_entry.access_token,
+                refresh_token=runtime_entry.refresh_token,
+                agent_key=runtime_entry.agent_key,
+            )
+        with self._lock:
+            current = self._find(lambda entry: entry.id == selected_id)
+            if current is not None:
+                self._replace_entry(current, updated)
+            self._current_id = selected_id
+            self._last_no_entries_log_at = None
+            self._unmatched_rotation_streak = 0
+        return updated
 
     def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         with self._lock:
@@ -1837,8 +1900,13 @@ class CredentialPool(CredentialPoolAdminMixin):
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
         pending_refresh: List[PooledCredential] = []
-        sole_credential = self._is_sole_credential()
-        for entry in self._entries:
+        # Least-used selection must release the pool lock before credential
+        # resync/refresh enters the auth store. Snapshot membership under the
+        # lock; mutation helpers below reconcile by id under that same lock.
+        with self._lock:
+            sole_credential = self._is_sole_credential()
+            entries = list(self._entries)
+        for entry in entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load; never lease an
             # unhydrated duplicate as an empty key.
@@ -1896,7 +1964,8 @@ class CredentialPool(CredentialPoolAdminMixin):
             available.append(entry)
         if entries_to_prune:
             pruned_ids = set(entries_to_prune)
-            self._entries = [e for e in self._entries if e.id not in pruned_ids]
+            with self._lock:
+                self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
             self._persist(removed_ids=entries_to_prune)
         return available, pending_refresh

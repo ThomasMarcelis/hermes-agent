@@ -35,6 +35,7 @@ from agent.auxiliary_client import (
     _resolve_auto_route,
     _resolve_task_provider_model,
     _resolve_xai_oauth_for_aux,
+    _recover_provider_pool,
     _CodexCompletionsAdapter,
     _pool_runtime_base_url,
 )
@@ -778,6 +779,115 @@ class TestBuildCodexClient:
         assert second_model == "gpt-5.4"
         assert mock_openai.call_count == 2
 
+
+    def test_cached_codex_client_rebuilds_when_same_entry_token_refreshes(self):
+        import agent.auxiliary_client as aux
+
+        class _Entry:
+            id = "cred-a"
+            label = "cred-a"
+            runtime_base_url = "https://chatgpt.com/backend-api/codex"
+
+            def __init__(self, token):
+                self.runtime_api_key = token
+
+        class _Pool:
+            def __init__(self):
+                self.entry = _Entry("tok-a")
+
+            def has_credentials(self):
+                return True
+
+            def select(self):
+                return self.entry
+
+            def runtime_api_key_matches(self, entry_id, token):
+                return entry_id == self.entry.id and token == self.entry.runtime_api_key
+
+        pool = _Pool()
+        with (
+            patch("agent.auxiliary_client.load_pool", return_value=pool),
+            patch(
+                "agent.auxiliary_client.OpenAI",
+                side_effect=[MagicMock(name="client-a"), MagicMock(name="client-b")],
+            ) as mock_openai,
+        ):
+            aux.shutdown_cached_clients()
+            try:
+                first, _ = aux._get_cached_client("openai-codex", "gpt-5.4")
+                pool.entry = _Entry("tok-b")
+                second, _ = aux._get_cached_client("openai-codex", "gpt-5.4")
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert first is not second
+        assert [call.kwargs["api_key"] for call in mock_openai.call_args_list] == [
+            "tok-a", "tok-b",
+        ]
+
+    def test_cache_and_resolver_share_one_selected_pool_entry(self):
+        """A peek hint must never be paired with another entry's key/URL."""
+        import agent.auxiliary_client as aux
+
+        class _Entry:
+            provider = "openrouter"
+
+            def __init__(self, entry_id, token, base_url):
+                self.id = entry_id
+                self.label = entry_id
+                self.runtime_api_key = token
+                self.runtime_base_url = base_url
+
+        entry_a = _Entry("cred-a", "token-a", "https://endpoint-a.example/v1")
+        entry_b = _Entry("cred-b", "token-b", "https://endpoint-b.example/v1")
+
+        class _Pool:
+            def __init__(self):
+                self.select_calls = 0
+
+            def has_credentials(self):
+                return True
+
+            def peek(self):
+                raise AssertionError("cache identity must not peek independently")
+
+            def current(self):
+                return entry_a
+
+            def select(self):
+                self.select_calls += 1
+                return entry_b
+
+        pool = _Pool()
+
+        def _client_for_kwargs(**kwargs):
+            return SimpleNamespace(
+                api_key=kwargs["api_key"],
+                base_url=kwargs["base_url"],
+                close=MagicMock(),
+            )
+
+        with (
+            patch("agent.auxiliary_client.load_pool", return_value=pool),
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                side_effect=_client_for_kwargs,
+            ),
+        ):
+            aux.shutdown_cached_clients()
+            try:
+                client, _ = aux._get_cached_client("openrouter", "test/model")
+                cache_key = next(
+                    key for key in aux._client_cache if key[0] == "openrouter"
+                )
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert pool.select_calls == 1
+        assert client.api_key == "token-b"
+        assert str(client.base_url) == "https://endpoint-b.example/v1"
+        assert client._hermes_pool_entry_id == "cred-b"
+        assert cache_key[8].startswith("openrouter:cred-b:")
 
 class TestResolveProviderClientUniversalModelFallback:
     """resolve_provider_client() picks a sensible model when callers pass none (#31845).
@@ -2875,6 +2985,185 @@ class TestAuxiliaryPoolRotationRetry:
         mock_fallback.assert_not_called()
 
 
+
+    @staticmethod
+    def _failed_client(api_key, entry_id, create):
+        return SimpleNamespace(
+            api_key=api_key,
+            base_url="https://chatgpt.com/backend-api/codex",
+            _hermes_pool_entry_id=entry_id,
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+
+    def test_recovery_marks_cached_codex_entry_by_id(self):
+        rate_err = Exception("usage limit reached")
+        rate_err.status_code = 429
+
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        pool.runtime_api_key_matches.return_value = True
+        pool.mark_exhausted_and_rotate.return_value = SimpleNamespace(id="cred-a")
+
+        with (
+            patch("agent.auxiliary_client.load_pool", return_value=pool),
+            patch("agent.auxiliary_client._evict_cached_clients"),
+        ):
+            assert _recover_provider_pool(
+                "openai-codex",
+                rate_err,
+                failed_api_key="cached-token",
+                failed_entry_id="cred-b",
+            ) is True
+
+        pool.mark_exhausted_and_rotate.assert_called_once()
+        assert pool.mark_exhausted_and_rotate.call_args.kwargs["credential_id"] == "cred-b"
+
+    def test_recovery_retries_refreshed_same_entry_without_exhausting_it(self):
+        auth_err = Exception("expired cached token")
+        auth_err.status_code = 401
+
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        pool.runtime_api_key_matches.return_value = False
+
+        with (
+            patch("agent.auxiliary_client.load_pool", return_value=pool),
+            patch("agent.auxiliary_client._evict_cached_clients") as evict,
+        ):
+            assert _recover_provider_pool(
+                "openai-codex",
+                auth_err,
+                failed_api_key="stale-token",
+                failed_entry_id="cred-a",
+            ) is True
+
+        evict.assert_called_once_with("openai-codex")
+        pool.mark_exhausted_and_rotate.assert_not_called()
+
+    def test_auth_refresh_retries_new_revision_without_refreshing_again(self):
+        from agent import auxiliary_client as aux
+
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        pool.runtime_api_key_matches.return_value = False
+
+        with (
+            patch("agent.auxiliary_client.load_pool", return_value=pool),
+            patch("agent.auxiliary_client._evict_cached_clients") as evict,
+        ):
+            assert aux._refresh_provider_credentials(
+                "openai-codex",
+                failed_api_key="stale-token",
+                failed_entry_id="cred-a",
+            ) is True
+
+        evict.assert_called_once_with("openai-codex")
+        pool.try_refresh_matching.assert_not_called()
+
+    def test_every_sync_recovery_attempt_keeps_failed_credential_identity(self):
+        first_error = Exception("rate limit reached")
+        first_error.status_code = 429
+        second_error = Exception("rate limit reached")
+        second_error.status_code = 429
+        stale_create = MagicMock(side_effect=[first_error, first_error])
+        rotated_create = MagicMock(side_effect=second_error)
+        stale_client = self._failed_client("token-a", "cred-a", stale_create)
+        rotated_client = self._failed_client("token-b", "cred-b", rotated_create)
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openai-codex", "gpt-5.4", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                side_effect=[
+                    (stale_client, "gpt-5.4"),
+                    (rotated_client, "gpt-5.4"),
+                ],
+            ),
+            patch(
+                "agent.auxiliary_client._refresh_provider_credentials",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._recover_provider_pool",
+                side_effect=[True, False],
+            ) as recover,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(None, None, ""),
+            ),
+            pytest.raises(Exception, match="rate limit reached"),
+        ):
+            call_llm(
+                task="compression",
+                provider="openai-codex",
+                model="gpt-5.4",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert [call.kwargs for call in recover.call_args_list] == [
+            {"failed_api_key": "token-a", "failed_entry_id": "cred-a"},
+            {"failed_api_key": "token-b", "failed_entry_id": "cred-b"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_every_async_recovery_attempt_keeps_failed_credential_identity(self):
+        first_error = Exception("rate limit reached")
+        first_error.status_code = 429
+        second_error = Exception("rate limit reached")
+        second_error.status_code = 429
+        stale_create = AsyncMock(side_effect=[first_error, first_error])
+        rotated_create = AsyncMock(side_effect=second_error)
+        stale_client = self._failed_client("token-a", "cred-a", stale_create)
+        rotated_client = self._failed_client("token-b", "cred-b", rotated_create)
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openai-codex", "gpt-5.4", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                side_effect=[
+                    (stale_client, "gpt-5.4"),
+                    (rotated_client, "gpt-5.4"),
+                ],
+            ),
+            patch(
+                "agent.auxiliary_client._refresh_provider_credentials",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._recover_provider_pool",
+                side_effect=[True, False],
+            ) as recover,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(None, None, ""),
+            ),
+            pytest.raises(Exception, match="rate limit reached"),
+        ):
+            await async_call_llm(
+                task="compression",
+                provider="openai-codex",
+                model="gpt-5.4",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert [call.kwargs for call in recover.call_args_list] == [
+            {"failed_api_key": "token-a", "failed_entry_id": "cred-a"},
+            {"failed_api_key": "token-b", "failed_entry_id": "cred-b"},
+        ]
 
 class TestAnthropicAuxiliaryReasoningTranslation:
     """Native Anthropic aux adapters must receive normalized Hermes reasoning.
