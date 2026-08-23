@@ -17,7 +17,12 @@ def test_hindsight_is_declared():
         "api_key",
         "api_url",
         "bank_id",
+        "bank_id_template",
         "recall_budget",
+        "recall_tags",
+        "observation_scopes",
+        "observation_scope_exclude_tag_prefixes",
+        "expose_retain_tool",
     }
 
 
