@@ -10530,7 +10530,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # (LLM-bound, seconds) and this switch are queued as ONE task on
             # the memory manager's serialized worker — end strictly before
             # switch, without blocking /new (#16454). With no history there
-            # is nothing to extract; switch inline as before.
+            # is nothing to extract; only the switch is queued.
             try:
                 _mm = getattr(self.agent, "_memory_manager", None)
                 if _mm is not None:
@@ -10542,7 +10542,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             reason="new_session",
                         )
                     else:
-                        _mm.on_session_switch(
+                        _mm.queue_session_switch(
                             self.session_id,
                             parent_session_id=old_session_id or "",
                             reset=True,
@@ -10996,7 +10996,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             try:
                 _mm = getattr(self.agent, "_memory_manager", None)
                 if _mm is not None and self.session_id:
-                    _mm.on_session_switch(
+                    _mm.queue_session_switch(
                         self.session_id,
                         parent_session_id="",
                         reset=False,

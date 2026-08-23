@@ -1255,7 +1255,7 @@ class CLICommandsMixin:
             try:
                 _mm = getattr(self.agent, "_memory_manager", None)
                 if _mm is not None:
-                    _mm.on_session_switch(
+                    _mm.queue_session_switch(
                         target_id,
                         parent_session_id=old_session_id or "",
                         reset=False,
@@ -1613,7 +1613,7 @@ class CLICommandsMixin:
             try:
                 _mm = getattr(self.agent, "_memory_manager", None)
                 if _mm is not None:
-                    _mm.on_session_switch(
+                    _mm.queue_session_switch(
                         new_session_id,
                         parent_session_id=parent_session_id or "",
                         reset=False,

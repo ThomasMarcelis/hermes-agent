@@ -1000,7 +1000,7 @@ def _(rid, params: dict) -> dict:
             mm = getattr(agent, "_memory_manager", None)
             if mm is not None:
                 try:
-                    mm.on_session_switch(
+                    mm.queue_session_switch(
                         session_key,
                         parent_session_id="",
                         reset=False,
