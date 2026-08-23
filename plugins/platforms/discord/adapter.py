@@ -2435,17 +2435,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
             self._record_command_sync_attempt(app_id, fingerprint)
 
-            http = getattr(self._client, "http", None)
-            has_ratelimit_timeout = http is not None and hasattr(http, "max_ratelimit_timeout")
-            previous_ratelimit_timeout = getattr(http, "max_ratelimit_timeout", None) if has_ratelimit_timeout else None
-            if has_ratelimit_timeout:
-                http.max_ratelimit_timeout = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
-
             try:
                 # Discord's per-app command-management bucket is small, and
-                # discord.py can otherwise sit inside one long retry sleep
-                # before surfacing the 429. Keep the whole sync bounded and
-                # persist Discord's retry-after when it refuses the batch.
+                # discord.py may sit inside a long retry sleep. Keep the whole
+                # sync bounded without mutating HTTPClient.max_ratelimit_timeout:
+                # that client is shared with live messages, so changing its
+                # global policy here can make unrelated thread creation raise
+                # RateLimited while command reconciliation is still running.
                 summary = await asyncio.wait_for(self._safe_sync_slash_commands(), timeout=600)
             except Exception as e:
                 if not self._is_discord_rate_limit(e):
@@ -2462,10 +2458,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     retry_after,
                 )
                 return
-            finally:
-                if has_ratelimit_timeout:
-                    http.max_ratelimit_timeout = previous_ratelimit_timeout
-
             self._record_command_sync_success(app_id, fingerprint, summary)
             logger.info(
                 "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
@@ -7292,19 +7284,16 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
-        Returns the created thread object, or ``None`` on failure. Both the
-        primary ``message.create_thread`` and the seed-message fallback are
-        retried once after a short backoff so transient connect errors
-        (e.g. ``Cannot connect to host discord.com:443``) don't immediately
-        burn through to the caller's failure path (#20243).
+        Returns the created thread object, or ``None`` on failure. Retry the
+        side-effect-free direct path before posting a single fallback seed.
+        Discord rate limits are waited out on the direct path rather than
+        branching into a fallback that shares the same thread-create bucket.
         """
         thread_name = self._derive_auto_thread_name(message.content or "")
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
         reason = f"Auto-threaded from mention by {display_name}"
 
         last_direct_error: Exception | None = None
-        last_fallback_error: Exception | None = None
-
         for attempt in range(2):
             try:
                 thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
@@ -7315,36 +7304,73 @@ class DiscordAdapter(BasePlatformAdapter):
                 return thread
             except Exception as direct_error:
                 last_direct_error = direct_error
-                try:
-                    seed_msg = await message.channel.send(
-                        f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
-                    )
-                    thread = await seed_msg.create_thread(
-                        name=thread_name,
-                        auto_archive_duration=1440,
-                        reason=reason,
-                    )
-                    try:
-                        setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
-                    except Exception:
-                        pass
-                    return thread
-                except Exception as fallback_error:
-                    last_fallback_error = fallback_error
-                    if attempt == 0:
-                        # Brief backoff before the second attempt — most failures
-                        # in this path are transient connect errors that recover
-                        # within a second or two.
+                if attempt == 0:
+                    if self._is_discord_rate_limit(direct_error):
+                        retry_after = self._extract_discord_retry_after(direct_error)
+                        if retry_after is None:
+                            logger.warning(
+                                "[%s] Discord rate-limited auto-thread creation without retry-after: %s",
+                                self.name,
+                                direct_error,
+                            )
+                            return None
+                        logger.info(
+                            "[%s] Discord rate-limited auto-thread creation; retrying direct path after %.2fs",
+                            self.name,
+                            retry_after,
+                        )
+                        await asyncio.sleep(retry_after)
+                    else:
+                        # Give short-lived connect failures one side-effect-free
+                        # retry before resorting to the seed-message fallback.
                         await asyncio.sleep(0.75)
-                        continue
+                    continue
 
-        logger.warning(
-            "[%s] Auto-thread creation failed after retry. Direct error: %s. Fallback error: %s",
-            self.name,
-            last_direct_error,
-            last_fallback_error,
-        )
-        return None
+                # A second rate-limit means the bucket still is not available.
+                # The seed fallback uses that same bucket, so it cannot help and
+                # would only leave a misleading parent-channel message.
+                if self._is_discord_rate_limit(direct_error):
+                    logger.warning(
+                        "[%s] Discord auto-thread creation remained rate-limited after retry: %s",
+                        self.name,
+                        direct_error,
+                    )
+                    return None
+
+        seed_msg = None
+        try:
+            seed_msg = await message.channel.send(
+                f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
+            )
+            thread = await seed_msg.create_thread(
+                name=thread_name,
+                auto_archive_duration=1440,
+                reason=reason,
+            )
+            try:
+                setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
+            except Exception:
+                pass
+            return thread
+        except Exception as fallback_error:
+            if seed_msg is not None:
+                try:
+                    await seed_msg.delete()
+                except Exception as cleanup_error:
+                    logger.debug(
+                        "[%s] Could not delete orphaned auto-thread seed message: %s",
+                        self.name,
+                        cleanup_error,
+                    )
+
+            logger.warning(
+                "[%s] Auto-thread creation failed after direct retry and one fallback. "
+                "Direct error: %s. Fallback error: %s",
+                self.name,
+                last_direct_error,
+                fallback_error,
+            )
+            return None
 
     async def rename_thread(
         self,
