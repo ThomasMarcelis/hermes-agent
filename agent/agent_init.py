@@ -1223,6 +1223,7 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     gateway status travels a different path and the indicator no-ops without it)."""
     kwargs = {
         "session_id": agent.session_id,
+        "parent_session_id": agent._parent_session_id or "",
         "platform": platform or "cli",
         "hermes_home": str(get_hermes_home()),
         # platform="cron" (scheduler) / "subagent" (delegate_task) → providers skip writes (MemoryProvider.initialize).
