@@ -1789,6 +1789,130 @@ def write_credential_pool(
         return _save_auth_store(auth_store)
 
 
+def select_and_increment_credential_pool_entry(
+    provider_id: str,
+    candidate_entries: Iterable[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Atomically choose and count one durable least-used credential.
+
+    ``CredentialPool`` objects are process-local snapshots.  The candidate
+    list therefore supplies identities and deterministic tie-break order only;
+    while holding the auth-store lock this function re-reads every candidate's
+    current row, rejects rows that became exhausted/dead, chooses the current
+    durable minimum, and increments only that row's ``request_count``.
+
+    Existing rows are copied from disk rather than from the caller so a stale
+    pool cannot overwrite a token refresh or newer metadata.  A missing row
+    (for example one read through global-root fallback) is seeded only if it is
+    selected, preserving profile shadowing.  ``None`` means every candidate
+    became unavailable before the transaction acquired the lock.
+    """
+    candidates: List[Dict[str, Any]] = []
+    candidate_order: Dict[str, int] = {}
+    for candidate in candidate_entries:
+        if not isinstance(candidate, dict):
+            raise TypeError("candidate_entries must contain credential dictionaries")
+        entry_id = str(candidate.get("id") or "").strip()
+        if not entry_id:
+            raise ValueError("candidate entry id is required")
+        if entry_id in candidate_order:
+            continue
+        candidate_order[entry_id] = len(candidates)
+        candidates.append(dict(candidate))
+    if not candidates:
+        raise ValueError("at least one candidate entry is required")
+
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            pool = {}
+            auth_store["credential_pool"] = pool
+
+        existing = pool.get(provider_id)
+        has_local_provider_rows = isinstance(existing, list)
+        existing_list = existing if has_local_provider_rows else []
+        existing_by_id = {
+            str(entry.get("id")): entry
+            for entry in existing_list
+            if isinstance(entry, dict) and entry.get("id")
+        }
+
+        def _count(entry: Dict[str, Any]) -> int:
+            try:
+                return max(0, int(entry.get("request_count", 0)))
+            except (TypeError, ValueError):
+                return 0
+
+        # Revalidate availability from the locked, current store. Import lazily
+        # to avoid auth.py <-> credential_pool.py import cycles.
+        from agent.credential_pool import (
+            PooledCredential,
+            STATUS_DEAD,
+            STATUS_EXHAUSTED,
+            _exhausted_until,
+        )
+
+        effective_candidates: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            entry_id = str(candidate["id"])
+            disk_entry = existing_by_id.get(entry_id)
+            if disk_entry is None and has_local_provider_rows:
+                # A local provider list existed and this identity disappeared
+                # after the process snapshot. Treat it as a concurrent removal,
+                # not as a global-fallback row to resurrect.
+                continue
+            effective = disk_entry if disk_entry is not None else candidate
+            durable = PooledCredential.from_dict(provider_id, effective)
+            if durable.last_status == STATUS_DEAD:
+                continue
+            if durable.last_status == STATUS_EXHAUSTED:
+                exhausted_until = _exhausted_until(durable)
+                if exhausted_until is None or exhausted_until > time.time():
+                    continue
+            effective_candidates.append(effective)
+
+        if not effective_candidates:
+            return None
+
+        selected_entry = min(
+            effective_candidates,
+            key=lambda entry: (
+                _count(entry),
+                candidate_order[str(entry.get("id"))],
+            ),
+        )
+        selected_id = str(selected_entry.get("id"))
+        # Existing rows must remain otherwise byte-for-byte identical so a
+        # concurrent refresh cannot be replaced by the stale candidate copy.
+        if selected_id in existing_by_id:
+            updated_entry = dict(selected_entry)
+        else:
+            updated_entry = sanitize_borrowed_credential_payload(
+                dict(selected_entry), provider_id
+            )
+        updated_entry["request_count"] = _count(selected_entry) + 1
+
+        updated_entries: List[Dict[str, Any]] = []
+        replaced = False
+        for disk_entry in existing_list:
+            if (
+                not replaced
+                and isinstance(disk_entry, dict)
+                and str(disk_entry.get("id") or "") == selected_id
+            ):
+                updated_entries.append(updated_entry)
+                replaced = True
+            else:
+                updated_entries.append(disk_entry)
+        if not replaced:
+            updated_entries.append(updated_entry)
+
+        pool[provider_id] = updated_entries
+        _save_auth_store(auth_store)
+        return dict(updated_entry)
+
+
 def suppress_credential_source(provider_id: str, source: str) -> None:
     """Mark a credential source as suppressed so it won't be re-seeded.
 

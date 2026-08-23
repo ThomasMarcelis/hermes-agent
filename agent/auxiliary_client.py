@@ -58,6 +58,7 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
@@ -1409,6 +1410,82 @@ def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
     return str(url or "").strip().rstrip("/")
 
 
+@dataclass(frozen=True)
+class _SelectedPoolContext:
+    """One immutable pooled credential revision for a client build attempt."""
+
+    provider: str
+    pool_present: bool
+    entry_id: str = ""
+    entry_label: str = ""
+    api_key: str = ""
+    base_url: str = ""
+    cache_revision: str = ""
+
+
+def _selected_pool_context(provider: str) -> _SelectedPoolContext:
+    """Select once and freeze the identity/runtime revision for this attempt."""
+    pool_present, entry = _select_pool_entry(provider)
+    if entry is None:
+        return _SelectedPoolContext(provider=provider, pool_present=pool_present)
+    entry_id = str(getattr(entry, "id", "") or "").strip()
+    api_key = _pool_runtime_api_key(entry)
+    base_url = _pool_runtime_base_url(entry)
+    revision = ""
+    if entry_id:
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(api_key.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(base_url.encode("utf-8"))
+        revision = f"{provider}:{entry_id}:{digest.hexdigest()}"
+    return _SelectedPoolContext(
+        provider=provider,
+        pool_present=pool_present,
+        entry_id=entry_id,
+        entry_label=str(getattr(entry, "label", "") or ""),
+        api_key=api_key,
+        base_url=base_url,
+        cache_revision=revision,
+    )
+
+
+def _bind_selected_pool_context(
+    client: Any,
+    selected_pool: Optional[_SelectedPoolContext],
+) -> None:
+    """Attach failure-attribution metadata to every wrapper layer."""
+    if client is None or selected_pool is None or not selected_pool.entry_id:
+        return
+    pending = [client]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        try:
+            setattr(current, "_hermes_pool_provider", selected_pool.provider)
+            setattr(current, "_hermes_pool_entry_id", selected_pool.entry_id)
+            setattr(current, "_hermes_pool_entry_label", selected_pool.entry_label)
+            setattr(current, "_hermes_pool_cache_revision", selected_pool.cache_revision)
+            # Compatibility aliases for callers introduced during the 0.20.5
+            # rework; both name sets identify the same frozen revision.
+            setattr(current, "_credential_pool_provider", selected_pool.provider)
+            setattr(current, "_credential_pool_entry_id", selected_pool.entry_id)
+            setattr(current, "_credential_pool_api_key", selected_pool.api_key)
+            setattr(current, "_credential_pool_revision", selected_pool.cache_revision)
+        except Exception:
+            pass
+        state = getattr(current, "__dict__", None)
+        if not isinstance(state, dict):
+            continue
+        for attr in ("_real_client", "_client", "_sync"):
+            child = state.get(attr)
+            if child is not None and child is not current:
+                pending.append(child)
+
+
 # Hostnames (lowercase, exact) that the auxiliary Anthropic path is allowed to
 # be pointed at via config.yaml model.base_url. Anything else falls back to the
 # Anthropic default — operators routing main-session traffic through a
@@ -2750,7 +2827,9 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
     return api_key, base_url
 
 
-def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
+def _resolve_xai_oauth_for_aux(
+    selected_pool: Optional[_SelectedPoolContext] = None,
+) -> Optional[Tuple[str, str]]:
     """Resolve a fresh xAI OAuth (api_key, base_url) for auxiliary clients.
 
     Prefer the credential pool, matching the main runtime/provider status
@@ -2763,6 +2842,9 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     auth-store-only logins. Returns ``None`` if the user is not authenticated
     with xAI Grok OAuth.
     """
+    if selected_pool is not None and selected_pool.pool_present:
+        if selected_pool.api_key and selected_pool.base_url:
+            return selected_pool.api_key, selected_pool.base_url
     try:
         from hermes_cli.auth import (
             DEFAULT_XAI_OAUTH_BASE_URL,
@@ -2805,7 +2887,9 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     return api_key, base_url
 
 
-def _read_codex_access_token() -> Optional[str]:
+def _read_codex_access_token(
+    selected_pool: Optional[_SelectedPoolContext] = None,
+) -> Optional[str]:
     """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
 
     If a credential pool exists but currently has no selectable runtime entry
@@ -2814,9 +2898,10 @@ def _read_codex_access_token() -> Optional[str]:
     fallback-to-Codex working when the pool state is stale but the stored OAuth
     token is still valid.
     """
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        token = _pool_runtime_api_key(entry)
+    if selected_pool is None:
+        selected_pool = _selected_pool_context("openai-codex")
+    if selected_pool.pool_present:
+        token = selected_pool.api_key
         if token:
             return token
 
@@ -3013,7 +3098,12 @@ def _warn_paid_lane_once(model: str) -> None:
     )
 
 
-def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+def _try_openrouter(
+    explicit_api_key: str = None,
+    model: str = None,
+    *,
+    selected_pool: Optional[_SelectedPoolContext] = None,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
     free_only, cfg_model = _aux_openrouter_settings()
     or_model = model or cfg_model
     if free_only and not _is_free_model(or_model):
@@ -3030,11 +3120,12 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
     if not _is_free_model(or_model):
         _warn_paid_lane_once(or_model)
 
-    pool_present, entry = _select_pool_entry("openrouter")
-    if pool_present:
-        or_key = explicit_api_key or _pool_runtime_api_key(entry)
+    if selected_pool is None:
+        selected_pool = _selected_pool_context("openrouter")
+    if selected_pool.pool_present:
+        or_key = explicit_api_key or selected_pool.api_key
         if or_key:
-            base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
+            base_url = selected_pool.base_url or OPENROUTER_BASE_URL
             logger.debug("Auxiliary client: OpenRouter via pool")
             return _create_openai_client(api_key=or_key, base_url=base_url,
                            default_headers=build_or_headers()), or_model
@@ -3051,13 +3142,16 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
                    default_headers=build_or_headers()), or_model
 
 
-def _describe_openrouter_unavailable() -> str:
+def _describe_openrouter_unavailable(
+    selected_pool: Optional[_SelectedPoolContext] = None,
+) -> str:
     """Return a more precise OpenRouter auth failure reason for logs."""
-    pool_present, entry = _select_pool_entry("openrouter")
-    if pool_present:
-        if entry is None:
+    if selected_pool is None:
+        selected_pool = _selected_pool_context("openrouter")
+    if selected_pool.pool_present:
+        if not selected_pool.entry_id:
             return "OpenRouter credential pool has no usable entries (credentials may be exhausted)"
-        if not _pool_runtime_api_key(entry):
+        if not selected_pool.api_key:
             return "OpenRouter credential pool entry is missing a runtime API key"
     if not _scoped_key_env("OPENROUTER_API_KEY"):
         return "OPENROUTER_API_KEY not set"
@@ -3854,7 +3948,11 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     return _fallback_client, model
 
 
-def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+def _build_xai_oauth_aux_client(
+    model: str,
+    *,
+    selected_pool: Optional[_SelectedPoolContext] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     """Build a CodexAuxiliaryClient for an xAI Grok OAuth-authenticated session.
 
     xAI's ``/v1/responses`` endpoint speaks the OpenAI Responses API, so we
@@ -3871,7 +3969,7 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    resolved = _resolve_xai_oauth_for_aux()
+    resolved = _resolve_xai_oauth_for_aux(selected_pool=selected_pool)
     if resolved is None:
         return None, None
     api_key, base_url = resolved
@@ -3886,7 +3984,11 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
     return CodexAuxiliaryClient(real_client, model), model
 
 
-def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+def _build_codex_client(
+    model: str,
+    *,
+    selected_pool: Optional[_SelectedPoolContext] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     """Build a CodexAuxiliaryClient for an explicitly-requested model.
 
     There is no auto-selection of the Codex model: the ChatGPT-account
@@ -3903,13 +4005,14 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        codex_token = _pool_runtime_api_key(entry)
+    if selected_pool is None:
+        selected_pool = _selected_pool_context("openai-codex")
+    if selected_pool.pool_present:
+        codex_token = selected_pool.api_key
         if codex_token:
-            base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+            base_url = selected_pool.base_url or _CODEX_AUX_BASE_URL
         else:
-            codex_token = _read_codex_access_token()
+            codex_token = _read_codex_access_token(selected_pool)
             if not codex_token:
                 return None, None
             base_url = _CODEX_AUX_BASE_URL
@@ -4041,15 +4144,21 @@ def _try_azure_foundry(
     return client, final_model
 
 
-def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
+def _try_anthropic(
+    explicit_api_key: str = None,
+    *,
+    selected_pool: Optional[_SelectedPoolContext] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
         return None, None
 
-    pool_present, entry = _select_pool_entry("anthropic")
-    if pool_present and entry is not None:
-        token = explicit_api_key or _pool_runtime_api_key(entry)
+    if selected_pool is None:
+        selected_pool = _selected_pool_context("anthropic")
+    pool_present = selected_pool.pool_present
+    if pool_present and selected_pool.api_key:
+        token = explicit_api_key or selected_pool.api_key
     else:
         # Pool absent, OR pool present but no usable entry (expired token +
         # stale refresh_token, all entries exhausted, etc). Fall through to the
@@ -4061,7 +4170,6 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         # goal judge and every other Anthropic-routed side channel died with
         # "no auxiliary client configured" while the main session stayed
         # healthy (it resolves the env token directly).
-        entry = None
         token = explicit_api_key or resolve_anthropic_token()
     if not token:
         return None, None
@@ -4076,7 +4184,11 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
     # would have every auxiliary side-channel call (memory extractors,
     # reflection, vision, title generation) 401 from the foreign host —
     # see issue #52608.
-    base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
+    base_url = (
+        selected_pool.base_url or _ANTHROPIC_DEFAULT_BASE_URL
+        if pool_present
+        else _ANTHROPIC_DEFAULT_BASE_URL
+    )
     try:
         from hermes_cli.config import load_config_readonly
         cfg = load_config_readonly()
@@ -4772,21 +4884,20 @@ def _pool_cache_hint(
     provider: str,
     *,
     main_runtime: Optional[Dict[str, Any]] = None,
+    selected_pool: Optional[_SelectedPoolContext] = None,
 ) -> str:
-    """Return a stable cache discriminator for pooled providers."""
+    """Return the frozen pooled identity/revision cache discriminator."""
+    if selected_pool is None or not selected_pool.entry_id:
+        return ""
     normalized = _normalize_aux_provider(provider)
     if normalized == "auto":
         runtime = _normalize_main_runtime(main_runtime)
-        normalized = _normalize_aux_provider(runtime.get("provider") or _read_main_provider())
-    if normalized in {"", "auto", "custom"}:
+        normalized = _normalize_aux_provider(
+            runtime.get("provider") or _read_main_provider()
+        )
+    if normalized and selected_pool.provider != normalized:
         return ""
-    entry = _peek_pool_entry(normalized)
-    if entry is None:
-        return ""
-    entry_id = str(getattr(entry, "id", "") or "").strip()
-    if not entry_id:
-        return ""
-    return f"{normalized}:{entry_id}"
+    return selected_pool.cache_revision
 
 
 def _pool_error_context(exc: Exception) -> Dict[str, Any]:
@@ -4840,13 +4951,37 @@ def _recoverable_pool_provider(
     return None
 
 
-def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str = "") -> bool:
+def _client_pool_failure_identity(client: Any) -> Dict[str, str]:
+    """Read the immutable pool identity carried by one concrete client."""
+    def _string_attr(name: str) -> str:
+        value = getattr(client, name, "")
+        return value.strip() if isinstance(value, str) else ""
+
+    return {
+        "failed_api_key": (
+            _string_attr("_credential_pool_api_key")
+            or _string_attr("api_key")
+        ),
+        "failed_entry_id": (
+            _string_attr("_hermes_pool_entry_id")
+            or _string_attr("_credential_pool_entry_id")
+        ),
+    }
+
+
+def _recover_provider_pool(
+    provider: str,
+    exc: Exception,
+    *,
+    failed_api_key: str = "",
+    failed_entry_id: str = "",
+) -> bool:
     """Try same-provider credential-pool recovery for auxiliary calls.
 
-    ``failed_api_key`` is the API key that was actually used for the failing
-    request.  Passing it lets mark_exhausted_and_rotate identify the correct
-    pool entry even when another process has already rotated the pool (which
-    would leave current() as None, causing the wrong entry to be marked).
+    The cached client's immutable entry id is authoritative. The key hint is
+    retained for compatibility, but a changed token on the same id means the
+    failed revision is already stale and must never quarantine the refreshed
+    row.
     """
     normalized = _normalize_aux_provider(provider)
     try:
@@ -4860,9 +4995,33 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     status_code = getattr(exc, "status_code", None)
     error_context = _pool_error_context(exc)
     hint = failed_api_key or None
+    credential_id = failed_entry_id or None
+
+    if credential_id and failed_api_key:
+        matches_fn = getattr(pool, "runtime_api_key_matches", None)
+        if callable(matches_fn):
+            try:
+                revision_matches = matches_fn(credential_id, failed_api_key)
+            except Exception as match_exc:
+                logger.debug(
+                    "Auxiliary client: could not verify pool revision for %s/%s: %s",
+                    normalized,
+                    credential_id,
+                    match_exc,
+                )
+            else:
+                if revision_matches is False:
+                    _evict_cached_clients(normalized)
+                    return True
 
     if _is_auth_error(exc):
-        refreshed = pool.try_refresh_current()
+        if credential_id or hint:
+            refreshed = pool.try_refresh_matching(
+                api_key_hint=hint,
+                credential_id=credential_id,
+            )
+        else:
+            refreshed = pool.try_refresh_current()
         if refreshed is not None:
             _evict_cached_clients(normalized)
             return True
@@ -4870,6 +5029,7 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
             status_code=status_code if status_code is not None else 401,
             error_context=error_context,
             api_key_hint=hint,
+            credential_id=credential_id,
         )
         if next_entry is not None:
             _evict_cached_clients(normalized)
@@ -4882,6 +5042,7 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
             status_code=status_code if status_code is not None else fallback_status,
             error_context=error_context,
             api_key_hint=hint,
+            credential_id=credential_id,
         )
         if next_entry is not None:
             _evict_cached_clients(normalized)
@@ -4907,6 +5068,7 @@ def _retry_same_provider_sync(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    failure_identity: Optional[Dict[str, str]] = None,
 ) -> Any:
     if task == "vision":
         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
@@ -4932,6 +5094,9 @@ def _retry_same_provider_sync(
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
+
+    if failure_identity is not None:
+        failure_identity.update(_client_pool_failure_identity(retry_client))
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
@@ -4982,6 +5147,7 @@ async def _retry_same_provider_async(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    failure_identity: Optional[Dict[str, str]] = None,
 ) -> Any:
     if task == "vision":
         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
@@ -5007,6 +5173,9 @@ async def _retry_same_provider_async(
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
+
+    if failure_identity is not None:
+        failure_identity.update(_client_pool_failure_identity(retry_client))
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
@@ -5039,9 +5208,48 @@ async def _retry_same_provider_async(
     )
 
 
-def _refresh_provider_credentials(provider: str) -> bool:
-    """Refresh short-lived credentials for OAuth-backed auxiliary providers."""
+def _refresh_provider_credentials(
+    provider: str,
+    *,
+    failed_api_key: str = "",
+    failed_entry_id: str = "",
+) -> bool:
+    """Refresh short-lived credentials for the exact failed pool identity."""
     normalized = _normalize_aux_provider(provider)
+    if failed_entry_id:
+        try:
+            pool = load_pool(normalized)
+            if pool and pool.has_credentials():
+                if failed_api_key:
+                    matches_fn = getattr(pool, "runtime_api_key_matches", None)
+                    if callable(matches_fn):
+                        revision_matches = matches_fn(
+                            failed_entry_id,
+                            failed_api_key,
+                        )
+                        if revision_matches is False:
+                            _evict_cached_clients(normalized)
+                            return True
+                        if revision_matches is None:
+                            return False
+                refreshed = pool.try_refresh_matching(
+                    api_key_hint=failed_api_key or None,
+                    credential_id=failed_entry_id,
+                )
+                if refreshed is not None:
+                    _evict_cached_clients(normalized)
+                    return True
+                # A selected pool identity must not fall through to a singleton
+                # resolver that may refresh or retry a different account.
+                return False
+        except Exception as exc:
+            logger.debug(
+                "Auxiliary exact-entry credential refresh failed for %s/%s: %s",
+                normalized,
+                failed_entry_id,
+                exc,
+            )
+            return False
     try:
         if normalized == "copilot":
             from hermes_cli.copilot_auth import (
@@ -5128,6 +5336,14 @@ def _refresh_provider_credentials(provider: str) -> bool:
         logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
         return False
     return False
+
+
+def _refresh_provider_credentials_for_client(provider: str, client: Any) -> bool:
+    """Refresh by immutable pool id when present, preserving legacy calls."""
+    identity = _client_pool_failure_identity(client)
+    if identity["failed_entry_id"]:
+        return _refresh_provider_credentials(provider, **identity)
+    return _refresh_provider_credentials(provider)
 
 
 def _auth_refresh_provider_for_route(
@@ -5376,7 +5592,10 @@ def _call_fallback_candidate_sync(
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
         )
-        if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
+        if (
+            fb_provider not in {"auto", "", None}
+            and _refresh_provider_credentials_for_client(fb_provider, fb_client)
+        ):
             retry_client, retry_model = _get_cached_client(
                 fb_provider,
                 destination.model,
@@ -5482,7 +5701,10 @@ async def _call_fallback_candidate_async(
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
         )
-        if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
+        if (
+            fb_provider not in {"auto", "", None}
+            and _refresh_provider_credentials_for_client(fb_provider, fb_client)
+        ):
             retry_client, retry_model = _get_cached_client(
                 fb_provider,
                 destination.model,
@@ -6373,6 +6595,7 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    selected_pool: Optional[_SelectedPoolContext] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -6564,11 +6787,14 @@ def resolve_provider_client(
 
     # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
+        client, default = _try_openrouter(
+            explicit_api_key=explicit_api_key,
+            selected_pool=selected_pool,
+        )
         if client is None:
             logger.warning(
                 "resolve_provider_client: openrouter requested but %s",
-                _describe_openrouter_unavailable(),
+                _describe_openrouter_unavailable(selected_pool),
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
@@ -6616,7 +6842,11 @@ def resolve_provider_client(
         if raw_codex:
             # Return the raw OpenAI client for callers that need direct
             # access to responses.stream() (e.g., the main agent loop).
-            codex_token = _read_codex_access_token()
+            codex_token = (
+                _read_codex_access_token(selected_pool)
+                if selected_pool is not None and selected_pool.pool_present
+                else _read_codex_access_token()
+            )
             if not codex_token:
                 logger.warning("resolve_provider_client: openai-codex requested "
                                "but no Codex OAuth token found (run: hermes model)")
@@ -6624,12 +6854,19 @@ def resolve_provider_client(
             final_model = _normalize_resolved_model(model, provider)
             raw_client = _create_openai_client(
                 api_key=codex_token,
-                base_url=_CODEX_AUX_BASE_URL,
+                base_url=(
+                    (selected_pool.base_url or _CODEX_AUX_BASE_URL)
+                    if selected_pool is not None and selected_pool.api_key == codex_token
+                    else _CODEX_AUX_BASE_URL
+                ),
                 default_headers=_codex_cloudflare_headers(codex_token),
             )
             return (raw_client, final_model)
         # Standard path: wrap in CodexAuxiliaryClient adapter
-        client, default = _build_codex_client(model)
+        client, default = _build_codex_client(
+            model,
+            selected_pool=selected_pool,
+        )
         if client is None:
             logger.warning("resolve_provider_client: openai-codex requested "
                            "but no Codex OAuth token found (run: hermes model)")
@@ -6647,7 +6884,10 @@ def resolve_provider_client(
     # OpenRouter / Nous bills for side tasks they thought were running on
     # their xAI subscription.
     if provider == "xai-oauth":
-        client, default = _build_xai_oauth_aux_client(model)
+        client, default = _build_xai_oauth_aux_client(
+            model,
+            selected_pool=selected_pool,
+        )
         if client is None:
             logger.warning(
                 "resolve_provider_client: xai-oauth requested but no xAI "
@@ -6929,22 +7169,35 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
-            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
+            client, default_model = _try_anthropic(
+                explicit_api_key=explicit_api_key,
+                selected_pool=selected_pool,
+            )
             if client is None:
                 logger.warning("resolve_provider_client: anthropic requested but no Anthropic credentials found")
                 return None, None
             final_model = _normalize_resolved_model(model or default_model, provider)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode else (client, final_model))
 
-        creds = resolve_api_key_provider_credentials(provider)
+        creds = (
+            {}
+            if selected_pool is not None and selected_pool.pool_present
+            else resolve_api_key_provider_credentials(provider)
+        )
         api_key = str(creds.get("api_key", "")).strip()
+        if selected_pool is not None and selected_pool.pool_present:
+            api_key = selected_pool.api_key or api_key
         # Honour an explicit api_key override (e.g. from a fallback_model entry
         # or a custom_providers entry) so callers that pass an explicit
         # credential can authenticate against endpoints where no built-in
         # credential is registered for this provider alias.
         if explicit_api_key:
             api_key = explicit_api_key.strip() or api_key
-        raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
+        raw_base_url = (
+            (selected_pool.base_url if selected_pool is not None else "")
+            or str(creds.get("base_url", "")).strip().rstrip("/")
+            or pconfig.inference_base_url
+        )
         if explicit_base_url:
             raw_base_url = explicit_base_url.strip().rstrip("/")
         # OpenCode Zen free tier (*-free slugs): served anonymously on the
@@ -7751,6 +8004,7 @@ def _client_cache_key(
     is_vision: bool = False,
     task: Optional[str] = None,
     model: Optional[str] = None,
+    selected_pool: Optional[_SelectedPoolContext] = None,
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = tuple(
@@ -7765,7 +8019,11 @@ def _client_cache_key(
         if provider == "auto"
         else ""
     )
-    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
+    pool_hint = _pool_cache_hint(
+        provider,
+        main_runtime=main_runtime,
+        selected_pool=selected_pool,
+    )
     # The model MUST participate in the key. Two concurrent auxiliary calls to
     # the SAME provider/base_url/key but DIFFERENT models (e.g. a MoA reference
     # fan-out running opus + gpt-5.5 in parallel threads) would otherwise share
@@ -7786,10 +8044,36 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
         # receive a non-functional client on the next cache hit.
         return
     with _client_cache_lock:
+        _prune_superseded_pool_cache_entries_unlocked(cache_key)
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and old_entry[0] is not client:
             _close_cached_client(old_entry[0])
         _client_cache[cache_key] = (client, default_model, bound_loop)
+
+
+def _prune_superseded_pool_cache_entries_unlocked(cache_key: tuple) -> None:
+    """Drop old token revisions for the same pooled credential identity.
+
+    Old clients are not closed here because an in-flight caller may still hold
+    one; removing the cache reference is sufficient and bounds stale revisions.
+    """
+    if len(cache_key) <= 8:
+        return
+    pool_hint = cache_key[8]
+    if not isinstance(pool_hint, str) or pool_hint.count(":") < 2:
+        return
+    pool_identity = pool_hint.rsplit(":", 1)[0]
+    for old_key in list(_client_cache):
+        if old_key == cache_key or len(old_key) <= 8:
+            continue
+        old_hint = old_key[8]
+        if (
+            isinstance(old_hint, str)
+            and old_hint.count(":") >= 2
+            and old_hint.rsplit(":", 1)[0] == pool_identity
+            and old_hint != pool_hint
+        ):
+            del _client_cache[old_key]
 
 
 def _refresh_nous_auxiliary_client(
@@ -8038,6 +8322,34 @@ def _compat_model(client: Any, model: Optional[str], cached_default: Optional[st
     return model or cached_default
 
 
+def _cached_pool_client_is_current(client: Any) -> bool:
+    """Return whether a cached wrapper still matches its durable pool entry."""
+    identity = _client_pool_failure_identity(client)
+    provider = getattr(client, "_hermes_pool_provider", "")
+    if not isinstance(provider, str) or not provider.strip():
+        provider = getattr(client, "_credential_pool_provider", "")
+    provider = provider.strip() if isinstance(provider, str) else ""
+    entry_id = identity["failed_entry_id"]
+    if not provider or not entry_id:
+        return True
+    try:
+        pool = load_pool(provider)
+        matches_fn = getattr(pool, "runtime_api_key_matches", None)
+        if not pool or not pool.has_credentials() or not callable(matches_fn):
+            return False
+        return matches_fn(entry_id, identity["failed_api_key"]) is True
+    except Exception as exc:
+        # A transient auth-store read failure should not churn every cache hit;
+        # request failure recovery will still evict and revalidate.
+        logger.debug(
+            "Auxiliary client: could not validate cached pool entry %s/%s: %s",
+            provider,
+            entry_id,
+            exc,
+        )
+        return True
+
+
 def _get_cached_client(
     provider: str,
     model: str = None,
@@ -8077,6 +8389,13 @@ def _get_cached_client(
         except RuntimeError:
             pass
     runtime = _normalize_main_runtime(main_runtime)
+    normalized_pool_provider = _normalize_aux_provider(provider)
+    selected_pool: Optional[_SelectedPoolContext] = None
+    if (
+        not api_key
+        and normalized_pool_provider not in {"", "auto", "custom", "nous"}
+    ):
+        selected_pool = _selected_pool_context(normalized_pool_provider)
     cache_key = _client_cache_key(
         provider,
         async_mode=async_mode,
@@ -8087,11 +8406,14 @@ def _get_cached_client(
         is_vision=is_vision,
         task=task,
         model=model,
+        selected_pool=selected_pool,
     )
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            if async_mode:
+            if not _cached_pool_client_is_current(cached_client):
+                del _client_cache[cache_key]
+            elif async_mode:
                 # Validate: the cached client must be bound to the CURRENT,
                 # OPEN loop.  If the loop changed or was closed, the httpx
                 # transport inside is dead — force-close and replace.
@@ -8114,35 +8436,27 @@ def _get_cached_client(
             else:
                 effective = _compat_model(cached_client, model, cached_default)
                 return cached_client, effective
-    # Build outside the lock.
-    # For pool-backed api_key providers, derive the active API key from the
-    # pool entry rather than from env vars.  resolve_api_key_provider_credentials
-    # always prefers env vars (first-entry bias), which bypasses pool rotation:
-    # after key #1 is marked exhausted the retry would still get key #1 from
-    # the env var and fail again, causing the retry2_err handler to mark key #2.
-    effective_api_key = api_key
-    if not effective_api_key:
-        _pe = _peek_pool_entry(_normalize_aux_provider(provider))
-        if _pe is not None:
-            _pk = _pool_runtime_api_key(_pe)
-            if _pk:
-                effective_api_key = _pk
+    # Build outside the lock from the exact identity used for the cache key.
+    # The resolver must not select or peek a second pool entry here.
     client, default_model = resolve_provider_client(
         provider,
         model,
         async_mode,
         explicit_base_url=base_url,
-        explicit_api_key=effective_api_key,
+        explicit_api_key=api_key,
         api_mode=api_mode,
         main_runtime=runtime,
         is_vision=is_vision,
         task=task,
+        selected_pool=selected_pool,
     )
     if client is not None:
+        _bind_selected_pool_context(client, selected_pool)
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
         with _client_cache_lock:
+            _prune_superseded_pool_cache_entries_unlocked(cache_key)
             if cache_key not in _client_cache:
                 # Safety belt: if the cache has grown beyond the max, evict
                 # the oldest entries (FIFO — dict preserves insertion order).
@@ -9997,7 +10311,10 @@ def _call_llm_impl(
         if (_is_auth_error(first_err)
                 and auth_refresh_provider not in {"auto", "", None}
                 and not client_is_nous):
-            if _refresh_provider_credentials(auth_refresh_provider):
+            if _refresh_provider_credentials_for_client(
+                auth_refresh_provider,
+                client,
+            ):
                 if auth_refresh_provider != _normalize_aux_provider(resolved_provider):
                     # The stale client is cached under the route label
                     # (e.g. "auto"), not the concrete backend we refreshed.
@@ -10031,7 +10348,9 @@ def _call_llm_impl(
         # the correct pool entry even when another process rotated the pool
         # between this call and recovery (which leaves current()=None and makes
         # _select_unlocked() return the NEXT key by mistake).
-        _client_api_key = str(getattr(client, "api_key", "") or "")
+        _client_failure_identity = _client_pool_failure_identity(client)
+        _client_api_key = _client_failure_identity["failed_api_key"]
+        _client_pool_entry_id = _client_failure_identity["failed_entry_id"]
         if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             # Skip the extra retry for clear payment/quota errors — the endpoint
@@ -10049,11 +10368,17 @@ def _call_llm_impl(
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
                     recovery_err = retry_err
-            if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
+            if _recover_provider_pool(
+                pool_provider,
+                recovery_err,
+                failed_api_key=_client_api_key,
+                failed_entry_id=_client_pool_entry_id,
+            ):
                 logger.info(
                     "Auxiliary %s: recovered %s via credential-pool rotation after %s",
                     task or "call", pool_provider, type(recovery_err).__name__,
                 )
+                retry_failure_identity: Dict[str, str] = {}
                 try:
                     return _retry_same_provider_sync(
                         task=task,
@@ -10072,6 +10397,7 @@ def _call_llm_impl(
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
                         extra_headers=extra_headers,
+                        failure_identity=retry_failure_identity,
                     )
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
@@ -10081,7 +10407,16 @@ def _call_llm_impl(
                     # alternative providers can still serve the request.
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        _recover_provider_pool(
+                            pool_provider,
+                            retry2_err,
+                            failed_api_key=retry_failure_identity.get(
+                                "failed_api_key", ""
+                            ),
+                            failed_entry_id=retry_failure_identity.get(
+                                "failed_entry_id", ""
+                            ),
+                        )
                         first_err = retry2_err
                     else:
                         raise
@@ -10740,7 +11075,10 @@ async def _async_call_llm_impl(
         if (_is_auth_error(first_err)
                 and auth_refresh_provider not in {"auto", "", None}
                 and not client_is_nous):
-            if _refresh_provider_credentials(auth_refresh_provider):
+            if _refresh_provider_credentials_for_client(
+                auth_refresh_provider,
+                client,
+            ):
                 if auth_refresh_provider != _normalize_aux_provider(resolved_provider):
                     # The stale client is cached under the route label
                     # (e.g. "auto"), not the concrete backend we refreshed.
@@ -10768,7 +11106,9 @@ async def _async_call_llm_impl(
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
-        _client_api_key = str(getattr(client, "api_key", "") or "")
+        _client_failure_identity = _client_pool_failure_identity(client)
+        _client_api_key = _client_failure_identity["failed_api_key"]
+        _client_pool_entry_id = _client_failure_identity["failed_entry_id"]
         if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             # Skip the extra retry for clear payment/quota errors — the endpoint
@@ -10786,11 +11126,17 @@ async def _async_call_llm_impl(
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
                     recovery_err = retry_err
-            if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
+            if _recover_provider_pool(
+                pool_provider,
+                recovery_err,
+                failed_api_key=_client_api_key,
+                failed_entry_id=_client_pool_entry_id,
+            ):
                 logger.info(
                     "Auxiliary %s (async): recovered %s via credential-pool rotation after %s",
                     task or "call", pool_provider, type(recovery_err).__name__,
                 )
+                retry_failure_identity: Dict[str, str] = {}
                 try:
                     return await _retry_same_provider_async(
                         task=task,
@@ -10807,11 +11153,21 @@ async def _async_call_llm_impl(
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
+                        failure_identity=retry_failure_identity,
                     )
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        _recover_provider_pool(
+                            pool_provider,
+                            retry2_err,
+                            failed_api_key=retry_failure_identity.get(
+                                "failed_api_key", ""
+                            ),
+                            failed_entry_id=retry_failure_identity.get(
+                                "failed_entry_id", ""
+                            ),
+                        )
                         first_err = retry2_err
                     else:
                         raise
