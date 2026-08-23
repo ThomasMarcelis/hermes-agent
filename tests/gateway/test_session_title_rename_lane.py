@@ -9,12 +9,14 @@ ten minutes, so the throwaway can be the one that survives.
 
 from __future__ import annotations
 
+import asyncio
 import types
 
 import pytest
 
 from gateway.config import Platform
-from gateway.run import TurnRunner
+from gateway.run import GatewayRunner, TurnRunner
+from gateway.session import SessionSource
 
 
 def _attach(lane):
@@ -53,3 +55,42 @@ def test_the_rename_waits_for_the_model_title(lane):
 
     callback("Fix flaky auth test", "llm")
     assert renames == ["Fix flaky auth test"]
+
+
+@pytest.mark.asyncio
+async def test_native_discord_auto_thread_rename_uses_native_signature(
+    monkeypatch,
+):
+    renames = []
+
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    async def rename_thread(
+        thread_id, name, *, only_if_current_name=None
+    ):
+        renames.append((thread_id, name, only_if_current_name))
+        return True
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {
+        Platform.DISCORD: types.SimpleNamespace(rename_thread=rename_thread)
+    }
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="999",
+        chat_type="thread",
+        user_id="user-1",
+        thread_id="999",
+        parent_chat_id="100",
+        auto_thread_created=True,
+        auto_thread_initial_name="Hermes",
+    )
+
+    await runner._rename_discord_auto_thread_for_session_title(
+        source, "sess-1", "Voice note follow-up"
+    )
+
+    assert renames == [("999", "Voice note follow-up", "Hermes")]
