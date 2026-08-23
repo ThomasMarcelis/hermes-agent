@@ -853,8 +853,14 @@ class TestTranscribeAudioXAIDispatch:
 # ============================================================================
 
 class TestTranscribeElevenLabs:
-    def test_successful_transcription(self, monkeypatch, sample_ogg):
+    def test_successful_transcription(self, monkeypatch, sample_ogg, tmp_path):
         monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-test-key")
+
+        keyterms_file = tmp_path / "keyterms.yaml"
+        keyterms_file.write_text(
+            "keyterms:\n  - Eneco\n  - eMobility\n  - Hermes\n",
+            encoding="utf-8",
+        )
 
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -865,11 +871,19 @@ class TestTranscribeElevenLabs:
                 "language_code": "eng",
                 "tag_audio_events": True,
                 "diarize": True,
+                "timestamps_granularity": "word",
+                "num_speakers": 2,
+                "enable_logging": False,
+                "file_format": "other",
+                "no_verbatim": True,
+                "keyterms": ["Hermes", "QMD"],
+                "keyterms_file": str(keyterms_file),
+                "max_keyterms": 95,
             }
         }
         with patch("tools.transcription_tools._load_stt_config", return_value=config), \
              patch("requests.post", return_value=mock_response) as mock_post:
-            from tools.transcription_tools import _transcribe_elevenlabs
+            from tools.transcription_cloud import _transcribe_elevenlabs
             result = _transcribe_elevenlabs(sample_ogg, "scribe_v2")
 
         assert result["success"] is True
@@ -877,10 +891,125 @@ class TestTranscribeElevenLabs:
         assert result["provider"] == "elevenlabs"
         call_kwargs = mock_post.call_args.kwargs
         assert call_kwargs["headers"]["xi-api-key"] == "eleven-test-key"
-        assert call_kwargs["data"]["model_id"] == "scribe_v2"
-        assert call_kwargs["data"]["language_code"] == "eng"
-        assert call_kwargs["data"]["tag_audio_events"] == "true"
-        assert call_kwargs["data"]["diarize"] == "true"
+        form = call_kwargs["data"]
+        form_values = dict(form)
+        assert form_values["model_id"] == "scribe_v2"
+        assert form_values["language_code"] == "eng"
+        assert form_values["tag_audio_events"] == "true"
+        assert form_values["diarize"] == "true"
+        assert form_values["timestamps_granularity"] == "word"
+        assert form_values["num_speakers"] == "2"
+        assert form_values["file_format"] == "other"
+        assert form_values["no_verbatim"] == "true"
+        assert "enable_logging" not in form_values
+        assert [value for name, value in form if name == "keyterms"] == [
+            "Hermes",
+            "QMD",
+            "Eneco",
+            "eMobility",
+        ]
+        assert call_kwargs["params"] == {"enable_logging": False}
+
+    @pytest.mark.parametrize("configured", (True, False))
+    def test_enable_logging_is_a_query_parameter(
+        self, monkeypatch, sample_ogg, configured
+    ):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-test-key")
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {"text": "hello"}
+
+        with patch(
+            "tools.transcription_tools._load_stt_config",
+            return_value={"elevenlabs": {"enable_logging": configured}},
+        ), patch("requests.post", return_value=mock_response) as mock_post:
+            from tools.transcription_cloud import _transcribe_elevenlabs
+
+            result = _transcribe_elevenlabs(sample_ogg, "scribe_v2")
+
+        assert result["success"] is True
+        assert "enable_logging" not in dict(mock_post.call_args.kwargs["data"])
+        assert mock_post.call_args.kwargs["params"] == {
+            "enable_logging": configured
+        }
+
+    def test_invalid_num_speakers_returns_failure(self, monkeypatch, sample_ogg):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-test-key")
+        with patch(
+            "tools.transcription_tools._load_stt_config",
+            return_value={"elevenlabs": {"num_speakers": "many"}},
+        ):
+            from tools.transcription_cloud import _transcribe_elevenlabs
+
+            result = _transcribe_elevenlabs(sample_ogg, "scribe_v2")
+
+        assert result["success"] is False
+        assert "ElevenLabs STT transcription failed" in result["error"]
+        assert "eleven-test-key" not in result["error"]
+
+
+class TestElevenLabsKeyterms:
+    def test_normalize_dedupes_case_insensitively_and_preserves_order(self):
+        from tools.transcription_cloud import _normalize_elevenlabs_keyterms
+
+        assert _normalize_elevenlabs_keyterms(
+            [" Hermes ", "Eneco", "hermes", "", "eMobility"],
+            max_keyterms=95,
+        ) == ["Hermes", "Eneco", "eMobility"]
+
+    @pytest.mark.parametrize(
+        ("term", "message"),
+        [
+            ("x" * 50, "fewer than 50 characters"),
+            ("one two three four five six", "at most 5 words"),
+            ("unsafe[term]", "unsupported character"),
+            (42, "must be strings"),
+        ],
+    )
+    def test_normalize_rejects_invalid_terms(self, term, message):
+        from tools.transcription_cloud import _normalize_elevenlabs_keyterms
+
+        with pytest.raises(ValueError, match=message):
+            _normalize_elevenlabs_keyterms([term], max_keyterms=95)
+
+    def test_normalize_fails_closed_above_configured_cap(self):
+        from tools.transcription_cloud import _normalize_elevenlabs_keyterms
+
+        with pytest.raises(ValueError, match="exceeds configured maximum of 2"):
+            _normalize_elevenlabs_keyterms(
+                ["Hermes", "Eneco", "eMobility"],
+                max_keyterms=2,
+            )
+
+    def test_loads_yaml_and_plain_text_files(self, tmp_path):
+        from tools.transcription_cloud import _load_elevenlabs_keyterms
+
+        yaml_file = tmp_path / "terms.yaml"
+        yaml_file.write_text(
+            "keyterms:\n  - Eneco\n  - eMobility\n",
+            encoding="utf-8",
+        )
+        text_file = tmp_path / "terms.txt"
+        text_file.write_text(
+            "# one term per line\nHermes\nQMD\n",
+            encoding="utf-8",
+        )
+
+        assert _load_elevenlabs_keyterms(
+            {"keyterms": ["JD"], "keyterms_file": str(yaml_file)}
+        ) == ["JD", "Eneco", "eMobility"]
+        assert _load_elevenlabs_keyterms(
+            {"keyterms_file": str(text_file)}
+        ) == ["Hermes", "QMD"]
+
+    def test_rejects_relative_or_missing_keyterms_file(self, tmp_path):
+        from tools.transcription_cloud import _load_elevenlabs_keyterms
+
+        with pytest.raises(ValueError, match="must be absolute"):
+            _load_elevenlabs_keyterms({"keyterms_file": "relative.yaml"})
+        with pytest.raises(ValueError, match="does not exist"):
+            _load_elevenlabs_keyterms(
+                {"keyterms_file": str(tmp_path / "missing.yaml")}
+            )
 
 # ============================================================================
 # _get_provider — ElevenLabs

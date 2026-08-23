@@ -1113,6 +1113,10 @@ DEFAULT_CONFIG = {
             "language_code": "",  # auto-detect; set "eng", "spa", ... to force
             "tag_audio_events": False,
             "diarize": False,
+            "no_verbatim": False,
+            "keyterms": [],
+            "keyterms_file": "",  # absolute YAML/TXT path; repeated multipart fields
+            "max_keyterms": 95,  # operational guardrail (provider maximum is 1000)
         },
         "deepinfra": {
             "model": "",  # empty = first stt-tagged model from the live catalog

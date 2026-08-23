@@ -191,11 +191,14 @@ def _transcribe_mistral(
 
 
 # ---- REST multipart backends (xAI, ElevenLabs) ----------------------------
-def _post_audio_multipart(url: str, headers: Dict[str, str], file_path: str, data: Dict[str, str]):
+def _post_audio_multipart(
+    url: str, headers: Dict[str, str], file_path: str,
+    data: Dict[str, str] | list[tuple[str, str]], *, params: Optional[Dict[str, Any]] = None,
+):
     import requests
     with open(file_path, "rb") as audio_file:
         return requests.post(url, headers=headers, files={"file": (Path(file_path).name, audio_file)},
-                             data=data, timeout=120)
+                             data=data, timeout=120, **({"params": params} if params is not None else {}))
 
 
 def _rest_provider(
@@ -291,6 +294,145 @@ def _elevenlabs_error_detail(err_body: Dict[str, Any]) -> str:
     return str(error_value) if error_value else ""
 
 
+def _normalize_elevenlabs_keyterms(
+    raw_terms: Any,
+    *,
+    max_keyterms: int = 95,
+) -> list[str]:
+    """Validate and de-duplicate Scribe keyterms while preserving order."""
+    if raw_terms in (None, ""):
+        return []
+    if not isinstance(raw_terms, (list, tuple)):
+        raise ValueError("ElevenLabs keyterms must be a list of strings")
+
+    try:
+        max_terms = int(max_keyterms)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ElevenLabs max_keyterms must be an integer") from exc
+    if max_terms < 1 or max_terms > 1000:
+        raise ValueError("ElevenLabs max_keyterms must be between 1 and 1000")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_term in raw_terms:
+        if not isinstance(raw_term, str):
+            raise ValueError("ElevenLabs keyterms must be strings")
+        term = raw_term.strip()
+        if not term:
+            continue
+        if len(term) >= 50:
+            raise ValueError(
+                "ElevenLabs keyterms must contain fewer than 50 characters"
+            )
+        if len(term.split()) > 5:
+            raise ValueError("ElevenLabs keyterms may contain at most 5 words")
+        if any(
+            char in term for char in ("[", "]", "{", "}", "<", ">", "\\")
+        ):
+            raise ValueError("ElevenLabs keyterm contains an unsupported character")
+        identity = term.casefold()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(term)
+
+    if len(normalized) > max_terms:
+        raise ValueError(
+            "ElevenLabs keyterm count "
+            f"{len(normalized)} exceeds configured maximum of {max_terms}"
+        )
+    return normalized
+
+
+def _load_elevenlabs_keyterms(elevenlabs_config: Dict[str, Any]) -> list[str]:
+    """Load inline and optional absolute file-backed Scribe keyterms."""
+    raw_terms = elevenlabs_config.get("keyterms") or []
+    if not isinstance(raw_terms, (list, tuple)):
+        raise ValueError("ElevenLabs keyterms must be a list of strings")
+    combined = list(raw_terms)
+
+    configured_path = str(elevenlabs_config.get("keyterms_file") or "").strip()
+    if configured_path:
+        keyterms_path = Path(configured_path).expanduser()
+        if not keyterms_path.is_absolute():
+            raise ValueError("ElevenLabs keyterms_file must be absolute")
+        if not keyterms_path.is_file():
+            raise ValueError("ElevenLabs keyterms_file does not exist")
+
+        if keyterms_path.suffix.lower() in {".yaml", ".yml"}:
+            try:
+                import yaml
+            except ImportError as exc:  # pragma: no cover - core dependency
+                raise ValueError("YAML keyterms_file requires PyYAML") from exc
+            loaded = yaml.safe_load(keyterms_path.read_text(encoding="utf-8"))
+            if loaded is None:
+                file_terms: Any = []
+            elif isinstance(loaded, dict):
+                file_terms = loaded.get("keyterms", [])
+            else:
+                file_terms = loaded
+            if not isinstance(file_terms, (list, tuple)):
+                raise ValueError(
+                    "ElevenLabs YAML keyterms_file must contain a keyterms list"
+                )
+            combined.extend(file_terms)
+        else:
+            combined.extend(
+                line.strip()
+                for line in keyterms_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            )
+
+    return _normalize_elevenlabs_keyterms(
+        combined,
+        max_keyterms=elevenlabs_config.get("max_keyterms", 95),
+    )
+
+
+def _build_elevenlabs_scribe_form(
+    model_name: str,
+    elevenlabs_config: Dict[str, Any],
+) -> list[tuple[str, str]]:
+    """Build allowlisted Scribe fields, retaining repeated keyterm entries."""
+    form: list[tuple[str, str]] = [
+        ("model_id", model_name),
+        (
+            "tag_audio_events",
+            "true"
+            if is_truthy_value(elevenlabs_config.get("tag_audio_events", False))
+            else "false",
+        ),
+        (
+            "diarize",
+            "true"
+            if is_truthy_value(elevenlabs_config.get("diarize", False))
+            else "false",
+        ),
+    ]
+    for name in ("language_code", "timestamps_granularity", "file_format"):
+        value = elevenlabs_config.get(name)
+        if value not in (None, ""):
+            form.append((name, str(value)))
+
+    if "no_verbatim" in elevenlabs_config:
+        form.append(
+            (
+                "no_verbatim",
+                "true"
+                if is_truthy_value(elevenlabs_config.get("no_verbatim"))
+                else "false",
+            )
+        )
+
+    num_speakers = elevenlabs_config.get("num_speakers")
+    if num_speakers not in (None, ""):
+        form.append(("num_speakers", str(int(num_speakers))))
+
+    for keyterm in _load_elevenlabs_keyterms(elevenlabs_config):
+        form.append(("keyterms", keyterm))
+    return form
+
+
 def _transcribe_elevenlabs(
     file_path: str, model_name: str, *, language: Optional[str] = None, prompt: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -310,12 +452,15 @@ def _transcribe_elevenlabs(
     language_code = language or _resolve_stt_language("elevenlabs", stt_config, extra_keys=("language_code",)) or ""
 
     def _post() -> Any:
-        data: Dict[str, str] = {
-            "model_id": model_name,
-            "tag_audio_events": str(is_truthy_value(elevenlabs_config.get("tag_audio_events", False))).lower(),
-            "diarize": str(is_truthy_value(elevenlabs_config.get("diarize", False))).lower(),
-            **({"language_code": language_code} if language_code else {})}
-        return _post_audio_multipart(f"{base_url}/speech-to-text", {"xi-api-key": api_key}, file_path, data)
+        data = _build_elevenlabs_scribe_form(model_name, elevenlabs_config)
+        if language_code:
+            data = [item for item in data if item[0] != "language_code"]
+            data.append(("language_code", language_code))
+        params = None
+        if "enable_logging" in elevenlabs_config:
+            params = {"enable_logging": is_truthy_value(elevenlabs_config.get("enable_logging"))}
+        return _post_audio_multipart(
+            f"{base_url}/speech-to-text", {"xi-api-key": api_key}, file_path, data, params=params)
 
     def _log(transcript_text: str, _body: Dict[str, Any]) -> None:
         logger.info("Transcribed %s via ElevenLabs Scribe (%s, %d chars)",
