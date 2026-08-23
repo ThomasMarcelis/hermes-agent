@@ -511,12 +511,22 @@ def _handle_send(args):
                 from gateway.session_context import get_session_env
                 source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli")
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+                mirror_thread_id = thread_id
+                if not mirror_thread_id and platform_name == "discord":
+                    returned_thread_id = result.get("thread_id")
+                    if returned_thread_id:
+                        mirror_thread_id = str(returned_thread_id)
+                mirror_chat_id = (
+                    mirror_thread_id
+                    if platform_name == "discord" and mirror_thread_id
+                    else chat_id
+                )
                 if mirror_to_session(
                     platform_name,
-                    chat_id,
+                    mirror_chat_id,
                     mirror_text,
                     source_label=source_label,
-                    thread_id=thread_id,
+                    thread_id=mirror_thread_id,
                     user_id=user_id,
                 ):
                     result["mirrored"] = True
@@ -922,7 +932,18 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    discord_thread_name=None,
+    discord_thread_auto_archive_duration=1440,
+    args=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1027,29 +1048,48 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
         )
         if _dc_caption is not None:
+            discord_kwargs = {
+                "thread_id": thread_id,
+                "media_files": media_files,
+                "caption": _dc_caption,
+            }
+            if discord_thread_name and not thread_id:
+                discord_kwargs.update(
+                    thread_name=discord_thread_name,
+                    thread_auto_archive_duration=discord_thread_auto_archive_duration,
+                )
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 "",
-                thread_id=thread_id,
-                media_files=media_files,
-                caption=_dc_caption,
+                **discord_kwargs,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
             return result
         last_result = None
+        resolved_thread_id = thread_id
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
+            discord_kwargs = {
+                "thread_id": resolved_thread_id,
+                "media_files": media_files if is_last else [],
+            }
+            if discord_thread_name and not resolved_thread_id:
+                discord_kwargs.update(
+                    thread_name=discord_thread_name,
+                    thread_auto_archive_duration=discord_thread_auto_archive_duration,
+                )
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
-                thread_id=thread_id,
-                media_files=media_files if is_last else [],
+                **discord_kwargs,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
+            if isinstance(result, dict) and result.get("thread_id"):
+                resolved_thread_id = str(result["thread_id"])
             last_result = result
         return last_result
 

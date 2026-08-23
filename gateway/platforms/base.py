@@ -21,6 +21,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from io import BytesIO
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -753,6 +754,9 @@ def _resolve_cache_dir(constant_name: str, new_subpath: str, old_name: str) -> P
 # photos/voice notes/short clips while still bounding a hostile upload.
 # ---------------------------------------------------------------------------
 DEFAULT_INBOUND_MEDIA_MAX_BYTES = 128 * 1024 * 1024
+DEFAULT_INBOUND_IMAGE_MAX_PIXELS = 40_000_000
+DEFAULT_INBOUND_IMAGE_MAX_TOTAL_PIXELS = 100_000_000
+DEFAULT_INBOUND_IMAGE_MAX_FRAMES = 256
 
 
 def get_inbound_media_max_bytes() -> int:
@@ -776,6 +780,37 @@ def get_inbound_media_max_bytes() -> int:
         return DEFAULT_INBOUND_MEDIA_MAX_BYTES
 
 
+def get_inbound_image_decode_limits() -> tuple[int, int, int]:
+    """Return per-frame pixels, cumulative pixels, and frame-count limits."""
+    defaults = (
+        DEFAULT_INBOUND_IMAGE_MAX_PIXELS,
+        DEFAULT_INBOUND_IMAGE_MAX_TOTAL_PIXELS,
+        DEFAULT_INBOUND_IMAGE_MAX_FRAMES,
+    )
+    keys = (
+        "max_inbound_image_pixels",
+        "max_inbound_image_total_pixels",
+        "max_inbound_image_frames",
+    )
+    try:
+        from hermes_cli.config import load_config_readonly as _load_config
+
+        cfg = _load_config()
+        gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        return defaults
+    if not isinstance(gateway_cfg, dict):
+        return defaults
+    resolved = []
+    for key, default in zip(keys, defaults):
+        try:
+            value = int(gateway_cfg.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        resolved.append(value if value > 0 else default)
+    return tuple(resolved)
+
+
 def validate_inbound_media_size(
     size: int,
     *,
@@ -796,14 +831,29 @@ def validate_inbound_media_size(
         )
 
 
-async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytes:
+async def _read_httpx_body_with_limit(
+    response,
+    *,
+    media_type: str,
+    max_bytes: Optional[int] = None,
+) -> bytes:
     """Read an httpx streaming response body without exceeding the media cap.
 
     Rejects early on an oversized ``Content-Length`` header, then re-checks
     the running total as chunks arrive so a lying/absent header can't smuggle
-    an unbounded body past the cap.
+    an unbounded body past the cap. When a caller supplies ``max_bytes``, the
+    strictest non-zero shared/caller limit wins.
     """
-    max_bytes = get_inbound_media_max_bytes()
+    configured_max = max(0, get_inbound_media_max_bytes())
+    if max_bytes is not None:
+        max_bytes = max(0, max_bytes)
+    if max_bytes is None:
+        effective_max = configured_max
+    elif configured_max and max_bytes:
+        effective_max = min(configured_max, max_bytes)
+    else:
+        effective_max = configured_max or max_bytes
+
     content_length = response.headers.get("content-length")
     if content_length:
         try:
@@ -815,16 +865,52 @@ async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytes:
             )
         else:
             validate_inbound_media_size(
-                declared_size, media_type=media_type, max_bytes=max_bytes,
+                declared_size, media_type=media_type, max_bytes=effective_max,
             )
 
     chunks: list[bytes] = []
     total = 0
     async for chunk in response.aiter_bytes():
         total += len(chunk)
-        validate_inbound_media_size(total, media_type=media_type, max_bytes=max_bytes)
+        validate_inbound_media_size(
+            total, media_type=media_type, max_bytes=effective_max
+        )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+async def download_media_bytes_from_url(
+    url: str,
+    *,
+    media_type: str = "media",
+    timeout: float = 30.0,
+    headers: Optional[dict] = None,
+    proxy_url: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+) -> bytes:
+    """Download one bounded media body with connect/redirect SSRF checks."""
+    from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+
+    if not is_safe_url(url):
+        raise ValueError(
+            f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}"
+        )
+
+    client_kwargs: dict[str, Any] = {
+        "timeout": timeout,
+        "follow_redirects": True,
+        "event_hooks": {"response": [_ssrf_redirect_guard]},
+    }
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+    async with create_ssrf_safe_async_client(**client_kwargs) as client:
+        async with client.stream("GET", url, headers=headers or {}) as response:
+            response.raise_for_status()
+            return await _read_httpx_body_with_limit(
+                response,
+                media_type=media_type,
+                max_bytes=max_bytes,
+            )
 
 
 def get_image_cache_dir() -> Path:
@@ -851,6 +937,87 @@ def _looks_like_image(data: bytes) -> bool:
     return False
 
 
+_DECODED_IMAGE_FORMATS = {
+    "JPEG": (".jpg", "image/jpeg"),
+    "PNG": (".png", "image/png"),
+    "GIF": (".gif", "image/gif"),
+    "WEBP": (".webp", "image/webp"),
+}
+_CANONICAL_IMAGE_MIME_BY_EXT = {
+    suffix: mime for suffix, mime in _DECODED_IMAGE_FORMATS.values()
+}
+
+
+def _validate_image_bytes(data: bytes, *, ext: str) -> tuple[str, str]:
+    """Fully decode image bytes and return their canonical suffix and MIME."""
+    if not _looks_like_image(data):
+        snippet = data[:80].decode("utf-8", errors="replace")
+        raise ValueError(
+            f"Refusing to cache non-image data as {ext} "
+            f"(starts with: {snippet!r})"
+        )
+
+    try:
+        import warnings
+        from PIL import Image
+
+        max_frame_pixels, max_total_pixels, max_frames = (
+            get_inbound_image_decode_limits()
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(data)) as image:
+                image_format = str(image.format or "").upper()
+                image.verify()
+        # verify() checks the container without decoding pixels. Re-open and
+        # load every frame so corrupt or oversized content cannot cross the
+        # cache boundary only to fail later in a provider adapter.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(data)) as image:
+                frame_count = int(getattr(image, "n_frames", 1) or 1)
+                if frame_count > max_frames:
+                    raise ValueError(
+                        f"image has too many frames ({frame_count} > {max_frames})"
+                    )
+                total_pixels = 0
+                for frame_index in range(frame_count):
+                    if frame_index:
+                        image.seek(frame_index)
+                    width, height = image.size
+                    frame_pixels = int(width) * int(height)
+                    if frame_pixels > max_frame_pixels:
+                        raise ValueError(
+                            "image frame exceeds decoded pixel limit "
+                            f"({frame_pixels} > {max_frame_pixels})"
+                        )
+                    total_pixels += frame_pixels
+                    if total_pixels > max_total_pixels:
+                        raise ValueError(
+                            "image exceeds cumulative decoded pixel limit "
+                            f"({total_pixels} > {max_total_pixels})"
+                        )
+                    image.load()
+    except Exception as exc:
+        raise ValueError(
+            f"Refusing to cache invalid or corrupt image as {ext}: {exc}"
+        ) from exc
+
+    canonical = _DECODED_IMAGE_FORMATS.get(image_format)
+    if canonical is None:
+        raise ValueError(
+            "Refusing to cache unsupported or ambiguous image format "
+            f"{image_format or '(unknown)'} as {ext}"
+        )
+    return canonical
+
+
+def canonical_image_mime_from_path(path: str) -> Optional[str]:
+    """Return the canonical image MIME encoded by a validated cache suffix."""
+    return _CANONICAL_IMAGE_MIME_BY_EXT.get(Path(str(path)).suffix.lower())
+
+
 def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     """
     Save raw image bytes to the cache and return the absolute file path.
@@ -863,24 +1030,25 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
         Absolute path to the cached image file as a string.
 
     Raises:
-        ValueError: If *data* does not look like a valid image (e.g. an HTML
-            error page returned by the upstream server).
+        ValueError: If *data* is not a decodable image (e.g. an HTML error
+            page or a truncated/corrupt image returned by the upstream).
     """
     validate_inbound_media_size(len(data), media_type="image")
-    if not _looks_like_image(data):
-        snippet = data[:80].decode("utf-8", errors="replace")
-        raise ValueError(
-            f"Refusing to cache non-image data as {ext} "
-            f"(starts with: {snippet!r})"
-        )
+    canonical_ext, _canonical_mime = _validate_image_bytes(data, ext=ext)
     cache_dir = get_image_cache_dir()
-    filename = f"img_{uuid.uuid4().hex[:12]}{ext}"
+    filename = f"img_{uuid.uuid4().hex[:12]}{canonical_ext}"
     filepath = cache_dir / filename
     filepath.write_bytes(data)
     return str(filepath)
 
 
-async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) -> str:
+async def cache_image_from_url(
+    url: str,
+    ext: str = ".jpg",
+    retries: int = 2,
+    *,
+    max_bytes: Optional[int] = None,
+) -> str:
     """
     Download an image from a URL and save it to the local cache.
 
@@ -922,7 +1090,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
                 ) as response:
                     response.raise_for_status()
                     content = await _read_httpx_body_with_limit(
-                        response, media_type="image",
+                        response, media_type="image", max_bytes=max_bytes,
                     )
                 return cache_image_from_bytes(content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
@@ -1022,7 +1190,13 @@ def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
     return str(filepath)
 
 
-async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) -> str:
+async def cache_audio_from_url(
+    url: str,
+    ext: str = ".ogg",
+    retries: int = 2,
+    *,
+    max_bytes: Optional[int] = None,
+) -> str:
     """
     Download an audio file from a URL and save it to the local cache.
 
@@ -1064,7 +1238,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
                 ) as response:
                     response.raise_for_status()
                     content = await _read_httpx_body_with_limit(
-                        response, media_type="audio",
+                        response, media_type="audio", max_bytes=max_bytes,
                     )
                 return cache_audio_from_bytes(content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
@@ -2245,7 +2419,9 @@ def cache_media_bytes(
             path = cache_image_from_bytes(data, ext=img_ext)
         except ValueError:
             return None
-        out_mime = mime if mime.startswith("image/") else SUPPORTED_IMAGE_DOCUMENT_TYPES.get(img_ext, "image/jpeg")
+        out_mime = canonical_image_mime_from_path(path)
+        if out_mime is None:
+            return None
         return CachedMedia(to_agent_visible_cache_path(path), out_mime, "image", display)
 
     if is_video:
@@ -2294,6 +2470,45 @@ class ProcessingOutcome(Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     CANCELLED = "cancelled"
+
+
+def normalize_cached_image_media_types(event: Any) -> None:
+    """Reconcile cached image paths with adapter-supplied MIME labels."""
+    media_urls = getattr(event, "media_urls", None) or []
+    media_types = getattr(event, "media_types", None)
+    if media_types is None:
+        media_types = []
+        event.media_types = media_types
+    for index, path in enumerate(media_urls):
+        claimed_mime = str(
+            media_types[index] if index < len(media_types) else ""
+        )
+        if not (
+            claimed_mime.startswith("image/")
+            or getattr(event, "message_type", None) == MessageType.PHOTO
+        ):
+            continue
+        canonical_mime = canonical_image_mime_from_path(path)
+        if canonical_mime is None:
+            continue
+        while len(media_types) <= index:
+            media_types.append("")
+        media_types[index] = canonical_mime
+
+    single_path = getattr(event, "media_path", None)
+    single_claimed = str(getattr(event, "media_mime_type", "") or "")
+    if single_path and (
+        single_claimed.startswith("image/")
+        or getattr(event, "message_type", None) == MessageType.PHOTO
+    ):
+        canonical_mime = canonical_image_mime_from_path(single_path)
+        if canonical_mime:
+            event.media_mime_type = canonical_mime
+            metadata = getattr(event, "metadata", None)
+            if isinstance(metadata, dict):
+                for key in ("mime_type", "content_type"):
+                    if key in metadata:
+                        metadata[key] = canonical_mime
 
 
 @dataclass
@@ -6053,6 +6268,7 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        normalize_cached_image_media_types(event)
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
 

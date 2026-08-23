@@ -27734,9 +27734,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Build the shared ``StreamConsumerConfig`` and the optional
         Telegram pause-typing closure used by both agent-run paths.
 
-        ``on_missing_cursor`` controls how platforms whose adapter sets
-        ``SUPPORTS_MESSAGE_EDITING = False`` are handled — both semantics
-        are preserved verbatim from the pre-refactor call sites:
+        Adapters with ``FINAL_ONLY_DELIVERY`` always raise: immutable webhook
+        delivery surfaces must emit exactly one final result, so even a
+        cursorless preview would be a separate real message.
+        ``on_missing_cursor`` controls how other platforms whose adapter sets
+        ``SUPPORTS_MESSAGE_EDITING = False`` are handled — both semantics are
+        preserved verbatim from the pre-refactor call sites:
 
         - ``"fallback"`` (proxy path): stream anyway with an empty cursor.
         - ``"raise"`` (in-process agent path): raise ``RuntimeError`` so
@@ -27745,6 +27748,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns ``(consumer_cfg, pause_typing_before_finalize)``.
         """
         from gateway.stream_consumer import StreamConsumerConfig
+
+        if getattr(adapter, "FINAL_ONLY_DELIVERY", False):
+            raise RuntimeError("skip streaming for final-only delivery adapter")
 
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
@@ -28406,10 +28412,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _phrase_err:
                 logger.debug("generic status phrase selection failed: %s", _phrase_err)
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
-        # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
+        # Immutable delivery surfaces must remain final-only: every progress,
+        # thinking, status, or stream update would become a separate permanent
+        # delivery rather than an editable preview.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        _delivery_adapter = self._adapter_for_source(source)
+        _final_only_delivery = bool(
+            getattr(_delivery_adapter, "FINAL_ONLY_DELIVERY", False)
+        )
+        tool_progress_enabled = (
+            progress_mode not in {"off", "log"}
+            and not _final_only_delivery
+        )
         # Live working-state status for text-rendering typing indicators
         # (Slack's assistant status line). Independent of tool_progress —
         # Slack defaults tool_progress off (permanent lines spam channels)
@@ -28420,7 +28434,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _live_status_mode = resolve_display_setting(
             user_config, platform_key, "live_status", "full"
         )
-        _live_status_adapter = self._adapter_for_source(source)
+        _live_status_adapter = (
+            None if _final_only_delivery else _delivery_adapter
+        )
         if not getattr(_live_status_adapter, "supports_status_text", False):
             _live_status_adapter = None
         if _live_status_mode == "off":
@@ -28438,7 +28454,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
+            not _final_only_delivery
             and interim_assistant_messages_mode != "off"
         )
         # thinking_progress is independent — if enabled, we need the progress
@@ -28450,7 +28466,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=False,
             require_platform_override_for={Platform.MATTERMOST},
         )
-        _thinking_enabled = _thinking_mode != "off"
+        _thinking_enabled = (
+            not _final_only_delivery and _thinking_mode != "off"
+        )
         # Slack-native task cards (#29483): when the Slack adapter's opt-in
         # is set, tool progress renders as native plan/task cards via
         # chat.startStream — the progress queue is needed even though Slack
@@ -28780,7 +28798,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self._adapter_for_source(source)
+        _status_adapter = None if _final_only_delivery else _delivery_adapter
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
@@ -29007,8 +29025,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _notify_start = time.time()
 
         async def _notify_long_running():
-            if _NOTIFY_INTERVAL is None:
-                return  # Notifications disabled (gateway_notify_interval: 0)
+            if _NOTIFY_INTERVAL is None or _final_only_delivery:
+                return  # Notifications disabled for config/final-only delivery
             _notify_adapter = self._adapter_for_source(source)
             if not _notify_adapter:
                 return

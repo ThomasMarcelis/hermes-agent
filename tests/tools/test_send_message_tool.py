@@ -144,11 +144,26 @@ class _patch_discord_sender:
         self._entry = None
         self._original = None
 
-    async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, media_files=None, caption=None):
+    async def _adapter(
+        self,
+        pconfig,
+        chat_id,
+        message,
+        *,
+        thread_id=None,
+        media_files=None,
+        caption=None,
+        thread_name=None,
+        thread_auto_archive_duration=1440,
+    ):
         token = getattr(pconfig, "token", None)
-        # Only forward caption= when set, so mocks written against the
-        # pre-caption signature (no caption kwarg) keep working.
+        # Only forward optional kwargs when set, preserving older mock contracts.
         extra = {"caption": caption} if caption is not None else {}
+        if thread_name is not None:
+            extra.update(
+                thread_name=thread_name,
+                thread_auto_archive_duration=thread_auto_archive_duration,
+            )
         return await self._mock(
             token, chat_id, message,
             thread_id=thread_id, media_files=media_files, **extra,

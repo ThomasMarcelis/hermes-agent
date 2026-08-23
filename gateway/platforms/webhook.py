@@ -177,6 +177,10 @@ def check_webhook_requirements() -> bool:
 class WebhookAdapter(BasePlatformAdapter):
     """Generic webhook receiver that triggers agent runs from HTTP POSTs."""
 
+    # Webhook delivery targets are immutable side effects, not editable chat
+    # previews. The gateway must emit exactly one final result per accepted run.
+    FINAL_ONLY_DELIVERY = True
+
     # No human is present to answer a "session restored — what next?" prompt:
     # webhook runs are event-triggered.  The startup auto-resume turn must
     # instruct the model to FINISH the interrupted work instead of emitting an
@@ -448,17 +452,37 @@ class WebhookAdapter(BasePlatformAdapter):
         window.append(now)
         return True
 
-    def _record_delivery_id(self, delivery_id: str, now: float) -> bool:
-        """Return True when this delivery should be processed."""
-        seen_at = self._seen_deliveries.get(delivery_id)
+    def _record_delivery_id(self, delivery_key: str, now: float) -> bool:
+        """Return True when this profile/route/provider delivery is new."""
+        seen_at = self._seen_deliveries.get(delivery_key)
         if seen_at is not None and now - seen_at < self._idempotency_ttl:
             return False
         if seen_at is not None:
-            self._seen_deliveries.pop(delivery_id, None)
-        self._seen_deliveries[delivery_id] = now
+            self._seen_deliveries.pop(delivery_key, None)
+        self._seen_deliveries[delivery_key] = now
         if len(self._seen_deliveries) > max(self._rate_limit * 2, 128):
             self._prune_seen_deliveries(now)
         return True
+
+    def _effective_delivery_profile(
+        self, request_profile: Optional[str] = None
+    ) -> str:
+        """Resolve the profile owning ingress, egress, and idempotency state."""
+        if request_profile:
+            return str(request_profile)
+        runner = self.gateway_runner
+        active_name = getattr(runner, "_active_profile_name", None)
+        if callable(active_name):
+            try:
+                return str(active_name() or "default")
+            except Exception:
+                pass
+        return "default"
+
+    @staticmethod
+    def _delivery_claim_key(profile: str, route_name: str, delivery_id: str) -> str:
+        """Build the full idempotency namespace for a provider delivery."""
+        return f"{profile}:{route_name}:{delivery_id}"
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
@@ -664,6 +688,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"error": f"Unknown route: {route_name}"}, status=404
             )
 
+        delivery_profile = self._effective_delivery_profile(
+            profile if isinstance(profile, str) else None
+        )
+
         # Disabled routes are kept in the subscriptions file (so the dashboard
         # can re-enable them) but reject incoming events.  Default-enabled:
         # only an explicit ``enabled: false`` turns a route off, matching the
@@ -849,12 +877,21 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
         )
 
+        # Namespace provider IDs by profile and route. Providers frequently
+        # reuse request IDs across endpoints; retries must dedupe only within
+        # the same ingress identity.
+        delivery_key = self._delivery_claim_key(
+            delivery_profile, route_name, delivery_id
+        )
+
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
+        if not self._record_delivery_id(delivery_key, now):
             logger.info(
-                "[webhook] Skipping duplicate delivery %s", delivery_id
+                "[webhook] Skipping duplicate delivery %s (%s)",
+                delivery_id,
+                delivery_key,
             )
             return web.json_response(
                 {"status": "duplicate", "delivery_id": delivery_id},
@@ -873,6 +910,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 "deliver_extra": self._render_delivery_extra(
                     route_config.get("deliver_extra", {}), payload
                 ),
+                "profile": delivery_profile,
+                "route": route_name,
                 "payload": payload,
             }
             logger.info(
@@ -886,6 +925,10 @@ class WebhookAdapter(BasePlatformAdapter):
             try:
                 result = await self._direct_deliver(prompt, delivery)
             except Exception:
+                # The provider must be able to retry a delivery that never
+                # reached its target. Only successful/accepted work owns the
+                # idempotency claim for the full TTL.
+                self._seen_deliveries.pop(delivery_key, None)
                 logger.exception(
                     "[webhook] direct-deliver failed route=%s delivery=%s",
                     route_name,
@@ -906,8 +949,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     },
                     status=200,
                 )
-            # Delivery attempted but target rejected it — surface as 502
-            # with a generic error (don't leak adapter-level detail).
+            # Delivery attempted but target rejected it — release the claim so
+            # provider retries can succeed, then surface a generic 502.
+            self._seen_deliveries.pop(delivery_key, None)
             logger.warning(
                 "[webhook] direct-deliver target rejected route=%s target=%s error=%s",
                 route_name,
@@ -931,6 +975,9 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+            "profile": delivery_profile,
+            "route": route_name,
+            "payload": payload,
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
@@ -1434,28 +1481,38 @@ class WebhookAdapter(BasePlatformAdapter):
                 success=False, error=f"Unknown platform: {platform_name}"
             )
 
-        # Default adapters first; multiplex may park Slack/etc. only on a
-        # secondary profile (self._profile_adapters). Fall back so webhook
-        # deliver:slack still works when default has slack disabled.
-        adapter = self.gateway_runner.adapters.get(target_platform)
-        if not adapter:
-            for _prof, amap in (getattr(self.gateway_runner, "_profile_adapters", None) or {}).items():
-                if not isinstance(amap, dict):
-                    continue
-                cand = amap.get(target_platform)
-                if cand is not None:
-                    adapter = cand
-                    break
+        # Select only the adapter map owned by the ingress profile. Falling
+        # through to "the first connected adapter" can cross tenants when two
+        # profiles use the same logical delivery platform.
+        delivery_profile = self._effective_delivery_profile(delivery.get("profile"))
+        active_profile = self._effective_delivery_profile()
+        if delivery_profile == active_profile:
+            adapter_map = getattr(self.gateway_runner, "adapters", {}) or {}
+        else:
+            profile_maps = getattr(self.gateway_runner, "_profile_adapters", {}) or {}
+            adapter_map = profile_maps.get(delivery_profile, {}) or {}
+        adapter = adapter_map.get(target_platform) if isinstance(adapter_map, dict) else None
         if not adapter:
             return SendResult(
                 success=False,
-                error=f"Platform {platform_name} not connected",
+                error=(
+                    f"Platform {platform_name} not connected for profile "
+                    f"{delivery_profile}"
+                ),
             )
 
         # Use home channel if no specific chat_id in deliver_extra
         extra = delivery.get("deliver_extra", {})
         chat_id = extra.get("chat_id", "")
         if not chat_id:
+            if delivery_profile != active_profile:
+                return SendResult(
+                    success=False,
+                    error=(
+                        f"No explicit chat_id for {platform_name} delivery on "
+                        f"secondary profile {delivery_profile}"
+                    ),
+                )
             home = self.gateway_runner.config.get_home_channel(target_platform)
             if home:
                 chat_id = home.chat_id
