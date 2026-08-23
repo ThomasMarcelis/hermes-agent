@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import random
@@ -40,6 +41,7 @@ from hermes_cli.auth import (
     _save_provider_state,
     _store_provider_state,
     read_credential_pool,
+    select_and_increment_credential_pool_entry,
     write_credential_pool,
 )
 
@@ -833,6 +835,36 @@ class CredentialPool:
             ]
             return matches[0].id if len(matches) == 1 else None
 
+    def runtime_api_key_matches(
+        self,
+        entry_id: str,
+        api_key: str,
+    ) -> Optional[bool]:
+        """Compare an entry's current runtime token without exposing it.
+
+        ``None`` means the identity no longer exists. ``False`` distinguishes
+        a same-ID token refresh from a failure of the credential revision that
+        is currently persisted in the pool.
+        """
+        normalized_id = str(entry_id or "").strip()
+        if not normalized_id:
+            return None
+        with self._lock:
+            entry = next(
+                (
+                    candidate
+                    for candidate in self._entries
+                    if candidate.id == normalized_id
+                ),
+                None,
+            )
+            if entry is None:
+                return None
+            return hmac.compare_digest(
+                str(entry.runtime_api_key or "").encode("utf-8"),
+                str(api_key or "").encode("utf-8"),
+            )
+
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
         """Swap an entry in-place by id, preserving sort order.
 
@@ -847,14 +879,17 @@ class CredentialPool:
                     return
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
-        # Self-locking (RLock): snapshotting self._entries must not race a
-        # concurrent rotation when called from the deferred refresh path.
+        # Snapshot under the pool lock, then release it before touching the
+        # auth store. OAuth refresh takes the canonical opposite pair only as
+        # auth-store lock followed by a short pool mutation. Holding this lock
+        # around write_credential_pool() would recreate that inversion.
         with self._lock:
-            write_credential_pool(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=removed_ids,
-            )
+            entries = [entry.to_dict() for entry in self._entries]
+        write_credential_pool(
+            self.provider,
+            entries,
+            removed_ids=removed_ids,
+        )
 
     def _is_terminal_auth_failure(
         self,
@@ -2132,6 +2167,8 @@ class CredentialPool:
         return False
 
     def select(self) -> Optional[PooledCredential]:
+        if self._strategy == STRATEGY_LEAST_USED:
+            return self._select_least_used()
         entry, pending_refresh = self._select_under_lock()
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
@@ -2145,6 +2182,81 @@ class CredentialPool:
             if entry is not None:
                 self._unmatched_rotation_streak = 0
         return entry
+
+    def _select_least_used(self) -> Optional[PooledCredential]:
+        """Choose and count least-used credentials in durable shared state.
+
+        Availability is first derived from this process's hydrated pool, but
+        the final candidate is revalidated and chosen under the cross-process
+        auth transaction. The durable helper returns the latest disk row so
+        merging it here cannot overwrite a concurrent OAuth refresh.
+        """
+        # This path deliberately runs outside self._lock. Availability checks
+        # can synchronize OAuth state and persist cooldown changes; the final
+        # auth transaction must never wait while holding the pool lock.
+        available, pending_refresh = self._available_entries(
+            clear_expired=True,
+            refresh=True,
+        )
+        candidates = list(available)
+
+        if pending_refresh:
+            self._refresh_pending_entries(pending_refresh)
+
+        if not candidates:
+            if pending_refresh:
+                candidates, _ = self._available_entries(
+                    clear_expired=True,
+                    refresh=False,
+                )
+            if not candidates:
+                with self._lock:
+                    self._current_id = None
+                    self._log_no_available_entries()
+                return None
+
+        persisted = select_and_increment_credential_pool_entry(
+            self.provider,
+            [entry.to_dict() for entry in candidates],
+        )
+        if persisted is None:
+            # Every stale snapshot candidate became dead/exhausted before the
+            # auth transaction. Never fall back to the pre-lock candidate.
+            with self._lock:
+                self._current_id = None
+                self._log_no_available_entries()
+            return None
+
+        selected_id = str(persisted.get("id") or "")
+        runtime_entry = next(
+            (entry for entry in candidates if entry.id == selected_id),
+            None,
+        )
+        updated = PooledCredential.from_dict(self.provider, persisted)
+        if runtime_entry is not None and is_borrowed_credential_source(
+            runtime_entry.source,
+            self.provider,
+        ):
+            # Borrowed secrets never cross the persistence boundary. Reattach
+            # only runtime values from the exact selected candidate.
+            updated = replace(
+                updated,
+                access_token=runtime_entry.access_token,
+                refresh_token=runtime_entry.refresh_token,
+                agent_key=runtime_entry.agent_key,
+            )
+
+        with self._lock:
+            current = next(
+                (entry for entry in self._entries if entry.id == selected_id),
+                None,
+            )
+            if current is not None:
+                self._replace_entry(current, updated)
+            self._current_id = selected_id
+            self._last_no_entries_log_at = None
+        self._unmatched_rotation_streak = 0
+        return updated
 
     def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
         """Run selection under the lock, returning entry + pending refreshes."""
@@ -2369,14 +2481,6 @@ class CredentialPool:
             entry = random.choice(available)
             self._current_id = entry.id
             return entry, pending_refresh
-
-        if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
-            entry = min(available, key=lambda e: e.request_count)
-            # Increment usage counter so subsequent selections distribute load
-            updated = replace(entry, request_count=entry.request_count + 1)
-            self._replace_entry(entry, updated)
-            self._current_id = entry.id
-            return updated, pending_refresh
 
         if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
             entry = available[0]

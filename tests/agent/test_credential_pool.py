@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import json
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -1700,6 +1702,420 @@ class TestLeastUsedStrategy:
             "least_used should alternate or increment"
         )
 
+
+    def test_stale_counter_snapshot_preserves_concurrent_oauth_refresh(
+        self, tmp_path, monkeypatch
+    ):
+        """The narrow counter write must adopt, never overwrite, disk auth."""
+        from unittest.mock import patch as _patch
+
+        from agent.credential_pool import (
+            CredentialPool,
+            PooledCredential,
+            STRATEGY_LEAST_USED,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        stale_entries = [
+            PooledCredential(
+                provider="openai-codex",
+                id="cred-a",
+                label="selected",
+                auth_type="oauth",
+                source="manual:device_code",
+                access_token="stale-access",
+                refresh_token="stale-refresh",
+                priority=0,
+                request_count=4,
+            ),
+            PooledCredential(
+                provider="openai-codex",
+                id="cred-b",
+                label="other-stale",
+                auth_type="oauth",
+                source="manual:device_code",
+                access_token="other-access",
+                refresh_token="other-refresh",
+                priority=1,
+                request_count=9,
+            ),
+        ]
+        with _patch(
+            "agent.credential_pool.get_pool_strategy",
+            return_value=STRATEGY_LEAST_USED,
+        ):
+            pool = CredentialPool("openai-codex", stale_entries)
+
+        concurrently_refreshed = {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "fresh-access",
+                        "refresh_token": "fresh-refresh",
+                    },
+                    "last_refresh": "2026-08-01T09:00:00Z",
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        **stale_entries[0].to_dict(),
+                        "access_token": "fresh-access",
+                        "refresh_token": "fresh-refresh",
+                        "request_count": 6,
+                        "last_refresh": "2026-08-01T09:00:00Z",
+                        "extra_concurrent_state": {"keep_selected": True},
+                    },
+                    {
+                        **stale_entries[1].to_dict(),
+                        "label": "other-concurrently-updated",
+                        "request_count": 12,
+                        "extra_concurrent_state": {"keep": True},
+                    },
+                ]
+            },
+        }
+        _write_auth_store(tmp_path, concurrently_refreshed)
+        monkeypatch.setattr(
+            "agent.credential_pool._codex_access_token_is_expiring",
+            lambda *_args, **_kwargs: False,
+        )
+
+        selected = pool.select()
+
+        assert selected is not None
+        assert selected.id == "cred-a"
+        assert selected.access_token == "fresh-access"
+        assert selected.refresh_token == "fresh-refresh"
+        assert selected.request_count == 7
+
+        final = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+        persisted = final["credential_pool"]["openai-codex"]
+        persisted_a = next(row for row in persisted if row["id"] == "cred-a")
+        persisted_b = next(row for row in persisted if row["id"] == "cred-b")
+        assert persisted_a["access_token"] == "fresh-access"
+        assert persisted_a["refresh_token"] == "fresh-refresh"
+        assert persisted_a["request_count"] == 7
+        assert persisted_a["extra_concurrent_state"] == {"keep_selected": True}
+        assert persisted_b == concurrently_refreshed["credential_pool"]["openai-codex"][1]
+        assert final["providers"] == concurrently_refreshed["providers"]
+
+    def test_least_used_counter_keeps_borrowed_runtime_secret_in_memory(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch as _patch
+
+        from agent.credential_pool import (
+            CredentialPool,
+            PooledCredential,
+            STRATEGY_LEAST_USED,
+        )
+        from hermes_cli.auth import write_credential_pool
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        entries = [
+            PooledCredential(
+                provider="openrouter",
+                id="borrowed-a",
+                label="environment a",
+                auth_type="api_key",
+                source="env:OPENROUTER_API_KEY",
+                access_token="synthetic-runtime-a",
+                priority=0,
+            ),
+            PooledCredential(
+                provider="openrouter",
+                id="borrowed-b",
+                label="environment b",
+                auth_type="api_key",
+                source="env:OPENROUTER_API_KEY_2",
+                access_token="synthetic-runtime-b",
+                priority=1,
+                request_count=5,
+            ),
+        ]
+        write_credential_pool("openrouter", [entry.to_dict() for entry in entries])
+        with _patch(
+            "agent.credential_pool.get_pool_strategy",
+            return_value=STRATEGY_LEAST_USED,
+        ):
+            pool = CredentialPool("openrouter", entries)
+
+        selected = pool.select()
+
+        assert selected is not None
+        assert selected.runtime_api_key == "synthetic-runtime-a"
+        persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+        persisted_a = persisted["credential_pool"]["openrouter"][0]
+        assert persisted_a["request_count"] == 1
+        assert "access_token" not in persisted_a
+
+    def test_independent_stale_pools_choose_durable_least_used_rows(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch as _patch
+
+        from agent.credential_pool import (
+            CredentialPool,
+            PooledCredential,
+            STRATEGY_LEAST_USED,
+        )
+        from hermes_cli.auth import write_credential_pool
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        entries = [
+            PooledCredential(
+                provider="openrouter",
+                id=entry_id,
+                label=entry_id,
+                auth_type="api_key",
+                source="manual",
+                access_token=f"token-{entry_id}",
+                priority=index,
+            )
+            for index, entry_id in enumerate(("a", "b"))
+        ]
+        write_credential_pool("openrouter", [entry.to_dict() for entry in entries])
+        with _patch(
+            "agent.credential_pool.get_pool_strategy",
+            return_value=STRATEGY_LEAST_USED,
+        ):
+            pool_one = CredentialPool("openrouter", list(entries))
+            pool_two = CredentialPool("openrouter", list(entries))
+
+        first = pool_one.select()
+        second = pool_two.select()
+
+        assert first is not None and second is not None
+        assert (first.id, second.id) == ("a", "b")
+        persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+        counts = {
+            row["id"]: row["request_count"]
+            for row in persisted["credential_pool"]["openrouter"]
+        }
+        assert counts == {"a": 1, "b": 1}
+
+    def test_least_used_auth_transaction_runs_without_pool_lock(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch as _patch
+
+        from agent.credential_pool import (
+            CredentialPool,
+            PooledCredential,
+            STRATEGY_LEAST_USED,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        entries = [
+            PooledCredential(
+                provider="test",
+                id=entry_id,
+                label=entry_id,
+                auth_type="api_key",
+                source="manual",
+                access_token=f"token-{entry_id}",
+                priority=index,
+            )
+            for index, entry_id in enumerate(("a", "b"))
+        ]
+        with _patch(
+            "agent.credential_pool.get_pool_strategy",
+            return_value=STRATEGY_LEAST_USED,
+        ):
+            pool = CredentialPool("test", entries)
+
+        def durable_select(_provider, candidates):
+            assert pool._lock.acquire(blocking=False), (
+                "auth-store transaction entered while pool lock was held"
+            )
+            pool._lock.release()
+            selected = dict(candidates[0])
+            selected["request_count"] = 1
+            return selected
+
+        with _patch(
+            "agent.credential_pool.select_and_increment_credential_pool_entry",
+            side_effect=durable_select,
+        ):
+            selected = pool.select()
+
+        assert selected is not None
+        assert selected.id == "a"
+
+    def test_least_used_exhausted_oauth_sync_cannot_cross_lock_deadlock(
+        self, monkeypatch
+    ):
+        """Auth-store-first refresh can take the pool lock during selection.
+
+        The historical least-used path held ``pool._lock`` while an exhausted
+        Codex row waited for ``_auth_store_lock``.  A concurrent refresh held
+        that auth lock and then needed the pool lock to publish its rotated
+        token, producing a deterministic cycle.  The refresh-side acquisition
+        below must succeed while selection is waiting on the auth store.
+        """
+        from unittest.mock import patch as _patch
+
+        from agent.credential_pool import (
+            CredentialPool,
+            PooledCredential,
+            STATUS_EXHAUSTED,
+            STRATEGY_LEAST_USED,
+        )
+
+        entry = PooledCredential(
+            provider="openai-codex",
+            id="codex-oauth",
+            label="Codex OAuth",
+            auth_type="oauth",
+            source="device_code",
+            access_token="stale-access",
+            refresh_token="stale-refresh",
+            priority=0,
+            last_status=STATUS_EXHAUSTED,
+            last_status_at=time.time(),
+            last_error_code=429,
+            last_error_reset_at=time.time() + 3600,
+        )
+        with _patch(
+            "agent.credential_pool.get_pool_strategy",
+            return_value=STRATEGY_LEAST_USED,
+        ):
+            pool = CredentialPool("openai-codex", [entry])
+
+        auth_lock = threading.Lock()
+        auth_held = threading.Event()
+        selection_waiting = threading.Event()
+        refresh_pool_acquired: list[bool] = []
+
+        @contextmanager
+        def ordered_auth_lock(*_args, **_kwargs):
+            if threading.current_thread().name == "least-used-selector":
+                selection_waiting.set()
+            auth_lock.acquire()
+            try:
+                yield
+            finally:
+                auth_lock.release()
+
+        def refresh_side() -> None:
+            with ordered_auth_lock():
+                auth_held.set()
+                if not selection_waiting.wait(timeout=1.0):
+                    refresh_pool_acquired.append(False)
+                    return
+                acquired = pool._lock.acquire(timeout=1.0)
+                refresh_pool_acquired.append(acquired)
+                if acquired:
+                    pool._lock.release()
+
+        selected: list[PooledCredential | None] = []
+
+        def select_side() -> None:
+            selected.append(pool.select())
+
+        fresh_state = {
+            "tokens": {
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+            }
+        }
+
+        def durable_select(_provider, candidates):
+            result = dict(candidates[0])
+            result["request_count"] = int(result.get("request_count", 0)) + 1
+            return result
+
+        monkeypatch.setattr(
+            "agent.credential_pool._auth_store_lock", ordered_auth_lock
+        )
+        monkeypatch.setattr("agent.credential_pool._load_auth_store", lambda: {})
+        monkeypatch.setattr(
+            "agent.credential_pool._load_provider_state",
+            lambda _store, _provider: fresh_state,
+        )
+        monkeypatch.setattr(pool, "_persist", lambda **_kwargs: None)
+        monkeypatch.setattr(
+            "agent.credential_pool.select_and_increment_credential_pool_entry",
+            durable_select,
+        )
+
+        refresh = threading.Thread(target=refresh_side, name="codex-refresh")
+        selector = threading.Thread(target=select_side, name="least-used-selector")
+        refresh.start()
+        assert auth_held.wait(timeout=1.0)
+        selector.start()
+        refresh.join(timeout=2.0)
+        selector.join(timeout=2.0)
+
+        assert not refresh.is_alive()
+        assert not selector.is_alive()
+        assert refresh_pool_acquired == [True], (
+            "least-used selection held the pool lock while waiting for auth.json"
+        )
+        assert selected and selected[0] is not None
+        assert selected[0].access_token == "fresh-access"
+
+    @pytest.mark.parametrize("concurrent_change", ["dead", "removed"])
+    def test_least_used_revalidates_candidate_inside_auth_transaction(
+        self, tmp_path, monkeypatch, concurrent_change
+    ):
+        from unittest.mock import patch as _patch
+
+        from agent.credential_pool import (
+            CredentialPool,
+            PooledCredential,
+            STATUS_DEAD,
+            STRATEGY_LEAST_USED,
+        )
+        from hermes_cli.auth import write_credential_pool
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        entries = [
+            PooledCredential(
+                provider="openrouter", id="stale-minimum", label="stale minimum",
+                auth_type="api_key", source="manual", access_token="token-a",
+                priority=0, request_count=0,
+            ),
+            PooledCredential(
+                provider="openrouter", id="live-fallback", label="live fallback",
+                auth_type="api_key", source="manual", access_token="token-b",
+                priority=1, request_count=5,
+            ),
+        ]
+        with _patch(
+            "agent.credential_pool.get_pool_strategy",
+            return_value=STRATEGY_LEAST_USED,
+        ):
+            pool = CredentialPool("openrouter", entries)
+
+        disk_rows = [entry.to_dict() for entry in entries]
+        removed_ids = None
+        if concurrent_change == "dead":
+            disk_rows[0].update(
+                last_status=STATUS_DEAD,
+                last_status_at=time.time(),
+                last_error_reason="concurrent quarantine",
+            )
+        else:
+            disk_rows = [disk_rows[1]]
+            removed_ids = ["stale-minimum"]
+        write_credential_pool("openrouter", disk_rows, removed_ids=removed_ids)
+
+        selected = pool.select()
+
+        assert selected is not None and selected.id == "live-fallback"
+        final = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+        rows = {
+            row["id"]: row for row in final["credential_pool"]["openrouter"]
+        }
+        if concurrent_change == "dead":
+            assert rows["stale-minimum"]["last_status"] == STATUS_DEAD
+            assert rows["stale-minimum"]["request_count"] == 0
+        else:
+            assert "stale-minimum" not in rows
+        assert rows["live-fallback"]["request_count"] == 6
 
 # ── PR #10160 salvage: Nous OAuth cross-process sync tests ─────────────────
 
