@@ -107,9 +107,15 @@ DEFAULT_CONFIG = {
         # whole call; the OpenAI SDK also retries transient errors (max_retries=2). Set 1 for fast
         # failover to fallback providers; raise to tolerate longer provider hiccups.
         "api_max_retries": 3,
-        # Empty-response retry guard. Empty retries re-send the full input at full price; this stops
-        # re-billing deterministic empties (unsignaled refusals, zero output tokens) while failing
-        # open on ambiguous evidence (missing usage, any tokens, model/provider change).
+        # Timeout for the sync-to-async tool bridge when Hermes is already
+        # running inside an event loop. Long-running tools may raise this.
+        "async_tool_timeout_seconds": 300,
+        # Empty-response retry guard (NS-503).  The empty-retry loop
+        # re-sends the full conversation input at full price on every
+        # attempt; these settings stop it from re-billing *deterministic*
+        # empties (unsignaled provider refusals with zero output tokens)
+        # while failing open on any ambiguous evidence (missing usage,
+        # any generated tokens, model/provider change mid-streak).
         "empty_response_guard": {
             "enabled": True,  # False = legacy fixed 3 retries unconditionally
             # When one empty attempt's estimated input cost >= this USD, the streak's retry budget

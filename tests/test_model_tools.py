@@ -1,16 +1,58 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
-from unittest.mock import patch
+import math
+from unittest.mock import ANY, call, patch
 
+import pytest
 
 from model_tools import (
+    _async_tool_timeout_seconds,
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
 )
+
+
+# =========================================================================
+# Async tool timeout resolution
+# =========================================================================
+
+class TestAsyncToolTimeoutResolution:
+    def test_config_value_overrides_bridge_default(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  async_tool_timeout_seconds: 21600\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        assert _async_tool_timeout_seconds() == 21600.0
+
+    @pytest.mark.parametrize(
+        "configured",
+        [
+            "not-a-number",
+            math.inf,
+            math.nan,
+            0,
+            -1,
+            0.5,
+            86_401,
+            10**100,
+        ],
+    )
+    def test_invalid_non_finite_or_pathological_values_use_default(
+        self, configured
+    ):
+        with patch("hermes_cli.config.load_config_readonly") as load_config:
+            load_config.return_value = {
+                "agent": {"async_tool_timeout_seconds": configured}
+            }
+            assert _async_tool_timeout_seconds() == 300.0
 
 
 # =========================================================================

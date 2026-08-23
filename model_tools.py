@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from contextvars import ContextVar
 import logging
+import math
 import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
@@ -88,6 +89,49 @@ def _get_worker_loop():
     return loop
 
 
+_MIN_ASYNC_TOOL_TIMEOUT_SECONDS = 1.0
+_MAX_ASYNC_TOOL_TIMEOUT_SECONDS = 86_400.0
+
+
+def _coerce_positive_timeout(value: Any) -> Optional[float]:
+    """Return a finite, operationally sane timeout, or ``None`` if invalid."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timeout):
+        return None
+    if not (
+        _MIN_ASYNC_TOOL_TIMEOUT_SECONDS
+        <= timeout
+        <= _MAX_ASYNC_TOOL_TIMEOUT_SECONDS
+    ):
+        return None
+    return timeout
+
+
+def _async_tool_timeout_seconds(default: float = 300.0) -> float:
+    """Resolve the event-loop bridge timeout from ``config.yaml``."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        configured = _coerce_positive_timeout(
+            cfg_get(
+                load_config_readonly(),
+                "agent",
+                "async_tool_timeout_seconds",
+            )
+        )
+        if configured is not None:
+            return configured
+    except Exception:
+        logger.debug(
+            "Could not resolve async tool timeout; using default",
+            exc_info=True,
+        )
+    return float(default)
+
+
 def _run_async(coro):
     """Run a coroutine from sync code; safe under a running loop (gateway/RL env)."""
     try:
@@ -121,11 +165,13 @@ def _run_async(coro):
                 worker_loop.close()
 
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        # Carry profile + approval/sudo context so get_hermes_home() resolves correctly.
+        timeout_seconds = _async_tool_timeout_seconds()
+        # Carry the active profile + approval/sudo callbacks into the worker so
+        # async tools resolve get_hermes_home() under the active profile.
         from tools.thread_context import propagate_context_to_thread
         future = pool.submit(propagate_context_to_thread(_run_in_worker))
         try:
-            return future.result(timeout=300)
+            return future.result(timeout=timeout_seconds)
         except concurrent.futures.TimeoutError:
             # Cancel inside the worker's own loop so the thread can wind down.
             if loop_ready.wait(timeout=1.0) and worker_loop is not None:
