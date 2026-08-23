@@ -99,6 +99,16 @@ def _get_max_concurrent_children() -> int:
         )
     return result
 
+def _get_top_level_completion_mode() -> str:
+    """Root model calls join unless the operator explicitly selects detached completion."""
+    value = _cfg().get("top_level_completion", "join")
+    normalized = str(value or "join").strip().lower()
+    if normalized in {"join", "detach"}:
+        return normalized
+    logger.warning("delegation.top_level_completion=%r is invalid; using 'join'", value)
+    return "join"
+
+
 def _get_independent_completions() -> bool:
     """delegation.independent_completions (bool, default False): split a background call into per-task / per-group
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""

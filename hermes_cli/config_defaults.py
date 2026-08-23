@@ -1219,6 +1219,9 @@ DEFAULT_CONFIG = {
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
     # every configured provider is supported.
     "delegation": {
+        # Root calls join all child outcomes for one synthesis. Explicit detach delivers
+        # later completions; nested orchestrators always join their own workers.
+        "top_level_completion": "join",
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
         # Fallback chain for delegated children (same entry format as the top-level list).

@@ -1,9 +1,7 @@
-"""The CLI spells out auto-resume when a delegate_task goes to the background.
+"""Explicitly detached delegation prints a later-resume notice; joined results remain silent.
 
-A top-level ``delegate_task`` returns a handle immediately and runs the subagent
-in the background; the result re-enters the conversation as a fresh turn when it
-finishes. ``_on_tool_complete`` prints a one-line, no-spinner reassurance at
-dispatch so the idle prompt doesn't read as "nothing happened".
+With delegation.top_level_completion=detach the tool returns a handle and the result
+re-enters as a new turn. The default joined result has no dispatched/background markers.
 """
 
 import json
@@ -49,8 +47,7 @@ def test_background_batch_dispatch_pluralizes(monkeypatch):
 
 
 def test_synchronous_delegate_result_prints_no_notice(monkeypatch):
-    """A non-background result (e.g. the stateless sync fallback) must not claim
-    a background dispatch."""
+    """Joined results, including the default root policy, must not claim a later dispatch."""
     cli_obj = _make_cli()
     printed = _capture(monkeypatch)
 

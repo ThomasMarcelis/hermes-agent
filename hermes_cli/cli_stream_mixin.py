@@ -723,8 +723,8 @@ class CLIStreamMixin:
     def _on_tool_complete(self, tool_call_id: str, function_name: str, function_args: dict, function_result: str):
         """Render file edits with inline diff after write-capable tools complete."""
         from cli import _cprint, logger
-        # A background delegate_task re-enters as a fresh turn when done; say so once so the
-        # idle prompt doesn't read as "nothing happened".
+        # Explicitly detached calls re-enter as a fresh turn; joined results have no dispatch
+        # markers and must not claim that a later background reply is coming.
         if function_name == "delegate_task":
             try:
                 parsed = json.loads(function_result) if isinstance(function_result, str) else (function_result or {})
