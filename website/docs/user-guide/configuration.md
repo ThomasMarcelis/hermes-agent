@@ -1834,6 +1834,13 @@ display:
   language: en            # UI language for static messages (approval prompts, some gateway replies). en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
 ```
 
+`display.tool_preview_length` is the final configured budget for friendly tool
+previews. Positive values cap the completed preview; `0` removes the configured
+cap. Messaging platforms still enforce their own physical message-size limits,
+and long progress content is split or rolled over at that boundary, subject to
+any platform anti-flood ceiling. You can set the value globally or override it
+per platform under `display.platforms.<platform>.tool_preview_length`.
+
 ### Per-turn summary and spinner token flow
 
 `display.turn_summary` (default `true`) prints one dim accounting line after each **interactive CLI** turn, summarising what that turn actually did:

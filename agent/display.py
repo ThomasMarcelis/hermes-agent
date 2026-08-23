@@ -108,7 +108,9 @@ class LocalEditSnapshot:
 
 # =========================================================================
 # Configurable tool preview length (0 = no limit)
-# Set once at startup by CLI or gateway from display.tool_preview_length config.
+# Used by CLI and initial tool-event construction. Gateways snapshot the
+# resolved value per turn before final rendering so concurrent platforms do
+# not race through this process-global compatibility setting.
 # =========================================================================
 _tool_preview_max_len: int = 0  # 0 = unlimited
 
@@ -195,7 +197,9 @@ class ToolPreview:
     url: str | None = None
 
 
-_PATH_PREVIEW_TOOLS = frozenset({"read_file", "write_file", "patch"})
+_PATH_PREVIEW_TOOLS = frozenset(
+    {"read_file", "write_file", "patch", "apply_patch"}
+)
 
 
 def _should_preserve_preview_end(tool_name: str, key: str | None = None) -> bool:
@@ -455,7 +459,7 @@ def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | No
     return args
 
 
-def _delegate_task_goal_parts(tasks: Any, *, per_goal_len: int) -> tuple[int, list[str]]:
+def _delegate_task_goal_parts(tasks: Any) -> tuple[int, list[str]]:
     if not isinstance(tasks, list):
         return 0, []
     goals: list[str] = []
@@ -464,8 +468,38 @@ def _delegate_task_goal_parts(tasks: Any, *, per_goal_len: int) -> tuple[int, li
             continue
         raw_goal = task.get("goal")
         goal = "?" if raw_goal is None else _oneline(str(raw_goal))
-        goals.append(_truncate_preview(goal or "?", per_goal_len))
+        goals.append(goal or "?")
     return len(goals), goals
+
+
+def _memory_operation_preview(operation: dict, target: str) -> str:
+    """Describe one memory mutation without imposing a hidden display cap."""
+    action = str(operation.get("action") or "").strip().lower()
+    content_value = operation.get("content")
+    if content_value is None:
+        content_value = operation.get("new_text")
+    content = _oneline(str(content_value or ""))
+    old = _oneline(str(operation.get("old_text") or ""))
+
+    if action == "add":
+        return f'+{target}: "{content}"'
+    if action == "replace":
+        old = old or "<missing old_text>"
+        return f'~{target}: "{old}" → "{content}"'
+    if action == "remove":
+        old = old or "<missing old_text>"
+        return f'-{target}: "{old}"'
+    return action
+
+
+def _changed_paths_preview(paths: list[str]) -> str | None:
+    """Describe every changed path before applying the configured final cap."""
+    labels = [_oneline(str(path)) for path in paths if path]
+    labels = [label for label in labels if label]
+    if not labels:
+        return None
+    noun = "file" if len(labels) == 1 else "files"
+    return f"{len(labels)} {noun}: " + " | ".join(labels)
 
 
 def _browser_exec_step_label(args: dict, max_chars: int = 80) -> str | None:
@@ -525,7 +559,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             return _truncate_preview(preview, max_len)
         tasks = args.get("tasks")
         if tasks and isinstance(tasks, list):
-            task_count, goals = _delegate_task_goal_parts(tasks, per_goal_len=40)
+            task_count, goals = _delegate_task_goal_parts(tasks)
             preview = (
                 f"{task_count} tasks: " + " | ".join(goals)
                 if goals else f"{len(tasks)} parallel tasks"
@@ -544,13 +578,14 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         timeout_val = args.get("timeout")
         parts = [str(action) if action else ""]
         if sid:
-            parts.append(str(sid)[:16])
+            parts.append(str(sid))
         if data:
-            parts.append(f'"{_oneline(str(data)[:20])}"')
+            parts.append(f'"{_oneline(str(data))}"')
         if timeout_val and action == "wait":
             parts.append(f"{timeout_val}s")
         parts = [p for p in parts if p]
-        return " ".join(parts) if parts else None
+        preview = " ".join(parts)
+        return _truncate_preview(preview, max_len) if preview else None
 
     if tool_name == "todo":
         todos_arg = args.get("todos")
@@ -575,43 +610,77 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         if path is None:
             return None
         path_text = str(path)
-        label = Path(path_text.replace("\\", "/")).name or path_text
         line_label = _read_file_line_label(args)
-        short_preview = f"{label} {line_label}".strip()
-        full_preview = f"{path_text} {line_label}".strip()
-        if max_len > 0 and len(full_preview) > max_len:
-            return truncate_tool_preview(
-                tool_name,
-                full_preview,
-                max_len,
-                key="path",
-            )
-        return short_preview if short_preview else None
+        preview = f"{path_text} {line_label}".strip()
+        return (
+            truncate_tool_preview(tool_name, preview, max_len, key="path")
+            if preview else None
+        )
+
+    if tool_name == "patch" and args.get("mode") == "patch":
+        patch_text = args.get("patch")
+        if isinstance(patch_text, str) and patch_text:
+            try:
+                from tools.patch_parser import parse_v4a_patch
+
+                operations, error = parse_v4a_patch(patch_text)
+            except Exception:
+                operations, error = [], "preview parse failed"
+            if not error:
+                paths = [
+                    (
+                        f"{operation.file_path} → {operation.new_path}"
+                        if operation.new_path else operation.file_path
+                    )
+                    for operation in operations
+                ]
+                preview = _changed_paths_preview(paths)
+                if preview:
+                    return truncate_tool_preview(
+                        tool_name, preview, max_len, key="path"
+                    )
+
+    if tool_name == "apply_patch":
+        changes = args.get("changes")
+        if isinstance(changes, list):
+            paths = [
+                str(change.get("path"))
+                for change in changes
+                if isinstance(change, dict) and change.get("path")
+            ]
+            preview = _changed_paths_preview(paths)
+            if preview:
+                return truncate_tool_preview(
+                    tool_name, preview, max_len, key="path"
+                )
 
     if tool_name == "session_search":
         query = _oneline(args.get("query", ""))
-        return f"recall: \"{query[:25]}{'...' if len(query) > 25 else ''}\""
+        preview = f'recall: "{query}"'
+        return _truncate_preview(preview, max_len)
 
     if tool_name == "memory":
-        action = args.get("action", "")
-        target = args.get("target", "")
-        if action == "add":
-            content = _oneline(args.get("content", ""))
-            return f"+{target}: \"{content[:25]}{'...' if len(content) > 25 else ''}\""
-        elif action == "replace":
-            old = _oneline(args.get("old_text") or "") or "<missing old_text>"
-            return f"~{target}: \"{old[:20]}\""
-        elif action == "remove":
-            old = _oneline(args.get("old_text") or "") or "<missing old_text>"
-            return f"-{target}: \"{old[:20]}\""
-        return action
+        target = str(args.get("target") or "")
+        operations = args.get("operations")
+        if isinstance(operations, list):
+            labels = [
+                _memory_operation_preview(operation, target)
+                for operation in operations
+                if isinstance(operation, dict)
+            ]
+            preview = (
+                f"{len(labels)} ops: " + " | ".join(labels)
+                if labels else "memory operations"
+            )
+        else:
+            preview = _memory_operation_preview(args, target)
+        return _truncate_preview(preview, max_len) if preview else None
 
     if tool_name == "send_message":
         target = args.get("target", "?")
         msg = _oneline(args.get("message", ""))
-        if len(msg) > 20:
-            msg = msg[:17] + "..."
-        return f"to {target}: \"{msg}\""
+        preview = f'to {target}: "{msg}"'
+        return _truncate_preview(preview, max_len)
 
     if tool_name == "skill_view":
         name = _oneline(str(args.get("name") or ""))
@@ -621,7 +690,11 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             preview = f"{name} → {file_path}" if name else file_path
         else:
             preview = name
-        return _truncate_preview(preview, max_len) if preview else None
+        return (
+            truncate_tool_preview(tool_name, preview, max_len, key="path")
+            if preview and file_path else
+            _truncate_preview(preview, max_len) if preview else None
+        )
 
     key = primary_args.get(tool_name)
     if not key:
@@ -659,11 +732,20 @@ def prepare_tool_preview(
     receive explicit truncation and URL metadata instead of inferring either
     fact from the rendered text.
     """
-    full_text = build_tool_preview(tool_name, args, max_len=0) or fallback
-    text = truncate_tool_preview(tool_name, full_text, max_len)
+    raw_full_text = build_tool_preview(tool_name, args or {}, max_len=0) or fallback
+    # Complete previews increase observability, not the authority to disclose
+    # credentials. Redact before the configured cap so slicing cannot leave a
+    # credential fragment that no longer matches the redactor's patterns.
+    full_text = redact_sensitive_text(str(raw_full_text), force=True)
+    path_key = (
+        "path"
+        if tool_name == "skill_view" and isinstance(args, dict) and args.get("file_path")
+        else None
+    )
+    text = truncate_tool_preview(tool_name, full_text, max_len, key=path_key)
     truncated = text != full_text
     url = None
-    if truncated:
+    if truncated and full_text == str(raw_full_text):
         candidate = _display_url(full_text)
         try:
             parsed = urlsplit(candidate)
@@ -1611,7 +1693,7 @@ def _get_cute_tool_message(
             return _wrap(f"┊ 🔀 delegate  {_trunc(f'{_action} {_sid}'.strip(), 35)}  {dur}")
         tasks = args.get("tasks")
         if tasks and isinstance(tasks, list):
-            task_count, goals = _delegate_task_goal_parts(tasks, per_goal_len=30)
+            task_count, goals = _delegate_task_goal_parts(tasks)
             detail = " | ".join(goals) if goals else "parallel"
             count_label = task_count or len(tasks)
             return _wrap(f"┊ 🔀 delegate  {count_label}x: {_trunc(detail, 35)}  {dur}")

@@ -563,8 +563,29 @@ display:
 
 - `off` — no progress messages
 - `new` — only show the first tool call per turn
-- `all` — show all tool calls (truncated to 40 characters in gateway messages)
-- `verbose` — show full tool call details (can produce long messages)
+- `all` — show all tool calls using their friendly, compact previews
+- `verbose` — show full raw tool arguments (can produce long messages)
+
+Use `display.tool_preview_length` to control the compact preview budget. A
+positive value caps each preview at that many characters; `0` means no
+configured cap. Path previews retain the filename when a positive cap is used.
+Discord's 2,000-character message boundary still applies, so an unlimited
+preview can roll over into another progress message rather than being silently
+clipped. Exceptionally large single previews remain subject to Discord's
+eight-message anti-flood ceiling and end with an omission notice. Complete
+previews still pass through Hermes' mandatory outbound secret redaction.
+
+```yaml
+display:
+  tool_progress: all
+  platforms:
+    discord:
+      tool_preview_length: 0  # complete friendly previews
+```
+
+`all` with an unlimited preview is usually preferable to `verbose` when you
+want complete paths, memory changes, delegated-task goals, and commands without
+dumping every raw argument field.
 
 #### `display.tool_progress_command`
 

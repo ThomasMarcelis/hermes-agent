@@ -11,8 +11,8 @@ Covers:
   - the transport accumulating one descriptor per platform (first = session
     default, later frames must NOT overwrite it),
   - the map resetting on a re-dial,
-  - RelayAdapter.max_message_length_for_chat / message_len_fn_for_chat
-    resolving from the chat's inbound platform,
+  - RelayAdapter.max_message_length_for_chat / message_len_fn_for_chat /
+    max_split_messages_for_chat resolving from the chat's inbound platform,
   - fallback to the scalar descriptor for unknown chats / transports without
     the map,
   - the stream consumer's _raw_message_limit honoring the per-chat cap.
@@ -150,6 +150,10 @@ async def test_adapter_resolves_per_chat_limits_from_inbound_platform():
     surrogate = "\U0001f600"  # 2 UTF-16 units, 1 codepoint
     assert adapter.message_len_fn_for_chat("tg-1")(surrogate) == 2
     assert adapter.message_len_fn_for_chat("dc-1")(surrogate) == 1
+    # Discord's native eight-message flood guard follows Discord chats through
+    # the relay rather than disappearing behind the generic adapter.
+    assert adapter.max_split_messages_for_chat("dc-1") == 8
+    assert adapter.max_split_messages_for_chat("tg-1") == 0
 
 
 # ───────────────────── stream consumer integration ─────────────────────

@@ -115,6 +115,20 @@ class TestDiscordToolPreviewFormatting:
         assert "final-audit-report.md" in out
         assert "/home/hermes" not in out
 
+    def test_structured_file_event_zero_preview_length_is_unlimited(self):
+        from gateway.stream_events import ToolCallChunk
+
+        adapter = _make_discord_adapter()
+        path = "/home/hermes/worktrees/release/evidence/final-audit-report.md"
+        out = adapter.format_tool_event(
+            ToolCallChunk("write_file", preview=path, args={"path": path}),
+            mode="all",
+            preview_max_len=0,
+        )
+
+        assert out is not None
+        assert path in out
+
     def test_untruncated_url_remains_plain(self):
         from agent.display import ToolPreview
 

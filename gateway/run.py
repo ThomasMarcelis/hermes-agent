@@ -4455,11 +4455,9 @@ class TurnRunner:
         # line ("bash"), and a bare fence renders correctly everywhere
         # that supports blocks.
         #
-        # Verbose mode shows the FULL command.  Non-verbose ("all"/"new")
-        # modes still wrap in a fence but truncate to a single line capped
-        # at ``tool_preview_length`` (default 40) so a long or multi-line
-        # command doesn't render as a huge block — matching the budget the
-        # non-terminal preview path already applies (#42634).
+        # Verbose mode shows the FULL command. Non-verbose ("all"/"new")
+        # modes still wrap in a fence. A positive tool_preview_length keeps a
+        # capped single-line summary; zero preserves the complete command.
         _code_block_full = None
         _code_block_short = None
         try:
@@ -4473,8 +4471,9 @@ class TurnRunner:
             and isinstance(args.get("command"), str)
             and args["command"].strip()
         ):
-            from agent.display import get_tool_preview_max_len
-            _cmd_full = args["command"].rstrip()
+            _cmd_full = _redact_gateway_user_facing_secrets(
+                args["command"].rstrip()
+            )
             # Consecutive terminal calls: drop the repeated
             # "💻 terminal" header so back-to-back commands render as
             # adjacent code blocks under a single header.
@@ -4482,17 +4481,21 @@ class TurnRunner:
                 "" if ctx.last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
             )
             _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
-            # Single-line, capped preview for non-verbose modes.
-            _pl = get_tool_preview_max_len()
-            _cap = _pl if _pl > 0 else 40
-            _lines = _cmd_full.splitlines()
-            _cmd_short = _lines[0] if _lines else _cmd_full
-            _multiline = len(_lines) > 1
-            if len(_cmd_short) > _cap:
-                _cmd_short = _cmd_short[:_cap - 3] + "..."
-            elif _multiline:
-                _cmd_short = _cmd_short + " ..."
-            _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
+            # Compact preview for non-verbose modes. An explicit zero means
+            # no configured cap, so retain the complete command block; the
+            # progress sender rolls over at the platform's physical limit.
+            _pl = ctx.tool_preview_max_len
+            if _pl == 0:
+                _code_block_short = _code_block_full
+            else:
+                _lines = _cmd_full.splitlines()
+                _cmd_short = _lines[0] if _lines else _cmd_full
+                _multiline = len(_lines) > 1
+                if len(_cmd_short) > _pl:
+                    _cmd_short = _cmd_short[:_pl - 3] + "..."
+                elif _multiline:
+                    _cmd_short = _cmd_short + " ..."
+                _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
 
         # Verbose mode: show detailed arguments, respects tool_preview_length
         if ctx.progress_mode == "verbose":
@@ -4502,9 +4505,10 @@ class TurnRunner:
                 return
             ctx.last_was_terminal_block[0] = False
             if args:
-                from agent.display import get_tool_preview_max_len
-                _pl = get_tool_preview_max_len()
-                args_str = json.dumps(args, ensure_ascii=False, default=str)
+                _pl = ctx.tool_preview_max_len
+                args_str = _redact_gateway_user_facing_secrets(
+                    json.dumps(args, ensure_ascii=False, default=str)
+                )
                 # When tool_preview_length is 0 (default), don't truncate
                 # in verbose mode — the user explicitly asked for full
                 # detail.  Platform message-length limits handle the rest.
@@ -4515,32 +4519,30 @@ class TurnRunner:
                 msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
-            ctx.progress_queue.put(msg)
+            ctx.progress_queue.put(_redact_gateway_user_facing_secrets(msg))
             return
 
-        # "all" / "new" modes: short preview, respects tool_preview_length
-        # config (defaults to 40 chars when unset to keep gateway messages
-        # compact — unlike CLI spinners, these persist as permanent messages).
-        # Terminal commands on markdown platforms get a single-line capped
-        # fenced block (built above) instead of the truncated preview.
+        # "all" / "new" modes: compact preview, respecting the configured
+        # tool_preview_length. Zero means no configured cap; platform message
+        # limits are handled by the progress sender below.
+        # Terminal commands on markdown platforms get a fenced block. Positive
+        # caps keep the historical single-line summary; zero keeps it complete.
         if _code_block_short is not None:
             msg = _code_block_short
             ctx.last_was_terminal_block[0] = True
         elif preview:
             from agent.display import (
-                get_tool_preview_max_len,
                 get_tool_verb,
                 prepare_tool_preview,
                 tool_verb_connector,
                 verb_drops_preview,
             )
-            _pl = get_tool_preview_max_len()
-            _cap = _pl if _pl > 0 else 40
+            _pl = ctx.tool_preview_max_len
             _prepared_preview = prepare_tool_preview(
                 tool_name,
                 args,
                 fallback=preview,
-                max_len=_cap,
+                max_len=_pl,
             )
             if _progress_adapter is not None:
                 preview = _progress_adapter.format_tool_preview(_prepared_preview)
@@ -4563,6 +4565,10 @@ class TurnRunner:
         else:
             msg = f"{emoji} {tool_name}..."
             ctx.last_was_terminal_block[0] = False
+
+        # Defence in depth for custom/plugin fallbacks that do not pass through
+        # the standard preview builder.
+        msg = _redact_gateway_user_facing_secrets(msg)
 
         # Dedup: collapse consecutive identical progress messages.
         # Common with execute_code where models iterate with the same
@@ -4873,12 +4879,46 @@ class TurnRunner:
             groups: list[list] = []
             current: list = []
             for line in lines:
-                candidate = current + [line]
-                if current and _progress_len_fn(_progress_text(candidate)) > _PROGRESS_TEXT_LIMIT:
-                    groups.append(current)
-                    current = [line]
-                else:
-                    current = candidate
+                text = str(line)
+                pieces = BasePlatformAdapter.truncate_message(
+                    text,
+                    _PROGRESS_TEXT_LIMIT,
+                    len_fn=_progress_len_fn,
+                )
+                try:
+                    max_pieces = int(
+                        adapter.max_split_messages_for_chat(
+                            str(ctx.source.chat_id)
+                        )
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    max_pieces = 0
+                if max_pieces > 0 and len(pieces) > max_pieces:
+                    dropped_chars = sum(
+                        _progress_len_fn(piece)
+                        for piece in pieces[max_pieces - 1 :]
+                    )
+                    notice = (
+                        f"⚠️ Preview truncated — {dropped_chars} characters omitted "
+                        "at platform delivery limit."
+                    )
+                    notice_pieces = BasePlatformAdapter.truncate_message(
+                        notice,
+                        _PROGRESS_TEXT_LIMIT,
+                        len_fn=_progress_len_fn,
+                    )
+                    pieces = pieces[: max_pieces - 1] + notice_pieces[:1]
+                for piece in pieces:
+                    candidate = current + [piece]
+                    if (
+                        current
+                        and _progress_len_fn(_progress_text(candidate))
+                        > _PROGRESS_TEXT_LIMIT
+                    ):
+                        groups.append(current)
+                        current = [piece]
+                    else:
+                        current = candidate
             if current:
                 groups.append(current)
             return groups
@@ -4899,6 +4939,13 @@ class TurnRunner:
                 metadata=ctx._progress_metadata,
             )
             _track_progress_result(result)
+            return result
+
+        async def _send_progress_line(text: str):
+            """Send one logical line within per-chat size and flood limits."""
+            result = None
+            for group in _split_progress_groups([text]):
+                result = await _send_progress_text(_progress_text(group))
             return result
 
         async def _roll_progress_overflow_if_needed() -> bool:
@@ -5047,40 +5094,18 @@ class TurnRunner:
                             _last_edit_ts = time.monotonic()
                         else:
                             can_edit = False
-                        _flood_result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
-                        )
-                        if (
-                            ctx._cleanup_progress
-                            and getattr(_flood_result, "success", False)
-                            and getattr(_flood_result, "message_id", None)
-                        ):
-                            ctx._cleanup_msg_ids.append(str(_flood_result.message_id))
+                        await _send_progress_line(msg)
                 else:
                     if can_edit:
                         # First tool: send all accumulated text as new message
                         full_text = "\n".join(progress_lines)
-                        result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=full_text,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
-                        )
+                        result = await _send_progress_text(full_text)
                     else:
-                        # Editing unsupported: send just this line
-                        result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
-                        )
+                        # Separate grouping (or a permanent edit failure):
+                        # split and flood-cap this logical line before send.
+                        result = await _send_progress_line(msg)
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id
-                        if ctx._cleanup_progress:
-                            ctx._cleanup_msg_ids.append(str(result.message_id))
 
                 _last_edit_ts = time.monotonic()
 
@@ -28337,11 +28362,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # display.<key> global, then built-in platform defaults.
         from gateway.display_config import resolve_display_setting
 
-        # Apply tool preview length config (0 = no limit)
+        # Resolve one immutable preview budget per turn. Gateway producers keep
+        # their compatibility display global uncapped; the gateway applies the
+        # platform-specific budget exactly once at final rendering. This also
+        # prevents concurrent platform turns from racing through that global.
+        tool_preview_max_len = 0
         try:
             from agent.display import set_tool_preview_max_len
             _tpl = resolve_display_setting(user_config, platform_key, "tool_preview_length", 0)
-            set_tool_preview_max_len(int(_tpl) if _tpl else 0)
+            tool_preview_max_len = max(int(_tpl), 0) if _tpl is not None else 0
+            set_tool_preview_max_len(0)
         except Exception:
             pass
 
@@ -28569,6 +28599,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             progress_mode=progress_mode,
             progress_grouping=progress_grouping,
             tool_progress_enabled=tool_progress_enabled,
+            tool_preview_max_len=tool_preview_max_len,
             progress_queue=progress_queue,
             log_queue=log_queue,
             last_progress_msg=last_progress_msg,

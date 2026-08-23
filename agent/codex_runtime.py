@@ -419,27 +419,24 @@ def _codex_item_to_preview(item: dict) -> Any:
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
         cmd = item.get("command") or ""
-        return cmd[:120] if cmd else None
+        return cmd if cmd else None
     if item_type == "fileChange":
-        paths = [c.get("path") for c in (item.get("changes") or [])
+        paths = [str(c.get("path")) for c in (item.get("changes") or [])
                  if isinstance(c, dict) and c.get("path")]
         if not paths:
             return None
-        preview = ", ".join(paths[:3])
-        if len(paths) > 3:
-            preview += f", +{len(paths) - 3} more"
-        return preview
+        return ", ".join(paths)
     if item_type in {"mcpToolCall", "dynamicToolCall"}:
         args = item.get("arguments") or {}
         if not isinstance(args, dict) or not args:
             return None
         try:
-            return json.dumps(args, ensure_ascii=False)[:120]
+            return json.dumps(args, ensure_ascii=False)
         except (TypeError, ValueError):
             return None
     if item_type == "webSearch":
         query = item.get("query") or ""
-        return query[:120] if query else None
+        return query if query else None
     return None
 
 

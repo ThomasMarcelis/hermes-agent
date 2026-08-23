@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 # reader, and ws.close (~3s), the full drain path stays inside 5s.
 _RELAY_GO_IDLE_ON_DISCONNECT_TIMEOUT_S = 2.0
 _RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S = 1.0
+# Keep relay-fronted Discord deliveries at parity with DiscordAdapter's
+# channel-flood guard. Other relay platforms currently advertise no ceiling.
+_DISCORD_MAX_SPLIT_MESSAGES = 8
 
 # How many already-answered prompt ids to remember, so a duplicate answer for
 # one of them (a double tap, or a connector redelivery of the same forward) is
@@ -291,6 +294,12 @@ class RelayAdapter(BasePlatformAdapter):
 
     def message_len_fn_for_chat(self, chat_id: str) -> Callable[[str], int]:
         return _LEN_FNS.get(self._descriptor_for_chat(chat_id).len_unit, len)
+
+    def max_split_messages_for_chat(self, chat_id: str) -> int:
+        descriptor = self._descriptor_for_chat(chat_id)
+        if descriptor.platform == Platform.DISCORD.value:
+            return _DISCORD_MAX_SPLIT_MESSAGES
+        return 0
 
     def supports_draft_streaming(
         self,

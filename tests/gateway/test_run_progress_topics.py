@@ -131,6 +131,41 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class FloodCappedProgressAdapter(SmallLimitProgressAdapter):
+    """Tiny platform that mirrors Discord's per-delivery anti-flood ceiling."""
+
+    MAX_SPLIT_MESSAGES = 3
+
+
+class RelayShapedDiscordProgressAdapter(SmallLimitProgressAdapter):
+    """Telegram-primary relay surface carrying a Discord chat."""
+
+    MAX_MESSAGE_LENGTH = 4096
+    MAX_SPLIT_MESSAGES = 0
+    DISCORD_MESSAGE_LIMIT = 2000
+    DISCORD_SPLIT_LIMIT = 8
+
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        return self.DISCORD_MESSAGE_LIMIT
+
+    def max_split_messages_for_chat(self, chat_id: str) -> int:
+        return self.DISCORD_SPLIT_LIMIT
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if len(content) > self.DISCORD_MESSAGE_LIMIT:
+            self.oversized_sends.append(content)
+        return await ProgressCaptureAdapter.send(
+            self, chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        if len(content) > self.DISCORD_MESSAGE_LIMIT:
+            self.oversized_edits.append(content)
+        return await ProgressCaptureAdapter.edit_message(
+            self, chat_id, message_id, content
+        )
+
+
 class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
     async def edit_message(
         self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
@@ -347,6 +382,37 @@ class LongPreviewAgent:
             "messages": [],
             "api_calls": 1,
         }
+
+
+class HugePreviewAgent:
+    """Agent whose one progress line would require many platform messages."""
+
+    PREVIEW = "complete-preview-segment " * 100
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.tool_progress_callback is not None
+        self.tool_progress_callback(
+            "tool.started",
+            "custom_tool",
+            self.PREVIEW,
+            {"prompt": self.PREVIEW},
+        )
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class RelayHugePreviewAgent(HugePreviewAgent):
+    """One Discord progress line large enough to exceed eight messages."""
+
+    PREVIEW = "relay-discord-complete-preview-segment " * 1000
 
 
 class UrlPreviewAgent:
@@ -677,17 +743,12 @@ def _extract_progress_preview(content: str) -> str | None:
     return None
 
 
-def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
-    """Shared setup for long-preview truncation tests.
-
-    Returns (adapter, result) after running the agent with LongPreviewAgent.
-    ``preview_length`` controls display.tool_preview_length in the config file
-    that _run_agent reads — so the gateway picks it up the same way production does.
-    """
+def _run_long_preview_helper(
+    monkeypatch, tmp_path, preview_length=0, progress_mode="all"
+):
+    """Run a long preview through Discord's real compact-progress path."""
     import asyncio
     import yaml
-
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -697,18 +758,28 @@ def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
     fake_run_agent.AIAgent = LongPreviewAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    # Write config.yaml so _run_agent picks up tool_preview_length
-    config = {"display": {"tool_preview_length": preview_length}}
+    config = {
+        "display": {
+            "platforms": {
+                "discord": {
+                    "tool_progress": progress_mode,
+                    "tool_preview_length": preview_length,
+                }
+            }
+        }
+    }
     (tmp_path / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
 
-    adapter = ProgressCaptureAdapter()
+    adapter = DiscordProgressCaptureAdapter()
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=Platform.DISCORD,
         chat_id="12345",
         chat_type="dm",
         thread_id=None,
@@ -721,25 +792,42 @@ def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
             history=[],
             source=source,
             session_id="sess-trunc",
-            session_key="agent:main:telegram:dm:12345",
+            session_key="agent:main:discord:dm:12345",
         )
     )
     return adapter, result
 
 
 def test_all_mode_respects_custom_preview_length(monkeypatch, tmp_path):
-    """When tool_preview_length is explicitly set (e.g. 120), all/new mode uses that."""
-    adapter, result = _run_long_preview_helper(monkeypatch, tmp_path, preview_length=120)
+    """A positive Discord preview cap is applied exactly once."""
+    adapter, result = _run_long_preview_helper(
+        monkeypatch, tmp_path, preview_length=120
+    )
     assert result["final_response"] == "done"
     assert adapter.sent
     content = adapter.sent[0]["content"]
-    # With 120-char cap, the command (165 chars) should still be truncated but longer.
     preview_text = _extract_progress_preview(content)
     assert preview_text is not None, f"No preview found in: {content}"
-    # Should be longer than the 40-char default
-    assert len(preview_text) > 40, f"Preview suspiciously short ({len(preview_text)}): {preview_text}"
-    # But still capped at 120
-    assert len(preview_text) <= 120, f"Preview too long ({len(preview_text)}): {preview_text}"
+    assert preview_text == LongPreviewAgent.LONG_CMD[:117] + "..."
+    assert len(preview_text) == 120
+
+
+@pytest.mark.parametrize("progress_mode", ["all", "new"])
+def test_zero_preview_length_is_unlimited_in_discord_compact_modes(
+    monkeypatch, tmp_path, progress_mode
+):
+    """An explicit zero means no configured cap in Discord compact modes."""
+    adapter, result = _run_long_preview_helper(
+        monkeypatch,
+        tmp_path,
+        preview_length=0,
+        progress_mode=progress_mode,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    preview_text = _extract_progress_preview(adapter.sent[0]["content"])
+    assert preview_text == LongPreviewAgent.LONG_CMD
 
 
 def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_path):
@@ -757,7 +845,7 @@ def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_p
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"tool_preview_length": 0}}),
+        yaml.dump({"display": {"tool_preview_length": 40}}),
         encoding="utf-8",
     )
 
@@ -1160,6 +1248,97 @@ async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatc
     assert any(call["message_id"] == "progress-1" for call in adapter.edits[1:])
     assert adapter.oversized_sends == []
     assert adapter.oversized_edits == []
+
+
+@pytest.mark.asyncio
+async def test_unlimited_preview_rolls_over_at_platform_message_limit(
+    monkeypatch, tmp_path
+):
+    """Unlimited means no display cap, not an oversized platform request."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        LongPreviewAgent,
+        session_id="sess-unlimited-preview-rollover",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_preview_length": 0,
+                "interim_assistant_messages": False,
+            }
+        },
+        adapter_cls=SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, SmallLimitProgressAdapter)
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+    rendered = "\n".join(
+        call["content"] for call in [*adapter.sent, *adapter.edits]
+    )
+    assert LongPreviewAgent.LONG_CMD[:60] in rendered
+    assert LongPreviewAgent.LONG_CMD[-60:] in rendered
+
+
+@pytest.mark.asyncio
+async def test_unlimited_preview_respects_platform_anti_flood_ceiling(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        HugePreviewAgent,
+        session_id="sess-unlimited-preview-anti-flood",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_preview_length": 0,
+                "interim_assistant_messages": False,
+            }
+        },
+        adapter_cls=FloodCappedProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, FloodCappedProgressAdapter)
+    assert len(adapter.sent) <= adapter.MAX_SPLIT_MESSAGES
+    rendered = "\n".join(call["content"] for call in adapter.sent)
+    assert "Preview truncated" in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouping", ["accumulate", "separate"])
+async def test_relay_discord_unlimited_preview_splits_and_caps_every_grouping(
+    monkeypatch, tmp_path, grouping
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RelayHugePreviewAgent,
+        session_id=f"sess-relay-discord-preview-{grouping}",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": grouping,
+                "tool_preview_length": 0,
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="relay-discord-chat",
+        thread_id="relay-discord-thread",
+        adapter_cls=RelayShapedDiscordProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, RelayShapedDiscordProgressAdapter)
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+    assert len(adapter.sent) <= adapter.DISCORD_SPLIT_LIMIT
+    payloads = [call["content"] for call in [*adapter.sent, *adapter.edits]]
+    assert all(len(payload) <= adapter.DISCORD_MESSAGE_LIMIT for payload in payloads)
+    assert any("Preview truncated" in payload for payload in payloads)
 
 
 @pytest.mark.asyncio

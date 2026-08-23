@@ -3375,6 +3375,18 @@ class BasePlatformAdapter(ABC):
         """
         return self.message_len_fn
 
+    def max_split_messages_for_chat(self, chat_id: str) -> int:
+        """Per-chat ceiling for one logical split delivery; 0 means no ceiling.
+
+        Native adapters can expose ``MAX_SPLIT_MESSAGES`` as a scalar. The
+        relay overrides this because one adapter can front platforms with
+        different flood policies.
+        """
+        try:
+            return max(int(getattr(self, "MAX_SPLIT_MESSAGES", 0) or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
     @property
     def enforces_own_access_policy(self) -> bool:
         """Whether this adapter gates inbound access before dispatch.
@@ -3594,18 +3606,18 @@ class BasePlatformAdapter(ABC):
                 return f"{emoji} {event.tool_name}: \"{event.preview}\""
             return f"{emoji} {event.tool_name}..."
 
-        # "all" / "new": short preview, capped (default 40 to keep gateway
-        # progress bubbles compact — they persist as permanent messages).
+        # "all" / "new": compact preview, capped only when configured.
+        # A zero preview_max_len means unlimited; the delivery layer still
+        # enforces the platform's physical message-size boundary.
         preview = event.preview
         if preview:
             from agent.display import prepare_tool_preview
 
-            cap = preview_max_len if preview_max_len > 0 else 40
             prepared = prepare_tool_preview(
                 event.tool_name,
                 event.args,
                 fallback=preview,
-                max_len=cap,
+                max_len=preview_max_len,
             )
             rendered = self.format_tool_preview(prepared)
             return f"{emoji} {event.tool_name}: \"{rendered}\""

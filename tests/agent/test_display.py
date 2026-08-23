@@ -101,6 +101,117 @@ class TestBuildToolPreview:
         assert result == "2 tasks: AAAAAAAAAAAAAAAAAA..."
         assert len(result) == 30
 
+    def test_delegate_task_batch_preview_has_no_hidden_per_goal_cap(self):
+        first_goal = "Trace every Discord preview layer without dropping context"
+        second_goal = "Verify the complete gateway rendering path with tests"
+
+        result = build_tool_preview(
+            "delegate_task",
+            {"tasks": [{"goal": first_goal}, {"goal": second_goal}]},
+            max_len=0,
+        )
+
+        assert result == f"2 tasks: {first_goal} | {second_goal}"
+
+    def test_memory_add_preview_uses_only_the_configured_cap(self):
+        content = (
+            "User prefers complete Discord tool previews for paths, memory "
+            "changes, and delegated work."
+        )
+
+        result = build_tool_preview(
+            "memory",
+            {"action": "add", "target": "user", "content": content},
+            max_len=0,
+        )
+
+        assert result == f'+user: "{content}"'
+
+    def test_memory_replace_preview_shows_old_and_new_text(self):
+        old = "Discord progress hides useful details"
+        new = "Discord progress shows complete useful details"
+
+        result = build_tool_preview(
+            "memory",
+            {
+                "action": "replace",
+                "target": "memory",
+                "old_text": old,
+                "content": new,
+            },
+            max_len=0,
+        )
+
+        assert result == f'~memory: "{old}" → "{new}"'
+
+    def test_memory_batch_preview_lists_every_operation(self):
+        result = build_tool_preview(
+            "memory",
+            {
+                "target": "memory",
+                "operations": [
+                    {"action": "add", "content": "Keep complete paths"},
+                    {
+                        "action": "replace",
+                        "old_text": "short previews",
+                        "new_text": "complete previews",
+                    },
+                    {"action": "remove", "old_text": "stale display rule"},
+                ],
+            },
+            max_len=0,
+        )
+
+        assert result == (
+            '3 ops: +memory: "Keep complete paths" | '
+            '~memory: "short previews" → "complete previews" | '
+            '-memory: "stale display rule"'
+        )
+
+    def test_session_search_preview_has_no_hidden_query_cap(self):
+        query = "Discord progress previews filenames paths memory and subagents"
+
+        result = build_tool_preview(
+            "session_search", {"query": query}, max_len=0,
+        )
+
+        assert result == f'recall: "{query}"'
+
+    def test_process_preview_has_no_hidden_session_or_data_cap(self):
+        session_id = "proc_4dae56ca81f6-complete-session-identifier"
+        data = "complete payload sent to the tracked background process"
+
+        result = build_tool_preview(
+            "process",
+            {"action": "submit", "session_id": session_id, "data": data},
+            max_len=0,
+        )
+
+        assert result == f'submit {session_id} "{data}"'
+
+    def test_send_message_preview_has_no_hidden_body_cap(self):
+        message = "Complete outbound message text remains inspectable in progress"
+
+        result = build_tool_preview(
+            "send_message",
+            {"target": "origin", "message": message},
+            max_len=0,
+        )
+
+        assert result == f'to origin: "{message}"'
+
+    def test_complete_previews_still_redact_secrets_before_delivery(self):
+        secret = "sk-proj-" + "A" * 48
+        command = f"curl -H 'Authorization: Bearer {secret}' https://example.com"
+
+        prepared = prepare_tool_preview(
+            "terminal", {"command": command}, fallback=command, max_len=0,
+        )
+
+        assert secret not in prepared.text
+        assert "***" in prepared.text
+        assert prepared.truncated is False
+
     def test_long_read_path_preserves_meaningful_tail(self):
         path = (
             "/home/example/.hermes/skills/research/references/"
@@ -114,6 +225,18 @@ class TestBuildToolPreview:
         assert result.startswith("...")
         assert result.endswith("important-target-file.md")
         assert "/home/example" not in result
+
+    def test_unlimited_read_preview_keeps_the_complete_path(self):
+        path = (
+            "/home/example/.hermes/skills/research/references/"
+            "important-target-file.md"
+        )
+
+        result = build_tool_preview(
+            "read_file", {"path": path, "offset": 4, "limit": 3}, max_len=0,
+        )
+
+        assert result == f"{path} L4-6"
 
     def test_path_cap_preserves_tail_for_file_tools(self):
         path = "/home/example/workspace/project/deep/path/final-report.md"
@@ -132,6 +255,77 @@ class TestBuildToolPreview:
         assert result.startswith("python scripts/")
         assert result.endswith("...")
         assert "--many --flags" not in result
+
+    def test_skill_reference_cap_preserves_the_file_path_tail(self):
+        result = build_tool_preview(
+            "skill_view",
+            {
+                "name": "hermes-agent",
+                "file_path": "references/hermes-tool-preview-path-truncation.md",
+            },
+            max_len=40,
+        )
+
+        assert result is not None
+        assert len(result) == 40
+        assert result.startswith("...")
+        assert result.endswith("tool-preview-path-truncation.md")
+
+    def test_prepared_skill_reference_preserves_the_file_path_tail(self):
+        prepared = prepare_tool_preview(
+            "skill_view",
+            {
+                "name": "hermes-agent",
+                "file_path": "references/hermes-tool-preview-path-truncation.md",
+            },
+            fallback="",
+            max_len=40,
+        )
+
+        assert prepared.truncated is True
+        assert prepared.text.startswith("...")
+        assert prepared.text.endswith("tool-preview-path-truncation.md")
+
+    def test_v4a_patch_preview_lists_every_target_path(self):
+        patch_text = """*** Begin Patch
+*** Update File: src/first.py
+@@
+-old
++new
+*** Add File: docs/second.md
++content
+*** Move File: config/old.yaml -> config/new.yaml
+*** End Patch"""
+
+        result = build_tool_preview(
+            "patch", {"mode": "patch", "patch": patch_text}, max_len=0,
+        )
+
+        assert result == (
+            "3 files: src/first.py | docs/second.md | "
+            "config/old.yaml → config/new.yaml"
+        )
+
+    def test_codex_apply_patch_preview_lists_every_changed_path(self):
+        paths = [f"src/component_{index}.py" for index in range(5)]
+
+        result = build_tool_preview(
+            "apply_patch",
+            {"changes": [{"kind": "update", "path": path} for path in paths]},
+            max_len=0,
+        )
+
+        assert result == "5 files: " + " | ".join(paths)
+
+        capped = prepare_tool_preview(
+            "apply_patch",
+            {"changes": [{"kind": "update", "path": path} for path in paths]},
+            fallback="",
+            max_len=40,
+        )
+        assert capped.truncated is True
+        assert capped.text.startswith("...")
+        assert capped.text.endswith("src/component_4.py")
 
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""

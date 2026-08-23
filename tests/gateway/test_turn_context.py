@@ -69,6 +69,45 @@ class TestTurnRunner:
         runner = _make_runner(ctx)  # stub adapter resolver returns None
         assert asyncio.run(runner.send_progress_messages()) is None
 
+    def test_progress_callback_uses_turn_local_preview_cap(self):
+        from agent.display import set_tool_preview_max_len
+
+        preview = "x" * 80
+        capped_ctx = TurnContext(
+            progress_mode="all",
+            tool_progress_enabled=True,
+            progress_queue=queue_mod.Queue(),
+            tool_preview_max_len=24,
+            _run_still_current=lambda: True,
+        )
+        unlimited_ctx = TurnContext(
+            progress_mode="all",
+            tool_progress_enabled=True,
+            progress_queue=queue_mod.Queue(),
+            tool_preview_max_len=0,
+            _run_still_current=lambda: True,
+        )
+
+        try:
+            # Simulate another concurrent turn overwriting the legacy global.
+            set_tool_preview_max_len(0)
+            _make_runner(capped_ctx).progress_callback(
+                "tool.started", "custom_tool", preview, {"prompt": preview}
+            )
+            capped = capped_ctx.progress_queue.get_nowait()
+
+            set_tool_preview_max_len(12)
+            _make_runner(unlimited_ctx).progress_callback(
+                "tool.started", "custom_tool", preview, {"prompt": preview}
+            )
+            unlimited = unlimited_ctx.progress_queue.get_nowait()
+        finally:
+            set_tool_preview_max_len(0)
+
+        assert f'"{"x" * 21}...' in capped
+        assert preview not in capped
+        assert preview in unlimited
+
     def test_normal_response_preserves_compression_exhausted(self):
         """A non-empty exhaustion response must still reach auto-reset consumers."""
 
