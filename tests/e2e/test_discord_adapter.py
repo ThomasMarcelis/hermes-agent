@@ -114,9 +114,10 @@ class TestRepliedToMediaDispatch:
         """A text reply to an image-bearing Discord message should give the agent that image."""
         cached_path = "/tmp/replied-discord-image.png"
 
-        async def fake_cache_image_from_url(url, *, ext=".jpg"):
+        async def fake_cache_image_from_url(url, *, ext=".jpg", max_bytes=None):
             assert url == "https://cdn.discordapp.com/attachments/image.png"
             assert ext == ".png"
+            assert max_bytes == discord_adapter._discord_attachment_limit()
             return cached_path
 
         monkeypatch.setattr(

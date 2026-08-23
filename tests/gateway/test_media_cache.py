@@ -7,8 +7,10 @@ that's a behavioral regression, not a test to update casually.
 """
 
 import mimetypes
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
 from gateway.platforms.media_cache import (
     DEFAULT_EXT_TO_MIME,
@@ -50,7 +52,9 @@ class TestSharedTable:
 # ---------------------------------------------------------------------------
 
 class TestCacheMediaBytes:
-    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    _buffer = BytesIO()
+    Image.new("RGB", (2, 2), "white").save(_buffer, format="PNG")
+    PNG = _buffer.getvalue()
 
     def test_image_dispatch(self, monkeypatch, tmp_path):
         monkeypatch.setattr(

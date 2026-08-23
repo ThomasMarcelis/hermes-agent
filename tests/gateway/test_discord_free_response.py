@@ -308,6 +308,31 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_discord_thread_free_response_channel_keeps_auto_thread(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+
+    fake_thread = SimpleNamespace(id=9001, name="task")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="new task without a mention",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "new task without a mention"
+    assert event.source.thread_id == "9001"
+
+
+@pytest.mark.asyncio
 async def test_fetch_channel_context_stops_at_self_message_and_reverses_to_chronological_order(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
     adapter.config.extra["history_backfill_limit"] = 10

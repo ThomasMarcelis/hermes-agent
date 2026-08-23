@@ -1,6 +1,9 @@
 import asyncio
 import threading
 from pathlib import Path
+from io import BytesIO
+
+from PIL import Image
 
 import pytest
 
@@ -90,10 +93,11 @@ async def test_async_cache_wrapper_uses_active_profile_home(monkeypatch, tmp_pat
     profile_home = tmp_path / "profile"
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
 
-    cached = await base.cache_image_from_bytes_async(
-        b"\x89PNG\r\n\x1a\nminimal", ".png"
-    )
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), "white").save(buffer, format="PNG")
+    data = buffer.getvalue()
+    cached = await base.cache_image_from_bytes_async(data, ".png")
 
     cached_path = Path(cached)
     assert cached_path.parent == profile_home / "cache" / "images"
-    assert cached_path.read_bytes() == b"\x89PNG\r\n\x1a\nminimal"
+    assert cached_path.read_bytes() == data

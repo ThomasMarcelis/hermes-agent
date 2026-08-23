@@ -146,7 +146,11 @@ def _handle_send(args):
         if isinstance(result, dict) and result.get("success"):
             if used_home_channel:
                 result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
-            if mirror_text and _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id):
+            mirror_thread_id = thread_id
+            if platform_name == "discord" and not mirror_thread_id and result.get("thread_id"):
+                mirror_thread_id = str(result["thread_id"])
+            mirror_chat_id = mirror_thread_id if platform_name == "discord" and mirror_thread_id else chat_id
+            if mirror_text and _mirror_sent_message(platform_name, mirror_chat_id, mirror_text, mirror_thread_id):
                 result["mirrored"] = True
         if isinstance(result, dict) and "error" in result:
             result["error"] = _sanitize_error_text(result["error"])
@@ -419,7 +423,8 @@ _PLUGIN_STANDALONE_MEDIA = {"discord": ("Discord", False, True, [], False), "fei
 
 
 async def _send_plugin_standalone(platform_name, pconfig, chat_id, message, chunks, media_files, *, thread_id,
-                                  max_len, force_document):
+                                  max_len, force_document, discord_thread_name=None,
+                                  discord_thread_auto_archive_duration=1440):
     """Chunked send through a plugin's standalone_sender_fn; one captionable file + short text
     rides as the media caption."""
     label, discover, captionable, empty_media, pass_force = _PLUGIN_STANDALONE_MEDIA[platform_name]
@@ -427,14 +432,29 @@ async def _send_plugin_standalone(platform_name, pconfig, chat_id, message, chun
     if err:
         return err
     extra = {"force_document": force_document} if pass_force else {}
+    if platform_name == "discord" and discord_thread_name and not thread_id:
+        extra.update(thread_name=discord_thread_name,
+                     thread_auto_archive_duration=discord_thread_auto_archive_duration)
     if captionable:
         # Cap on the platform's own message limit so the caption is deliverable.
         caption, _ = _media_caption_split(message, media_files, max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT))
         if caption is not None:
             return await sender(pconfig, chat_id, "", thread_id=thread_id, media_files=media_files,
                                 caption=caption, **extra)
-    return await _send_chunks(chunks, lambda chunk, is_last: sender(
-        pconfig, chat_id, chunk, thread_id=thread_id, media_files=media_files if is_last else empty_media, **extra))
+    resolved_thread_id = thread_id
+
+    async def send_one(chunk, is_last):
+        nonlocal resolved_thread_id
+        result = await sender(
+            pconfig, chat_id, chunk, thread_id=resolved_thread_id,
+            media_files=media_files if is_last else empty_media, **extra)
+        if platform_name == "discord" and isinstance(result, dict) and result.get("thread_id"):
+            resolved_thread_id = str(result["thread_id"])
+            extra.pop("thread_name", None)
+            extra.pop("thread_auto_archive_duration", None)
+        return result
+
+    return await _send_chunks(chunks, send_one)
 
 
 def _via_adapter_route(p, pc, cid, chunk, media, tid, fd):
@@ -469,7 +489,8 @@ _TEXT_SENDERS = {
 _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None,
+                            discord_thread_name=None, discord_thread_auto_archive_duration=1440):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
     lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
@@ -488,7 +509,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
     if platform_name == "discord" or (media_files and platform_name in _PLUGIN_STANDALONE_MEDIA):
         return await _send_plugin_standalone(platform_name, pconfig, chat_id, message, chunks, media_files,
-                                             thread_id=thread_id, max_len=max_len, force_document=force_document)
+                                             thread_id=thread_id, max_len=max_len, force_document=force_document,
+                                             discord_thread_name=discord_thread_name,
+                                             discord_thread_auto_archive_duration=discord_thread_auto_archive_duration)
     route = _CHUNKED_ROUTES.get(platform_name)
     if route is not None and (media_files or not route[0]):
         _, empty_media, sender = route

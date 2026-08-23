@@ -2,9 +2,13 @@
 
 import os
 import time
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from PIL import Image
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -13,14 +17,14 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
+    normalize_cached_image_media_types,
     safe_url_for_log,
     utf16_len,
     validate_inbound_media_size,
     _log_safe_path,
     _prefix_within_utf16_limit,
-    cache_audio_from_bytes,
 )
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 
 
 def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
@@ -55,6 +59,74 @@ class TestInboundMediaSizeCap:
         monkeypatch.setattr(base, "get_inbound_media_max_bytes", lambda: 16)
         with pytest.raises(ValueError, match="Inbound image payload is too large"):
             cache_image_from_bytes(self._PNG, ext=".png")
+
+
+def _encoded_image(fmt: str = "PNG") -> bytes:
+    buffer = BytesIO()
+    Image.new("RGBA" if fmt == "PNG" else "RGB", (2, 2), "white").save(
+        buffer, format=fmt
+    )
+    return buffer.getvalue()
+
+
+class TestInboundImageDecodeValidation:
+    def test_truncated_magic_bytes_are_rejected(self, tmp_path):
+        with patch("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path):
+            with pytest.raises(ValueError, match="invalid or corrupt image"):
+                cache_image_from_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32, ".jpg")
+
+    def test_cache_suffix_follows_decoded_format_not_claim(self, tmp_path):
+        with patch("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path):
+            path = cache_image_from_bytes(_encoded_image("PNG"), ".jpg")
+        assert path.endswith(".png")
+
+    def test_per_frame_pixel_limit_is_enforced(self, tmp_path, monkeypatch):
+        buffer = BytesIO()
+        Image.new("RGB", (5, 5), "white").save(buffer, format="PNG")
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_inbound_image_decode_limits",
+            lambda: (20, 100, 10),
+        )
+        with patch("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path):
+            with pytest.raises(ValueError, match="frame exceeds decoded pixel limit"):
+                cache_image_from_bytes(buffer.getvalue(), ".png")
+
+    def test_animated_limits_are_enforced(self, tmp_path, monkeypatch):
+        frames = [Image.new("P", (3, 3), color=i) for i in (0, 255)]
+        buffer = BytesIO()
+        frames[0].save(
+            buffer, format="GIF", save_all=True, append_images=frames[1:],
+            optimize=False,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_inbound_image_decode_limits",
+            lambda: (20, 10, 1),
+        )
+        with patch("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path):
+            with pytest.raises(ValueError, match="too many frames"):
+                cache_image_from_bytes(buffer.getvalue(), ".gif")
+
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_inbound_image_decode_limits",
+            lambda: (20, 10, 10),
+        )
+        with patch("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path):
+            with pytest.raises(ValueError, match="cumulative decoded pixel limit"):
+                cache_image_from_bytes(buffer.getvalue(), ".gif")
+
+    def test_event_mime_is_reconciled_to_validated_cache_suffix(self, tmp_path):
+        with patch("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path):
+            path = cache_image_from_bytes(_encoded_image("PNG"), ".jpg")
+        event = SimpleNamespace(
+            message_type=MessageType.PHOTO,
+            media_path=path,
+            media_mime_type="image/jpeg",
+            metadata={"mime_type": "image/jpeg", "content_type": "image/jpeg"},
+        )
+        normalize_cached_image_media_types(event)
+        assert event.media_mime_type == "image/png"
+        assert event.metadata["mime_type"] == "image/png"
+        assert event.metadata["content_type"] == "image/png"
 
 
 class TestSecretCaptureGuidance:
@@ -1588,3 +1660,41 @@ class TestPlatformLockTakeoverGovernance:
         assert adapter._acquire_platform_lock("discord-token", "tok", "Discord") is False
         assert len(takeover_calls) == 1
         assert adapter._platform_lock_takeover_attempted is True
+
+
+def test_image_limits_and_canonical_mime_flow_through_real_profile_config(tmp_path, monkeypatch):
+    import gateway.platforms.base as base
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "gateway:\n  max_inbound_image_pixels: 3\n"
+        "  max_inbound_image_total_pixels: 20\n  max_inbound_image_frames: 2\n"
+    )
+    data = _encoded_image("PNG")
+    assert base.cache_media_bytes(data, filename="claimed.jpg", mime_type="image/jpeg") is None
+    assert not (tmp_path / "cache" / "images").exists()
+
+    (tmp_path / "config.yaml").write_text("gateway:\n  max_inbound_image_pixels: 4\n")
+    cached = base.cache_media_bytes(data, filename="claimed.jpg", mime_type="image/jpeg")
+    assert cached is not None
+    assert cached.media_type == "image/png"
+    assert cached.path.endswith(".png")
+    assert Path(cached.path).read_bytes() == data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured,caller", [(16, 64), (64, 16), (0, 16)])
+async def test_streamed_media_enforces_strictest_nonzero_limit(monkeypatch, configured, caller):
+    import gateway.platforms.base as base
+
+    monkeypatch.setattr(base, "get_inbound_media_max_bytes", lambda: configured)
+
+    class Response:
+        headers = {"content-length": "1"}
+
+        async def aiter_bytes(self):
+            yield b"x" * 10
+            yield b"y" * 10
+
+    with pytest.raises(ValueError, match="too large"):
+        await base._read_httpx_body_with_limit(Response(), media_type="document", max_bytes=caller)

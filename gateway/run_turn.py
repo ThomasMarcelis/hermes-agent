@@ -2346,8 +2346,11 @@ class GatewayTurnMixin:
     ) -> "tuple[Any, Optional[Callable[[], None]]]":
         """Build the shared ``StreamConsumerConfig`` and optional Telegram pause-typing closure.
         For non-editing adapters ``on_missing_cursor="fallback"`` streams with an empty cursor;
-        ``"raise"`` raises ``RuntimeError`` so the caller skips streaming entirely."""
+        ``"raise"`` raises ``RuntimeError`` so the caller skips streaming entirely.
+        Final-only adapters reject both modes: each preview would be a permanent delivery."""
         from gateway.stream_consumer import StreamConsumerConfig
+        if getattr(adapter, "FINAL_ONLY_DELIVERY", False) is True:
+            raise RuntimeError("skip streaming for final-only delivery adapter")
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
             def _pause_typing_before_finalize(_adapter=adapter, _chat_id=source.chat_id) -> None:
@@ -2644,13 +2647,14 @@ class GatewayTurnMixin:
                 logger.debug("generic status phrase selection failed: %s", _phrase_err)
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
 
-        # Webhooks can't edit messages, so tool progress / log mode are off there.
+        # Immutable delivery targets must emit only the completed response.
         is_webhook = source.platform == Platform.WEBHOOK
-        tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook
+        final_only = getattr(adapter, "FINAL_ONLY_DELIVERY", False) is True
+        tool_progress_enabled = progress_mode not in {"off", "log"} and not final_only
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
         _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
         _live_status_adapter = (
-            adapter if getattr(adapter, "supports_status_text", False) and _live_status_mode != "off" else None
+            adapter if not final_only and getattr(adapter, "supports_status_text", False) and _live_status_mode != "off" else None
         )
         # "log" mode: tool calls go to ~/.hermes/logs/tool_calls.log instead of the chat. Gateway-only.
         log_mode_enabled = progress_mode == "log" and not is_webhook
@@ -2659,8 +2663,8 @@ class GatewayTurnMixin:
         interim_assistant_messages_mode = _display_surface_mode(
             "interim_assistant_messages", default=True, require_platform_override_for={Platform.MATTERMOST},
         )
-        interim_assistant_messages_enabled = not is_webhook and interim_assistant_messages_mode != "off"
-        _thinking_enabled = _display_surface_mode(
+        interim_assistant_messages_enabled = not final_only and interim_assistant_messages_mode != "off"
+        _thinking_enabled = not final_only and _display_surface_mode(
             "thinking_progress", default=False, require_platform_override_for={Platform.MATTERMOST},
         ) != "off"
         # Slack-native task cards need the progress queue even with text tool_progress off.
@@ -3702,7 +3706,10 @@ class GatewayTurnMixin:
         turn_ctx._step_callback_sync = turn_runner._step_callback_sync
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
-        turn_ctx._status_adapter = self._adapter_for_source(source)
+        status_adapter = self._adapter_for_source(source)
+        turn_ctx._status_adapter = (
+            None if getattr(status_adapter, "FINAL_ONLY_DELIVERY", False) is True else status_adapter
+        )
         turn_ctx._status_chat_id = source.chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
         return _status_thread_metadata
@@ -3725,7 +3732,7 @@ class GatewayTurnMixin:
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
         _status_thread_metadata = turn_ctx._status_thread_metadata
         _notify_adapter = self._adapter_for_source(source)
-        if not _notify_adapter:
+        if not _notify_adapter or getattr(_notify_adapter, "FINAL_ONLY_DELIVERY", False) is True:
             return
         _heartbeat_msg_id: Optional[str] = None
         while True:

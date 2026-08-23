@@ -1959,6 +1959,13 @@ DEFAULT_CONFIG = {
         # huge remote URLs can OOM-kill constrained deployments. Enforced in
         # gateway/platforms/base.py for every adapter. 0 = no cap. Default 128 MiB.
         "max_inbound_media_bytes": 134217728,
+        # Decode limits for inbound images. These complement the byte cap:
+        # compressed images and animations can expand far beyond wire size.
+        # Non-positive values fall back to these safe defaults.
+        "max_inbound_image_pixels": 40000000,
+        "max_inbound_image_total_pixels": 100000000,
+        "max_inbound_image_frames": 256,
+
         # Let adapters read HTTP_PROXY/HTTPS_PROXY/NO_PROXY/SSL_CERT_FILE from the environment and
         # auto-detect generic/macOS system proxies. False when the gateway inherits a proxy it must
         # not use (e.g. a scheduled task picking up a Clash/V2Ray HTTP_PROXY -> "Cannot connect to

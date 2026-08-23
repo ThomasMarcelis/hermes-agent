@@ -17,7 +17,10 @@ images natively.
 from __future__ import annotations
 
 import base64
+from io import BytesIO
 from types import SimpleNamespace
+
+from PIL import Image
 
 
 def _png_bytes():
@@ -110,10 +113,10 @@ class TestCacheMcpImageBlock:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_tool_content import _cache_mcp_image_block
 
-        # minimal JPEG SOI marker + filler
-        jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 100 + b"\xff\xd9"
+        buffer = BytesIO()
+        Image.new("RGB", (2, 2), "white").save(buffer, format="JPEG")
         block = SimpleNamespace(
-            data=base64.b64encode(jpeg).decode("ascii"),
+            data=base64.b64encode(buffer.getvalue()).decode("ascii"),
             mimeType="image/jpeg",
         )
         tag = _cache_mcp_image_block(block)
