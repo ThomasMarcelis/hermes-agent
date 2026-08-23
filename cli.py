@@ -537,6 +537,7 @@ def load_cli_config() -> Dict[str, Any]:
             },
         },
         "delegation": {
+            "top_level_completion": "join",  # join all child outcomes before root finalization
             "max_iterations": 45,  # Max tool-calling turns per child agent
             "model": "",       # Subagent model override (empty = inherit parent model)
             "provider": "",    # Subagent provider override (empty = inherit parent provider)
@@ -14369,9 +14370,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _on_tool_complete(self, tool_call_id: str, function_name: str, function_args: dict, function_result: str):
         """Render file edits with inline diff after write-capable tools complete."""
-        # A top-level delegate_task dispatches in the background and re-enters as
-        # a fresh turn when done. Say so once — no spinner, nothing to poll — so
-        # the idle prompt doesn't read as "nothing happened" (⛓ tracks the work).
+        # In explicit detach mode, delegate_task re-enters as a fresh turn when
+        # done. Say so once — no spinner, nothing to poll — so the idle prompt
+        # does not read as "nothing happened" (⛓ tracks the work). Joined-mode
+        # results have no dispatched/background marker and skip this notice.
         if function_name == "delegate_task":
             try:
                 parsed = json.loads(function_result) if isinstance(function_result, str) else (function_result or {})
