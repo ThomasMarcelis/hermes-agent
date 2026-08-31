@@ -5173,25 +5173,45 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return False
 
     async def create_handoff_thread(
-        self, parent_chat_id: str, name: str, *, auto_archive_duration: int = 1440,
+        self,
+        parent_chat_id: str,
+        name: str,
+        *,
+        auto_archive_duration: int = 1440,
     ) -> Optional[str]:
-        """Create a handoff thread under a text channel; returns the thread id or ``None``.
-        Falls back to seed-message + ``message.create_thread``; DMs/voice/threads can't host threads."""
+        """Create a visible Discord thread under a text-channel message.
+
+        Discord can create an unanchored thread directly on a text channel, but
+        that thread does not produce a starter message in the parent timeline.
+        Users who were not auto-joined can therefore miss the handoff entirely
+        even though delivery into the thread succeeds. Always post the visible
+        parent seed first and create the public thread from that message.
+
+        Returns the new thread id as a string, or ``None`` on failure or when
+        the parent cannot host a message-backed thread (DMs, voice channels,
+        and threads themselves). Returning ``None`` lets the caller fall back
+        to ordinary channel/DM delivery instead of hiding content in an
+        unanchored thread.
+        """
         if not self._client or not DISCORD_AVAILABLE:
             return None
+
         try:
             parent_id = int(parent_chat_id)
         except (TypeError, ValueError):
             return None
+
         try:
             parent = self._client.get_channel(parent_id)
             if parent is None:
                 parent = await self._client.fetch_channel(parent_id)
         except Exception as exc:
             logger.warning(
-                "[%s] Handoff thread: cannot resolve parent %s: %s", self.name, parent_chat_id, exc,
+                "[%s] Handoff thread: cannot resolve parent %s: %s",
+                self.name, parent_chat_id, exc,
             )
             return None
+
         # DMs, voice channels, and existing threads can't host child threads.
         if isinstance(parent, getattr(discord, "DMChannel", ())):
             logger.info(
@@ -5199,31 +5219,31 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 self.name, parent_chat_id,
             )
             return None
+
         thread_name = (name or "handoff").strip()[:80] or "handoff"
         reason = "Hermes session handoff"
-        try:
-            create = getattr(parent, "create_thread", None)
-            if create is not None:
-                thread = await create(name=thread_name, auto_archive_duration=auto_archive_duration, reason=reason)
-                return str(thread.id)
-        except Exception as direct_error:
-            logger.debug(
-                "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
-                self.name, direct_error,
-            )
+        seed_msg = None
+
         try:
             send = getattr(parent, "send", None)
             if send is None:
                 return None
-            seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
+            seed_msg = await send(f"\U0001f9f5 **{thread_name}**")
             thread = await seed_msg.create_thread(
-                name=thread_name, auto_archive_duration=auto_archive_duration, reason=reason,
+                name=thread_name,
+                auto_archive_duration=auto_archive_duration,
+                reason=reason,
             )
             return str(thread.id)
-        except Exception as fallback_error:
+        except Exception as exc:
+            if seed_msg is not None:
+                try:
+                    await seed_msg.delete()
+                except Exception:
+                    logger.warning("[%s] Handoff thread: orphan starter cleanup failed", self.name, exc_info=True)
             logger.warning(
-                "[%s] Handoff thread: both create paths failed for parent %s: %s",
-                self.name, parent_chat_id, fallback_error,
+                "[%s] Handoff thread: visible seed/thread creation failed for parent %s: %s",
+                self.name, parent_chat_id, exc,
             )
             return None
 
@@ -6832,6 +6852,16 @@ async def _standalone_is_forum(aiohttp, chat_id: str, json_headers: dict, sess_k
     return is_forum
 
 
+async def _standalone_remove_thread_seed(session, seed_url, seed_id, headers, req_kw) -> None:
+    """Best-effort cleanup when the parent seed could not become a thread."""
+    try:
+        async with session.delete(f"{seed_url}/{seed_id}", headers=headers, **req_kw) as resp:
+            if resp.status not in {200, 204, 404}:
+                logger.warning("Discord orphan thread starter cleanup failed (%s)", resp.status)
+    except Exception:
+        logger.warning("Discord orphan thread starter cleanup failed", exc_info=True)
+
+
 async def _standalone_send(
     pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
     media_files: Optional[list] = None, force_document: bool = False, caption: Optional[str] = None,
@@ -6928,16 +6958,36 @@ async def _standalone_send(
                     result["warnings"] = warnings
                 return result
             if requested_thread_name:
-                thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
+                # The parent starter makes the cron run visible even to users who
+                # were not joined to the new thread. Never create an unanchored fallback.
+                seed_url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as thread_session:
                     async with thread_session.post(
-                        thread_url, headers=json_headers,
-                        json={"name": requested_thread_name, "type": 11,
-                              "auto_archive_duration": archive_duration}, **_req_kw,
+                        seed_url, headers=json_headers,
+                        json={"content": f"🧵 **{requested_thread_name}**"}, **_req_kw,
                     ) as resp:
-                        data, err = await _standalone_response_json_or_error(resp, "Discord thread creation error")
+                        seed, err = await _standalone_response_json_or_error(resp, "Discord thread starter error")
                         if err:
                             return err
+                    seed_id = str(seed.get("id") or "")
+                    if not seed_id:
+                        return {"error": "Discord thread starter response omitted the message id"}
+                    thread_url = f"{seed_url}/{seed_id}/threads"
+                    try:
+                        async with thread_session.post(
+                            thread_url, headers=json_headers,
+                            json={"name": requested_thread_name,
+                                  "auto_archive_duration": archive_duration}, **_req_kw,
+                        ) as resp:
+                            data, err = await _standalone_response_json_or_error(resp, "Discord thread creation error")
+                        if not err and not data.get("id"):
+                            err = {"error": "Discord thread creation response omitted the thread id"}
+                    except Exception:
+                        await _standalone_remove_thread_seed(thread_session, seed_url, seed_id, auth_headers, _req_kw)
+                        raise
+                    if err:
+                        await _standalone_remove_thread_seed(thread_session, seed_url, seed_id, auth_headers, _req_kw)
+                        return err
                 created_thread_id = str(data.get("id") or "")
                 if not created_thread_id:
                     return {"error": "Discord thread creation response omitted the thread id"}
