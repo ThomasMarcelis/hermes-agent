@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+
+import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -36,7 +38,12 @@ def test_send_message_created_thread_is_mirrored_to_thread_session():
     assert mirror.call_args.kwargs["thread_id"] == "thread-1"
 
 
-def test_requested_name_creates_thread_then_sends_starter_content():
+def test_requested_name_anchors_thread_in_parent_then_sends_content():
+    seed_response = MagicMock()
+    seed_response.status = 200
+    seed_response.json = AsyncMock(return_value={"id": "seed-123"})
+    seed_response.__aenter__ = AsyncMock(return_value=seed_response)
+    seed_response.__aexit__ = AsyncMock(return_value=None)
     thread_response = MagicMock()
     thread_response.status = 201
     thread_response.json = AsyncMock(return_value={"id": "thread-123"})
@@ -50,7 +57,7 @@ def test_requested_name_creates_thread_then_sends_starter_content():
     session = MagicMock()
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=None)
-    session.post = MagicMock(side_effect=[thread_response, message_response])
+    session.post = MagicMock(side_effect=[seed_response, thread_response, message_response])
 
     with patch("aiohttp.ClientSession", return_value=session), patch(
         "gateway.channel_directory.lookup_channel_type", return_value="channel"
@@ -64,12 +71,13 @@ def test_requested_name_creates_thread_then_sends_starter_content():
         ))
 
     assert result["thread_id"] == "thread-123"
-    first, second = session.post.call_args_list
-    assert first.args[0].endswith("/channels/ch1/threads")
-    assert first.kwargs["json"] == {
-        "name": "Daily report", "type": 11, "auto_archive_duration": 60,
-    }
-    assert second.args[0].endswith("/channels/thread-123/messages")
+    seed, thread, content = session.post.call_args_list
+    assert seed.args[0].endswith("/channels/ch1/messages")
+    assert seed.kwargs["json"] == {"content": "🧵 **Daily report**"}
+    assert thread.args[0].endswith("/channels/ch1/messages/seed-123/threads")
+    assert thread.kwargs["json"] == {"name": "Daily report", "auto_archive_duration": 60}
+    assert content.args[0].endswith("/channels/thread-123/messages")
+    assert content.kwargs["json"] == {"content": "Cron output"}
 
 
 def test_thread_per_run_is_created_once_for_chunked_delivery():
@@ -94,3 +102,60 @@ def test_thread_per_run_is_created_once_for_chunked_delivery():
     assert first.kwargs["thread_auto_archive_duration"] == 60
     assert second.kwargs["thread_id"] == "thread-1"
     assert "thread_name" not in second.kwargs
+
+
+def test_standalone_handoff_seed_failure_never_creates_unanchored_thread():
+    response = MagicMock()
+    response.status = 403
+    response.text = AsyncMock(return_value="missing permission")
+    response.__aenter__ = AsyncMock(return_value=response)
+    response.__aexit__ = AsyncMock(return_value=None)
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    session.post = MagicMock(return_value=response)
+
+    with patch("aiohttp.ClientSession", return_value=session), patch(
+        "gateway.channel_directory.lookup_channel_type", return_value="channel"
+    ):
+        result = asyncio.run(_standalone_send(
+            SimpleNamespace(token="tok", extra={}), "ch1", "Cron output", thread_name="Daily report",
+        ))
+
+    assert "error" in result
+    session.post.assert_called_once()
+    assert session.post.call_args.args[0].endswith("/channels/ch1/messages")
+
+
+@pytest.mark.parametrize("failure", ["rejected", "missing_id", "exception"])
+def test_standalone_thread_failure_removes_visible_parent_seed(failure):
+    def response(status, payload):
+        value = MagicMock()
+        value.status = status
+        value.json = AsyncMock(return_value=payload)
+        value.text = AsyncMock(return_value="thread rejected")
+        value.__aenter__ = AsyncMock(return_value=value)
+        value.__aexit__ = AsyncMock(return_value=None)
+        return value
+
+    seed = response(200, {"id": "seed-1"})
+    failed = response(403 if failure == "rejected" else 201, {})
+    if failure == "exception":
+        failed.__aenter__ = AsyncMock(side_effect=RuntimeError("connection lost"))
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    session.post = MagicMock(side_effect=[seed, failed])
+    session.delete = MagicMock(return_value=response(204, {}))
+
+    with patch("aiohttp.ClientSession", return_value=session), patch(
+        "gateway.channel_directory.lookup_channel_type", return_value="channel"
+    ):
+        result = asyncio.run(_standalone_send(
+            SimpleNamespace(token="tok", extra={}), "ch1", "Cron output", thread_name="Daily report",
+        ))
+
+    assert "error" in result
+    assert session.post.call_count == 2
+    session.delete.assert_called_once()
+    assert session.delete.call_args.args[0].endswith("/channels/ch1/messages/seed-1")
