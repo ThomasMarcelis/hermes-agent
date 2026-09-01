@@ -19,14 +19,16 @@ from hermes_cli import models as M
 def test_anthropic_curated_alias_survives_when_live_omits_it():
     """A curated alias missing from /v1/models still surfaces (first)."""
     curated = M._PROVIDER_MODELS["anthropic"]
+    assert "claude-fable-5-1" in curated  # newest Fable alias is curated
     assert "claude-fable-5" in curated  # sanity: the alias is curated
     assert "claude-sonnet-5" in curated  # newest Sonnet alias is curated
 
-    # Live catalog the API would actually return — no fable-5.
+    # Lagging live catalog — no Fable aliases.
     live = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
     with patch.object(M, "_fetch_anthropic_models", return_value=live):
         result = M.provider_model_ids("anthropic")
 
+    assert "claude-fable-5-1" in result
     assert "claude-fable-5" in result
     assert "claude-sonnet-5" in result
     # Curated order is preserved at the front.
