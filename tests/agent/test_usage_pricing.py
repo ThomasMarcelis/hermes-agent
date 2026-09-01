@@ -193,6 +193,18 @@ def test_deepseek_deprecated_aliases_price_as_v4_flash():
 
 
 
+def test_native_fable_5_1_uses_published_cache_discount():
+    entry = get_pricing_entry(
+        "anthropic/claude-fable-5.1",
+        provider="anthropic",
+    )
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("10.00")
+    assert entry.output_cost_per_million == Decimal("50.00")
+    assert entry.cache_read_cost_per_million == Decimal("0.25")
+    assert entry.cache_write_cost_per_million == Decimal("12.50")
+
+
 def test_bedrock_claude_rows_all_carry_cache_pricing():
     """Invariant: every Bedrock Claude pricing row must carry cache-read AND
     cache-write rates, otherwise a cached session prices as ``unknown``.

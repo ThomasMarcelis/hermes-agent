@@ -1011,6 +1011,8 @@ class TestBuildAnthropicKwargs:
         )
         # New / unknown Claude models → modern contract by default.
         for m in (
+            "claude-fable-5-1",
+            "anthropic/claude-fable-5.1",
             "claude-fable-5",
             "anthropic/claude-fable-5",
             "claude-saga-2",            # hypothetical future named model
@@ -1020,6 +1022,7 @@ class TestBuildAnthropicKwargs:
             assert _supports_xhigh_effort(m) is True, m
             assert _forbids_sampling_params(m) is True, m
         # 1M-context reasoning model → highest output ceiling.
+        assert _get_anthropic_max_output("anthropic/claude-fable-5.1") == 128_000
         assert _get_anthropic_max_output("anthropic/claude-fable-5") == 128_000
 
 

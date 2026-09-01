@@ -182,13 +182,15 @@ class TestOpenRouterProfile:
         top-level dict must remain a single merged dict — verify the verbosity
         path doesn't clobber the extra_headers slot used by Grok affinity."""
         p = get_provider_profile("openrouter")
+        assert p is not None
         # mandatory anthropic + effort → verbosity, no extra_headers
-        _, tl = p.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": "high"},
-            supports_reasoning=True,
-            model="anthropic/claude-fable-5",
-        )
-        assert tl == {"verbosity": "high"}
+        for model in ("anthropic/claude-fable-5.1", "anthropic/claude-fable-5"):
+            _, tl = p.build_api_kwargs_extras(
+                reasoning_config={"enabled": True, "effort": "high"},
+                supports_reasoning=True,
+                model=model,
+            )
+            assert tl == {"verbosity": "high"}
 
     def test_speed_tier_slugs_pin_endpoints_and_rewrite_wire_model(self):
         """Nous-style ``-fast``/``-flex`` slugs are OpenRouter ENDPOINTS of the base model: the wire

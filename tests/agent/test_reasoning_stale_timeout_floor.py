@@ -76,6 +76,7 @@ import pytest
     ("anthropic/claude-sonnet-4.5", 180.0),
     ("anthropic/claude-sonnet-4.6", 180.0),
     # Anthropic Mythos-class named reasoning models — deep-reasoning tier.
+    ("anthropic/claude-fable-5.1", 600.0),
     ("anthropic/claude-fable-5", 600.0),
     ("claude-fable-5", 600.0),
     ("claude-fable", 600.0),

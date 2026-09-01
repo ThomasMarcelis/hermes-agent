@@ -153,6 +153,9 @@ _GOOGLE_URL = "https://ai.google.dev/pricing"
 _OPUS = ("5.00", "25.00", "0.50", "6.25")
 _SONNET = ("3.00", "15.00", "0.30", "3.75")
 _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
+    ("anthropic", "https://platform.claude.com/docs/en/models/fable-5-1/overview", "anthropic-pricing-2026-09", {
+        "claude-fable-5-1": ("10.00", "50.00", "0.25", "12.50"),
+    }),
     # OpenAI GPT-5.6 (Sol/Terra/Luna). Cache write = 1.25x input, cache read =
     # 0.10x input. "-pro" high-effort modes bill at the same per-token rates
     # (aliased below); "Sol Fast mode" is a separate tier, not covered.
