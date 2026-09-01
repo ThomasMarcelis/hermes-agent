@@ -52,6 +52,7 @@ def test_floor_matching_is_vendor_prefix_and_variant_suffix_transparent():
     while a look-alike community derivative does not match at all."""
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor as floor
 
+    assert floor("anthropic/claude-fable-5.1") == floor("claude-fable-5") is not None
     assert floor("openai/o3-mini") == floor("o3-mini") is not None
     assert floor("gpt-5.6-sol-900k") == floor("gpt-5.6-sol") is not None
     assert floor("thinkingmachines/inkling:free") == floor("thinkingmachines/inkling") is not None
