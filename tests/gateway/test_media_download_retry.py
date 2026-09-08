@@ -394,6 +394,17 @@ class TestSlackAttachmentDiagnostics:
 # SlackAdapter._download_slack_file
 # ---------------------------------------------------------------------------
 
+@pytest.fixture
+def slack_public_dns(monkeypatch):
+    """HTTP is mocked below; give the real SSRF check deterministic public DNS."""
+    def resolve(host, port, *args, **kwargs):
+        assert host == "files.slack.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port or 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+
+
+@pytest.mark.usefixtures("slack_public_dns")
 class TestSlackDownloadSlackFile:
     """Tests for SlackAdapter._download_slack_file"""
 
@@ -456,8 +467,18 @@ class TestSlackDownloadSlackFile:
 # SlackAdapter._download_slack_file_bytes
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("slack_public_dns")
 class TestSlackDownloadSlackFileBytes:
     """Tests for SlackAdapter._download_slack_file_bytes"""
+
+    def test_private_dns_still_blocks_before_http(self, monkeypatch):
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 443)),
+        ])
+        adapter = _make_slack_adapter()
+        with patch("httpx.AsyncClient") as client, pytest.raises(ValueError, match="SSRF protection"):
+            asyncio.run(adapter._download_slack_file_bytes("https://files.slack.com/file.bin"))
+        client.assert_not_called()
 
     def test_success_returns_bytes(self):
         """Successful download returns raw bytes."""
