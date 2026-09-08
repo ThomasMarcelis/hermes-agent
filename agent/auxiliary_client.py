@@ -1506,10 +1506,8 @@ class _CodexCompletionsAdapter:
                 resp_kwargs["service_tier"] = service_tier.strip()
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
-                # Shared per-model vocabulary with the main transport ("max" is gpt-5.6-only; "minimal"/"ultra"
-                # rejected; ``()`` = the model takes no ``reasoning`` field at all — gpt-4o/4.1 on api.openai.com,
-                # #76255). ``enabled: False`` goes on the wire as ``effort: none`` where the vocabulary has it,
-                # since an omitted field leaves the model's default effort on (#75227).
+                # Shared per-model/route effort vocabulary, including local Codex Astra.
+                # An explicit disable maps to effort none when supported (#75227).
                 from agent.reasoning_effort import clamp_effort
                 from agent.transports.codex import _codex_efforts_for_route
                 supported = _codex_efforts_for_route(model, host, is_codex_backend=route.is_codex_backend)

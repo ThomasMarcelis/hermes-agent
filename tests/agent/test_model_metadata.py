@@ -466,7 +466,8 @@ class TestCodexOAuthContextLength:
             for key in mm._codex_oauth_context_cache
         )
 
-    def test_probe_failure_falls_back_to_hardcoded(self):
+    @pytest.mark.parametrize("model", ["gpt-5.5", "gpt-6-astra"])
+    def test_probe_failure_falls_back_to_hardcoded(self, model):
         """If the probe fails (non-200 / network error), we still return
         the hardcoded 272k rather than leaking through to models.dev 1.05M."""
         from agent.model_metadata import get_model_context_length
@@ -479,7 +480,7 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             ctx = get_model_context_length(
-                model="gpt-5.5",
+                model=model,
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="expired-token",
                 provider="openai-codex",
@@ -535,7 +536,7 @@ class TestCodexOAuthContextLength:
         assert remaining.get(other_key) == 128_000
 
 
-    @pytest.mark.parametrize("slug", ["gpt-5.6-sol"])
+    @pytest.mark.parametrize("slug", ["gpt-5.6-sol", "gpt-6-astra"])
     def test_base_slug_keeps_advertised_272k(self, slug):
         """Base slugs (no ``-900k`` suffix) keep the advertised 272K — the
         cheaper default limit. The verified-above bump is opt-in only."""

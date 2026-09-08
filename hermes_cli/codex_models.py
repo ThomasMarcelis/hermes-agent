@@ -6,6 +6,9 @@ import json
 import logging
 import os
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+from agent.codex_headers import CODEX_AUX_BASE_URL, is_local_codex_base_url
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -151,16 +154,43 @@ def _ranked_slugs(entries: object) -> List[str]:
     return _dedupe(slug for _, slug in sortable)
 
 
-def _fetch_models_from_api(access_token: str) -> List[str]:
+def codex_discovery_base_url(fallback_base_url: Optional[str] = None) -> str:
+    """Use the configured Codex route for discovery, preserving the legacy environment override."""
+    env_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+    if env_url:
+        return env_url
+    from hermes_cli.config import load_config_readonly
+
+    model_cfg = load_config_readonly().get("model", {})
+    if isinstance(model_cfg, dict) and str(model_cfg.get("provider") or "").strip().lower() in {"codex", "openai-codex"}:
+        configured = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+        if configured:
+            return configured
+    return str(fallback_base_url or CODEX_AUX_BASE_URL).strip().rstrip("/")
+
+
+def _fetch_models_from_api(access_token: str, *, base_url: Optional[str] = None) -> List[str]:
     """Fetch available models from the Codex API. Returns visible models sorted by priority."""
     try:
         import httpx
-        # The per-account catalog needs ChatGPT-Account-ID (else ``{"models":[]}`` with HTTP 200
-        # masquerades as "no models") and, for residency-enforced workspaces, the residency header.
+        # Account and residency headers are needed by the canonical per-account catalog.
         from agent.codex_headers import codex_account_headers
         headers = {"Authorization": f"Bearer {access_token}", **codex_account_headers(access_token)}
-        from agent.model_metadata import fetch_codex_catalog_entries
-        entries, _status = fetch_codex_catalog_entries(lambda url: httpx.get(url, headers=headers, timeout=10))
+        endpoint = (base_url or CODEX_AUX_BASE_URL).rstrip("/")
+        if is_local_codex_base_url(endpoint):
+            parts = urlsplit(endpoint)
+            catalog_url = urlunsplit((parts.scheme, parts.netloc, "/v1/models", "", ""))
+            resp = httpx.get(catalog_url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            entries = data.get("models", data.get("data", [])) if isinstance(data, dict) else []
+            if isinstance(entries, list):
+                entries = [{**item, "slug": item.get("slug") or item.get("id")}
+                           for item in entries if isinstance(item, dict)]
+        else:
+            from agent.model_metadata import fetch_codex_catalog_entries
+            entries, _status = fetch_codex_catalog_entries(lambda url: httpx.get(url, headers=headers, timeout=10))
     except Exception as exc:
         logger.debug("Failed to fetch Codex models from API: %s", exc)
         return []
@@ -194,14 +224,19 @@ def _read_cache_models(codex_home: Path) -> List[str]:
     return _ranked_slugs(entries if isinstance(entries, list) else [])
 
 
-def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
-    """Available Codex model IDs: live API (if token) > config.toml default > local cache > defaults."""
+def get_codex_model_ids(access_token: Optional[str] = None, *, base_url: Optional[str] = None) -> List[str]:
+    """Discover the selected Codex endpoint; local codex-lb retains its verified offline Astra choice."""
+    endpoint = str(base_url or codex_discovery_base_url()).rstrip("/")
+    local_proxy = is_local_codex_base_url(endpoint)
     codex_home = Path(os.getenv("CODEX_HOME", "").strip() or str(Path.home() / ".codex")).expanduser()
     if access_token:
-        api_models = _fetch_models_from_api(access_token)
+        # Keep the original one-argument seam for official callers; other endpoints are explicit.
+        api_models = (_fetch_models_from_api(access_token) if endpoint == CODEX_AUX_BASE_URL else
+                      _fetch_models_from_api(access_token, base_url=endpoint))
         if api_models:
-            return _finalize_codex_models(api_models)
+            return _finalize_codex_models(_dedupe([*api_models, "gpt-6-astra"]) if local_proxy else api_models)
     default_model = _read_default_model(codex_home)
-    return _finalize_codex_models(_drop_undiscovered_astra(_dedupe([
-        *([default_model] if default_model else []), *_read_cache_models(codex_home),
-        *DEFAULT_CODEX_MODELS])))
+    cached = [*([default_model] if default_model else []), *_read_cache_models(codex_home)]
+    if local_proxy:
+        return _finalize_codex_models(_dedupe([*cached, "gpt-6-astra", *DEFAULT_CODEX_MODELS]))
+    return _finalize_codex_models(_drop_undiscovered_astra(_dedupe([*cached, *DEFAULT_CODEX_MODELS])))

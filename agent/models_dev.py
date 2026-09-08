@@ -635,6 +635,16 @@ _DEEPSEEK_FLASH_VISION: Dict[str, Any] = {
 }
 
 _BUILTIN_MODEL_METADATA: Dict[Tuple[str, str], Dict[str, Any]] = {
+    # codex-lb /v1/models, September 2026: the Codex window differs from the public API.
+    # This catalog did not supply pricing/output limits, so leave those fields unspecified.
+    ("openai-codex", "gpt-6-astra"): {
+        "name": "GPT-6 Astra",
+        "limit": {"context": 272_000},
+        "modalities": {"input": ["text", "image"], "output": ["text"]},
+        "tool_call": True,
+        "reasoning": True,
+        "attachment": True,
+    },
     ("openai", "gpt-6-astra"): {
         "limit": {"context": 1_050_000, "output": 128_000},
         "modalities": {"input": ["text", "image"], "output": ["text"]},
@@ -793,8 +803,10 @@ def _builtin_model_metadata(
     provider: str, model: str, *, config: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Built-in metadata for a provider/model pair, if Hermes has a vendor-specific entry."""
-    provider_key = _models_dev_id(provider, config=config) or (provider or "").strip()
-    return _BUILTIN_MODEL_METADATA.get((provider_key, (model or "").strip().lower()))
+    provider_key = (provider or "").strip().lower()
+    model_key = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return (_BUILTIN_MODEL_METADATA.get((provider_key, model_key))
+            or _BUILTIN_MODEL_METADATA.get((_models_dev_id(provider, config=config) or provider_key, model_key)))
 
 
 def _relay_vision_marker_metadata(provider: str, model: str) -> Optional[Dict[str, Any]]:

@@ -1297,21 +1297,22 @@ def _openai_discovery_base_url(provider: str) -> str:
 
 
 def _codex_catalog(normalized: str, force_refresh: bool) -> list[str]:
-    from hermes_cli.codex_models import get_codex_model_ids
+    from hermes_cli.codex_models import codex_discovery_base_url, get_codex_model_ids
 
-    # Live OAuth token so the picker matches what ChatGPT lists for this account; hardcoded
-    # catalog without a token / when unreachable. Read-only (#68004): a picker never imports,
-    # refreshes or persists a credential, so an expired stored token means the hardcoded catalog
-    # until the runtime lease refreshes it.
+    # Read-only picker: never refresh/persist credentials. Preserve the matching endpoint.
+    # A local Codex proxy owns a different catalog from the official account-scoped route.
     try:
         from hermes_cli.auth import _codex_access_token_is_expiring, resolve_codex_runtime_credentials
 
-        access_token = resolve_codex_runtime_credentials(read_only=True).get("api_key")
-        if _codex_access_token_is_expiring(access_token, 0):
-            access_token = None
+        credentials = resolve_codex_runtime_credentials(read_only=True)
+        if _codex_access_token_is_expiring(credentials.get("api_key"), 0):
+            credentials = {**credentials, "api_key": None}
     except Exception:
-        access_token = None
-    return get_codex_model_ids(access_token=access_token)
+        credentials = {}
+    return get_codex_model_ids(
+        access_token=credentials.get("api_key"),
+        base_url=codex_discovery_base_url(credentials.get("base_url")),
+    )
 
 
 _COPILOT_ACP_SESSION_MEMO_TTL = 300.0  # 5 min; SWR disk cache handles the rest
@@ -1773,14 +1774,16 @@ def _credential_fingerprint(provider: str) -> str:
         except Exception:
             pass
 
-    # Azure Foundry deployments are per-resource and the wizard writes only model.base_url, so a
-    # resource switch under the same key must not serve the previous resource's catalog (#27989).
+    # Azure resources and Codex endpoints own distinct model catalogs.
     if provider == "azure-foundry":
         try:
             from hermes_cli.runtime_provider import _config_base_url_for_provider
             parts.append(f"effective_base={_config_base_url_for_provider(_get_model_config_dict(), 'azure-foundry')}")
         except Exception:
             pass
+    if provider == "openai-codex":
+        from hermes_cli.codex_models import codex_discovery_base_url
+        parts.append(f"effective_base={codex_discovery_base_url()}")
 
     if provider == "ollama":
         provider_cfg = _get_provider_config_dict("ollama")
@@ -1879,8 +1882,15 @@ def _normalized_cache_slug(provider: Optional[str]) -> str:
 
 
 def _model_requires_account_discovery(provider: Optional[str], model: str) -> bool:
-    """Astra names cannot confer API/OAuth entitlement through picker state."""
-    return _normalized_cache_slug(provider) in {"openai", "openai-api", "openai-codex"} and is_astra_model(model)
+    """Official Astra names cannot confer entitlement; the configured local Codex proxy owns its catalog."""
+    normalized = _normalized_cache_slug(provider)
+    if normalized == "openai-codex":
+        from agent.codex_headers import is_local_codex_base_url
+        from hermes_cli.codex_models import codex_discovery_base_url
+
+        if is_local_codex_base_url(codex_discovery_base_url()):
+            return False
+    return normalized in {"openai", "openai-api", "openai-codex"} and is_astra_model(model)
 
 
 def cached_provider_model_ids(

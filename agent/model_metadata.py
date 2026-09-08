@@ -2074,6 +2074,14 @@ def _resolve_custom_endpoint_context_length(model: str, base_url: str, api_key: 
     if ctx is not None:
         _save_unless_skipped(model, base_url, ctx, provider)
         return ctx
+    # Local codex-lb has Codex limits even when its catalog is temporarily unavailable.
+    # Preserve the live probes above and the public API catalog below.
+    from agent.codex_headers import is_local_codex_base_url
+    from agent.reasoning_effort import is_astra_model
+    if is_local_codex_base_url(base_url) and is_astra_model(model):
+        ctx, _source = _resolve_codex_oauth_context_length_with_source(model)
+        if ctx is not None:
+            return ctx
     # 3. Probe-down fallback after endpoint-specific detection failed
     logger.info(
         "Could not detect context length for model %r at %s — defaulting to %s tokens (probe-down). "
@@ -2167,6 +2175,14 @@ def _resolve_provider_aware_context_length(model: str, base_url: str, api_key: s
     # 5b/5c. Nous portal and Codex OAuth (lower limits than the direct API for the same slug; its
     # own /models is authoritative). Persist ONLY the authoritative source ("portal" / "live"): an
     # OR-fallback or static-table value cached on a blip would be frozen in by step 1 forever.
+    # Local Codex LB can report a live window distinct from both the public API and
+    # the fallback OAuth table. Do not probe a foreign endpoint with a ChatGPT token.
+    if effective_provider == "openai-codex" and base_url:
+        from agent.codex_headers import is_local_codex_base_url
+        if is_local_codex_base_url(base_url):
+            local_ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+            if local_ctx is not None:
+                return local_ctx
     sourced = {
         "nous": lambda: _resolve_nous_context_length(model, base_url=base_url or "", api_key=api_key or "") + ("portal",),
         "openai-codex": lambda: _resolve_codex_oauth_context_length_with_source(model, access_token=api_key or "") + ("live",),

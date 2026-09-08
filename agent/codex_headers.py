@@ -31,6 +31,23 @@ def is_official_codex_base_url(base_url: str) -> bool:
         return False
 
 
+def is_local_codex_base_url(base_url: str) -> bool:
+    """Recognize an explicitly addressed loopback Codex backend, including codex-lb's /v1 route."""
+    try:
+        parsed = urlparse(base_url)
+        path = parsed.path.rstrip("/")
+        return (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and (
+                path == "/backend-api/codex" or path.startswith("/backend-api/codex/")
+                or (parsed.port == 2455 and path in {"", "/v1"})
+            )
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def codex_cloudflare_headers(access_token: str, *, base_url: str = CODEX_AUX_BASE_URL) -> Dict[str, str]:
     """Identity and account headers for chatgpt.com/backend-api/codex.
 
