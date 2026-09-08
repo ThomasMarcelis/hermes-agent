@@ -232,6 +232,9 @@ class TestCrossPlatformDelivery:
         mock_tg_adapter.send = AsyncMock(return_value=SendResult(success=True))
 
         mock_runner = MagicMock()
+        mock_runner._primary_profile_name = "default"
+        mock_runner._active_profile_name.return_value = "default"
+        mock_runner._profile_adapters = {}
         mock_runner.adapters = {Platform.TELEGRAM: mock_tg_adapter}
         mock_runner.config = GatewayConfig(
             platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")}

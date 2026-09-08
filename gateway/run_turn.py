@@ -3147,7 +3147,7 @@ class GatewayTurnMixin:
         """Staged one-shot warning before the inactivity timeout escalates."""
         from gateway.run import _interim_metadata
         _warn_adapter = self._adapter_for_source(source)
-        if not _warn_adapter:
+        if not _warn_adapter or getattr(_warn_adapter, "FINAL_ONLY_DELIVERY", False) is True:
             return
         try:
             await _warn_adapter.send(

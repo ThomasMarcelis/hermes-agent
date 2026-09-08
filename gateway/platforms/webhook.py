@@ -782,11 +782,15 @@ class WebhookAdapter(BasePlatformAdapter):
 
     def _find_adapter(self, target_platform: Platform, delivery_profile: str):
         """Resolve only within the ingress profile; unavailable delivery fails closed."""
-        if delivery_profile == self._effective_delivery_profile():
+        # As in GatewayAuthorizationMixin, secondary maps take precedence and
+        # adapters belongs to the captured primary, never the active turn scope.
+        profile_maps = getattr(self.gateway_runner, "_profile_adapters", {}) or {}
+        if delivery_profile in profile_maps:
+            adapter_map = profile_maps[delivery_profile] or {}
+        elif delivery_profile == getattr(self.gateway_runner, "_primary_profile_name", None):
             adapter_map = getattr(self.gateway_runner, "adapters", {}) or {}
         else:
-            profile_maps = getattr(self.gateway_runner, "_profile_adapters", {}) or {}
-            adapter_map = profile_maps.get(delivery_profile, {}) or {}
+            return None
         return adapter_map.get(target_platform) if isinstance(adapter_map, dict) else None
 
     async def _deliver_cross_platform(self, platform_name: str, content: str, delivery: dict) -> SendResult:
@@ -803,7 +807,7 @@ class WebhookAdapter(BasePlatformAdapter):
         extra = delivery.get("deliver_extra", {})
         chat_id = extra.get("chat_id", "")
         if not chat_id:
-            if delivery_profile != self._effective_delivery_profile():
+            if delivery_profile != getattr(self.gateway_runner, "_primary_profile_name", None):
                 return SendResult(success=False, error=f"No explicit chat_id for {platform_name} delivery on secondary profile {delivery_profile}")
             home = self.gateway_runner.config.get_home_channel(target_platform)
             if not home:

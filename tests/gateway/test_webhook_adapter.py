@@ -713,6 +713,9 @@ class TestWebhookSilenceSuppression:
         mock_target = AsyncMock()
         mock_target.send = AsyncMock(return_value=SendResult(success=True))
         mock_runner = MagicMock()
+        mock_runner._primary_profile_name = "default"
+        mock_runner._active_profile_name.return_value = "default"
+        mock_runner._profile_adapters = {}
         mock_runner.adapters = {Platform("telegram"): mock_target}
         mock_runner.config.get_home_channel.return_value = None
         adapter.gateway_runner = mock_runner
@@ -840,6 +843,9 @@ class TestDeliverCrossPlatformThreadId:
         mock_target.send = AsyncMock(return_value=SendResult(success=True))
 
         mock_runner = MagicMock()
+        mock_runner._primary_profile_name = "default"
+        mock_runner._active_profile_name.return_value = "default"
+        mock_runner._profile_adapters = {}
         mock_runner.adapters = {Platform("telegram"): mock_target}
         mock_runner.config.get_home_channel.return_value = None
 

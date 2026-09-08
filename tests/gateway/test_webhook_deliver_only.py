@@ -51,6 +51,9 @@ def _wire_mock_target(adapter: WebhookAdapter, platform_name: str = "telegram"):
     mock_target.send = AsyncMock(return_value=SendResult(success=True))
 
     mock_runner = MagicMock()
+    mock_runner._primary_profile_name = "default"
+    mock_runner._active_profile_name.return_value = "default"
+    mock_runner._profile_adapters = {}
     mock_runner.adapters = {Platform(platform_name): mock_target}
     mock_runner.config.get_home_channel.return_value = None
 

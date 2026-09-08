@@ -509,9 +509,9 @@ def safe_url_for_log(url: str, max_len: int = 80) -> str:
 async def _ssrf_redirect_guard(response):
     """Re-validate each redirect target (a public URL 302-ing to http://169.254.169.254/ would
     bypass the pre-flight is_safe_url()). Async because httpx awaits response event hooks."""
-    from tools.url_safety import is_safe_url, redirect_target_from_response
+    from tools.url_safety import async_is_safe_url, redirect_target_from_response
     redirect_url = redirect_target_from_response(response)
-    if redirect_url and not is_safe_url(redirect_url):
+    if redirect_url and not await async_is_safe_url(redirect_url):
         raise ValueError(f"Blocked redirect to private/internal address: {safe_url_for_log(redirect_url)}")
 
 
@@ -643,13 +643,11 @@ async def download_media_bytes_from_url(
     proxy_url: Optional[str] = None,
     max_bytes: Optional[int] = None,
 ) -> bytes:
-    """Download one bounded media body with connect/redirect SSRF checks."""
-    from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+    """Download one size- and time-bounded body with connect/redirect SSRF checks.
 
-    if not is_safe_url(url):
-        raise ValueError(
-            f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}"
-        )
+    ``timeout`` bounds URL validation and the complete transfer as well as each HTTP I/O.
+    """
+    from tools.url_safety import async_is_safe_url, create_ssrf_safe_async_client
 
     client_kwargs: dict[str, Any] = {
         "timeout": timeout,
@@ -658,14 +656,21 @@ async def download_media_bytes_from_url(
     }
     if proxy_url:
         client_kwargs["proxy"] = proxy_url
-    async with create_ssrf_safe_async_client(**client_kwargs) as client:
-        async with client.stream("GET", url, headers=headers or {}) as response:
-            response.raise_for_status()
-            return await _read_httpx_body_with_limit(
-                response,
-                media_type=media_type,
-                max_bytes=max_bytes,
+    # HTTPX's I/O timeout alone lets a slow-drip response run indefinitely.
+    # Nest the resource contexts inside the deadline so cancellation closes both.
+    async with asyncio.timeout(timeout):
+        if not await async_is_safe_url(url):
+            raise ValueError(
+                f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}"
             )
+        async with create_ssrf_safe_async_client(**client_kwargs) as client:
+            async with client.stream("GET", url, headers=headers or {}) as response:
+                response.raise_for_status()
+                return await _read_httpx_body_with_limit(
+                    response,
+                    media_type=media_type,
+                    max_bytes=max_bytes,
+                )
 
 
 def _cache_dir_accessors(kind: str, constant_name: str, new_subpath: str, old_name: str):
