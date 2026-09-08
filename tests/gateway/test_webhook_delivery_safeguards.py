@@ -14,13 +14,15 @@ from gateway.platforms.webhook import _INSECURE_NO_AUTH
 from tests.gateway.test_webhook_adapter import _create_app, _make_adapter
 
 
-def _runner_with_adapters(default, profiles=None):
-    """Exercise the gateway's real profile-aware resolver, not a MagicMock method."""
+def _delivery_runner(primary_adapter, *, profile_adapters=None, config=None):
+    """Exercise the production profile-aware delivery resolver."""
+    from gateway.config import GatewayConfig
     runner = object.__new__(GatewayRunner)
-    runner.adapters = {Platform.DISCORD: default}
-    runner._profile_adapters = profiles or {}
     runner._primary_profile_name = "default"
-    runner.config = SimpleNamespace(multiplex_profiles=bool(profiles), profile_routes=[])
+    runner.adapters = {Platform.DISCORD: primary_adapter}
+    runner._profile_adapters = profile_adapters or {}
+    runner._profile_failed_platforms = {}
+    runner.config = config or GatewayConfig(multiplex_profiles=bool(profile_adapters))
     return runner
 
 
@@ -62,7 +64,7 @@ class TestWebhookIdempotencyNamespace:
         })
         target = MagicMock()
         target.send = AsyncMock(return_value=SendResult(False, error="down"))
-        runner = _runner_with_adapters(target)
+        runner = _delivery_runner(target)
         adapter.gateway_runner = runner  # type: ignore[assignment]
         headers = {"X-GitHub-Delivery": "retryable-delivery"}
 
@@ -82,7 +84,9 @@ async def test_cross_platform_delivery_is_strictly_profile_scoped():
     default_target.send = AsyncMock(return_value=SendResult(True))
     worker_target = MagicMock()
     worker_target.send = AsyncMock(return_value=SendResult(True))
-    runner = _runner_with_adapters(default_target, {"worker": {Platform.DISCORD: worker_target}})
+    runner = _delivery_runner(
+        default_target, profile_adapters={"worker": {Platform.DISCORD: worker_target}},
+    )
     adapter.gateway_runner = runner  # type: ignore[assignment]
 
     result = await adapter._deliver_cross_platform(
@@ -119,7 +123,7 @@ async def test_webhook_delivery_sends_exactly_one_final_response(on_missing_curs
     adapter = _make_adapter()
     target = MagicMock()
     target.send = AsyncMock(return_value=SendResult(True))
-    delivery_runner = _runner_with_adapters(target)
+    delivery_runner = _delivery_runner(target)
     adapter.gateway_runner = delivery_runner  # type: ignore[assignment]
     chat_id = "webhook:generic:delivery-1"
     adapter._delivery_info[chat_id] = {
@@ -204,8 +208,9 @@ async def test_http_profile_route_keeps_delivery_and_retry_in_owning_profile(tmp
     }})
     default_target = SimpleNamespace(send=AsyncMock(return_value=SendResult(True)))
     worker_target = SimpleNamespace(send=AsyncMock(side_effect=[RuntimeError("offline"), SendResult(True)]))
-    adapter.gateway_runner = _runner_with_adapters(
-        default_target, {"worker": {Platform.DISCORD: worker_target}},
+    adapter.gateway_runner = _delivery_runner(
+        default_target, profile_adapters={"worker": {Platform.DISCORD: worker_target}},
+        config=SimpleNamespace(multiplex_profiles=True, profile_routes=[]),
     )
     monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve", lambda multiplex: [
         ("default", default_home), ("worker", worker_home),
@@ -225,3 +230,114 @@ async def test_http_profile_route_keeps_delivery_and_retry_in_owning_profile(tmp
     assert worker_target.send.await_count == 2
     assert all(call.args[0] == "worker-channel" for call in worker_target.send.await_args_list)
     default_target.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary_profile", ["default", "operator"])
+@pytest.mark.parametrize("active_profile", ["primary", "worker"])
+async def test_delivery_owner_and_home_are_stable_across_turn_scopes(
+    tmp_path, monkeypatch, primary_profile, active_profile,
+):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from gateway.config import GatewayConfig, HomeChannel, PlatformConfig
+    from gateway.run import GatewayRunner, _profile_runtime_scope
+
+    isolated_home = tmp_path / "home"
+    default_home = isolated_home / ".hermes"
+    primary_home = (default_home if primary_profile == "default"
+                    else default_home / "profiles" / primary_profile)
+    worker_home = default_home / "profiles" / "worker"
+    primary_home.mkdir(parents=True)
+    worker_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: isolated_home)
+    monkeypatch.setenv("HERMES_HOME", str(primary_home))
+    runner = object.__new__(GatewayRunner)
+    runner._primary_profile_name = runner._active_profile_name()
+    primary = SimpleNamespace(send=AsyncMock(return_value=SendResult(True)))
+    worker = SimpleNamespace(send=AsyncMock(return_value=SendResult(True)))
+    runner.adapters = {Platform.DISCORD: primary}
+    runner._profile_adapters = {"worker": {Platform.DISCORD: worker}}
+    runner.config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(
+        home_channel=HomeChannel(Platform.DISCORD, "primary-home", "Home"),
+    )})
+    adapter = _make_adapter()
+    adapter.gateway_runner = runner
+
+    scoped_home = primary_home if active_profile == "primary" else worker_home
+    with _profile_runtime_scope(scoped_home, prepared_secret_scope={}):
+        assert runner._active_profile_name() == (primary_profile if active_profile == "primary" else "worker")
+        # No explicit profile uses the active turn, but the adapter map still has a fixed owner.
+        expected = primary if active_profile == "primary" else worker
+        assert adapter._find_adapter(Platform.DISCORD, adapter._effective_delivery_profile()) is expected
+        assert adapter._find_adapter(Platform.DISCORD, primary_profile) is primary
+        assert adapter._find_adapter(Platform.DISCORD, "worker") is worker
+        result = await adapter._deliver_cross_platform("discord", "worker final", {
+            "profile": "worker", "deliver_extra": {"chat_id": "worker-chat"},
+        })
+        assert result.success
+        worker.send.assert_awaited_once_with("worker-chat", "worker final", metadata=None)
+        primary.send.assert_not_awaited()
+
+        result = await adapter._deliver_cross_platform("discord", "no worker home", {"profile": "worker"})
+        assert not result.success
+        worker.send.assert_awaited_once()
+        primary.send.assert_not_awaited()
+        result = await adapter._deliver_cross_platform("discord", "primary final", {"profile": primary_profile})
+        assert result.success
+        primary.send.assert_awaited_once_with("primary-home", "primary final", metadata=None)
+
+        # Both a failed platform connection and an absent secondary runtime fail closed.
+        for profiles in ({"worker": {}}, {}):
+            runner._profile_adapters = profiles
+            result = await adapter._deliver_cross_platform("discord", "must not leak", {
+                "profile": "worker", "deliver_extra": {"chat_id": "worker-chat"},
+            })
+            assert not result.success
+        # Bare test runners without captured ownership retain the target resolver's
+        # active-profile fallback. Production runners always capture ownership.
+        del runner._primary_profile_name
+        assert adapter._find_adapter(
+            Platform.DISCORD,
+            adapter._effective_delivery_profile(),
+        ) is primary
+        primary.send.assert_awaited_once()
+        worker.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_only", [True, False])
+async def test_inactivity_warning_respects_final_only_delivery(final_only):
+    from types import SimpleNamespace
+
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    adapter = _make_adapter()
+    adapter.FINAL_ONLY_DELIVERY = final_only
+    target = SimpleNamespace(send=AsyncMock(return_value=SendResult(True)))
+    adapter.gateway_runner = _delivery_runner(target)
+    chat_id = "webhook:events:warning"
+    adapter._delivery_info[chat_id] = {
+        "deliver": "discord", "profile": "default", "deliver_extra": {"chat_id": "final-chat"},
+    }
+    source = SessionSource(platform=Platform.WEBHOOK, chat_id=chat_id)
+    runner = object.__new__(GatewayRunner)
+    if not final_only:
+        adapter = SimpleNamespace(emit_warning=AsyncMock(return_value=SendResult(True)))
+    runner._delivery_adapter_for = lambda source: adapter
+    await runner._run_agent_inactivity_warning(
+        SimpleNamespace(agent_warning=60, agent_timeout=180), source, {"thread_id": "status-thread"},
+    )
+    if final_only:
+        target.send.assert_not_awaited()
+        # The interim warning must neither deliver nor consume the pending final's route.
+        assert (await adapter.send(chat_id, "Final response")).success
+        target.send.assert_awaited_once_with("final-chat", "Final response", metadata=None)
+    else:
+        adapter.emit_warning.assert_awaited_once()
+        assert "I seem to be stuck" in adapter.emit_warning.await_args.args[1]
+        assert adapter.emit_warning.await_args.kwargs["metadata"] == {
+            "thread_id": "status-thread", "_interim_send": True,
+        }

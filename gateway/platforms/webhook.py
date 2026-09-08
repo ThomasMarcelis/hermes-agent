@@ -911,7 +911,8 @@ class WebhookAdapter(BasePlatformAdapter):
 
     def _delivery_config(self, profile: Optional[str]):
         """Load the delivery profile's config inside its captured scope."""
-        if not profile or profile == "default":
+        primary_profile = getattr(self.gateway_runner, "_primary_profile_name", None)
+        if not profile or profile == "default" or profile == primary_profile:
             return self.gateway_runner.config
         from gateway.config import load_gateway_config
         return load_gateway_config()
