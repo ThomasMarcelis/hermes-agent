@@ -292,7 +292,10 @@ class CLIModelSwitchMixin:
             fallback_model = "gpt-5.3-codex"
             try:
                 from hermes_cli.codex_models import get_codex_model_ids
-                available = get_codex_model_ids(access_token=self.api_key if self.api_key else None)
+                available = get_codex_model_ids(
+                    access_token=self.api_key if self.api_key else None,
+                    base_url=getattr(self, "base_url", None),
+                )
                 if available:
                     fallback_model = available[0]
             except Exception:

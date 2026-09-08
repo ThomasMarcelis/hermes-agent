@@ -341,9 +341,9 @@ def _model_flow_nous(config, current_model="", args=None):
 def _model_flow_openai_codex(config, current_model=""):
     """OpenAI Codex provider: ensure logged in, then pick model."""
     from hermes_cli.auth import (
-        get_codex_auth_status, _prompt_model_selection, _login_openai_codex, PROVIDER_REGISTRY, DEFAULT_CODEX_BASE_URL,
+        get_codex_auth_status, _prompt_model_selection, _login_openai_codex, PROVIDER_REGISTRY,
     )
-    from hermes_cli.codex_models import get_codex_model_ids
+    from hermes_cli.codex_models import codex_discovery_base_url, get_codex_model_ids
     if not _oauth_gate(
         bool(get_codex_auth_status().get("logged_in")), "OpenAI Codex", _login_openai_codex, argparse.Namespace(),
         PROVIDER_REGISTRY["openai-codex"], recheck=lambda: get_codex_auth_status().get("logged_in")):
@@ -360,11 +360,12 @@ def _model_flow_openai_codex(config, current_model=""):
             from hermes_cli.auth import resolve_codex_runtime_credentials
             _codex_token = resolve_codex_runtime_credentials().get("api_key")
 
+    _codex_base_url = codex_discovery_base_url()
     codex_models = get_codex_model_ids(access_token=_codex_token)
     selected = _prompt_model_selection(
         codex_models, current_model=current_model, confirm_provider="openai-codex",
-        confirm_base_url=DEFAULT_CODEX_BASE_URL, confirm_api_key=_codex_token or "")
-    _activate_provider_model(selected, "openai-codex", DEFAULT_CODEX_BASE_URL,
+        confirm_base_url=_codex_base_url, confirm_api_key=_codex_token or "")
+    _activate_provider_model(selected, "openai-codex", _codex_base_url,
                              f"Default model set to: {selected} (via OpenAI Codex)")
 
 

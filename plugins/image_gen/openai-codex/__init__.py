@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 _MAX_ERROR_BODY_CHARS = 500
 
 # Hosts the ``image_generation`` tool call; ``API_MODEL`` does the image work.
-_CODEX_CHAT_MODEL = "gpt-5.6-sol"
+_CODEX_CHAT_MODEL = "gpt-6-astra"
 _CODEX_BASE_URL = "http://127.0.0.1:2455/backend-api/codex"
 _CODEX_INSTRUCTIONS = (
     "You are an assistant that must fulfill image generation and image editing "

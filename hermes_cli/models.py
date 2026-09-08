@@ -1099,17 +1099,19 @@ def _openai_discovery_base_url(provider: str) -> str:
 
 
 def _codex_catalog(normalized: str, force_refresh: bool) -> list[str]:
-    from hermes_cli.codex_models import get_codex_model_ids
+    from hermes_cli.codex_models import codex_discovery_base_url, get_codex_model_ids
 
-    # Live OAuth token so the picker matches what ChatGPT lists for this account; hardcoded
-    # catalog without a token / when unreachable.
+    # Keep endpoint and credential together; a local Codex proxy is a different catalog owner.
     try:
         from hermes_cli.auth import resolve_codex_runtime_credentials
 
-        access_token = resolve_codex_runtime_credentials(refresh_if_expiring=True).get("api_key")
+        credentials = resolve_codex_runtime_credentials(refresh_if_expiring=True)
     except Exception:
-        access_token = None
-    return get_codex_model_ids(access_token=access_token)
+        credentials = {}
+    return get_codex_model_ids(
+        access_token=credentials.get("api_key"),
+        base_url=codex_discovery_base_url(credentials.get("base_url")),
+    )
 
 
 def _copilot_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]:
@@ -1424,6 +1426,10 @@ def _credential_fingerprint(provider: str) -> str:
         except Exception:
             pass
 
+    if provider == "openai-codex":
+        from hermes_cli.codex_models import codex_discovery_base_url
+        parts.append(f"effective_base={codex_discovery_base_url()}")
+
     if provider == "ollama":
         provider_cfg = _get_provider_config_dict("ollama")
         key_env = provider_cfg.get("key_env") or provider_cfg.get("api_key_env") or ""
@@ -1516,8 +1522,15 @@ def _normalized_cache_slug(provider: Optional[str]) -> str:
 
 
 def _model_requires_account_discovery(provider: Optional[str], model: str) -> bool:
-    """Astra names cannot confer API/OAuth entitlement through picker state."""
-    return _normalized_cache_slug(provider) in {"openai", "openai-api", "openai-codex"} and is_astra_model(model)
+    """Official Astra names cannot confer entitlement; the configured local Codex proxy owns its catalog."""
+    normalized = _normalized_cache_slug(provider)
+    if normalized == "openai-codex":
+        from agent.codex_headers import is_local_codex_base_url
+        from hermes_cli.codex_models import codex_discovery_base_url
+
+        if is_local_codex_base_url(codex_discovery_base_url()):
+            return False
+    return normalized in {"openai", "openai-api", "openai-codex"} and is_astra_model(model)
 
 
 def cached_provider_model_ids(

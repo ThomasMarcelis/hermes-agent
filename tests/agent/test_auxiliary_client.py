@@ -3473,6 +3473,29 @@ class TestCodexAdapterPromptCacheKey:
         ])
         assert "prompt_cache_retention" not in captured
 
+    @pytest.mark.parametrize("effort", ["max", "ultra"])
+    @pytest.mark.parametrize("base_url", [
+        "https://chatgpt.com/backend-api/codex",
+        "http://127.0.0.1:2455/backend-api/codex",
+    ])
+    def test_astra_codex_preserves_stronger_reasoning(self, effort, base_url):
+        adapter, captured = self._build_adapter(base_url=base_url, model="gpt-6-astra")
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": effort}},
+        )
+        assert captured["model"] == "gpt-6-astra"
+        assert captured["reasoning"] == {"effort": effort, "summary": "auto"}
+        assert captured["stream"] is True
+
+    def test_astra_official_api_keeps_verified_effort_ceiling(self):
+        adapter, captured = self._build_adapter(base_url="https://api.openai.com/v1", model="gpt-6-astra")
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "ultra"}},
+        )
+        assert captured["reasoning"]["effort"] == "max"
+
     def test_astra_auxiliary_request_uses_official_contract(self):
         adapter, captured = self._build_adapter(
             base_url="https://api.openai.com/v1",

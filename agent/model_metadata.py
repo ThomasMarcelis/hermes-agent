@@ -1724,6 +1724,14 @@ def _resolve_custom_endpoint_context_length(model: str, base_url: str, api_key: 
     if ctx is not None:
         _save_unless_skipped(model, base_url, ctx, provider)
         return ctx
+    # Local codex-lb has Codex limits even when its catalog is temporarily unavailable.
+    # Preserve the live probes above and the public API catalog below.
+    from agent.codex_headers import is_local_codex_base_url
+    from agent.reasoning_effort import is_astra_model
+    if is_local_codex_base_url(base_url) and is_astra_model(model):
+        ctx, _source = _resolve_codex_oauth_context_length_with_source(model)
+        if ctx is not None:
+            return ctx
     # 3. Probe-down fallback after endpoint-specific detection failed
     logger.info(
         "Could not detect context length for model %r at %s — defaulting to %s tokens (probe-down). "

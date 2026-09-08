@@ -39,14 +39,13 @@ class TestLadderContract:
         for level in VALID_REASONING_EFFORTS:
             assert level in EFFORT_LADDER, level
 
-    def test_no_declared_wire_set_contains_ultra(self):
-        """ultra is internal vocabulary; every wire set must exclude it so it
-        always clamps down."""
+    def test_declared_wire_sets_use_canonical_ladder_levels(self):
+        """All declared wire levels must participate in canonical effort clamping."""
         import agent.reasoning_effort as mod
 
         for name in dir(mod):
             if name.endswith("_EFFORTS"):
-                assert "ultra" not in getattr(mod, name), name
+                assert set(getattr(mod, name)) <= set(EFFORT_LADDER), name
 
 
 class TestClampEffort:

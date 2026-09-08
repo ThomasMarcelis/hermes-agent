@@ -526,6 +526,16 @@ _UNKNOWN_MODEL_BASE: Dict[str, Any] = {"limit": {"context": 200000, "output": 81
 # their capabilities available for an explicitly selected/discovered model
 # without adding them to any picker catalog.
 _BUILTIN_MODEL_METADATA: Dict[Tuple[str, str], Dict[str, Any]] = {
+    # codex-lb /v1/models, September 2026: the Codex window differs from the public API.
+    # This catalog did not supply pricing/output limits, so leave those fields unspecified.
+    ("openai-codex", "gpt-6-astra"): {
+        "name": "GPT-6 Astra",
+        "limit": {"context": 272_000},
+        "modalities": {"input": ["text", "image"], "output": ["text"]},
+        "tool_call": True,
+        "reasoning": True,
+        "attachment": True,
+    },
     ("openai", "gpt-6-astra"): {
         "limit": {"context": 1_050_000, "output": 128_000},
         "modalities": {"input": ["text", "image"], "output": ["text"]},
@@ -659,8 +669,11 @@ def _merge_catalog_entry_with_override(raw: Dict[str, Any], override: Dict[str, 
 def _apply_overrides(provider: str, model: str, entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """*entry* patched by its override; ``_UNKNOWN_MODEL_BASE`` patched by a fill-gap override on a
     catalog miss (selected AFTER lookup: _default only fills misses); None when neither exists."""
-    provider_key = PROVIDER_TO_MODELS_DEV.get((provider or "").strip(), (provider or "").strip())
-    builtin = _BUILTIN_MODEL_METADATA.get((provider_key, (model or "").strip().lower()))
+    provider_key = (provider or "").strip().lower()
+    model_key = (model or "").strip().lower().rsplit("/", 1)[-1]
+    builtin = _BUILTIN_MODEL_METADATA.get((provider_key, model_key))
+    if builtin is None:
+        builtin = _BUILTIN_MODEL_METADATA.get((PROVIDER_TO_MODELS_DEV.get(provider_key, provider_key), model_key))
     base = entry if entry is not None else builtin
     override = _override_for(provider, model, catalog_hit=base is not None)
     return base if override is None else _merge_catalog_entry_with_override(base if base is not None else _UNKNOWN_MODEL_BASE, override)

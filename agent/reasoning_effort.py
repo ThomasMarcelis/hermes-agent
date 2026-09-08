@@ -20,20 +20,22 @@ from typing import Optional, Sequence
 _KIMI_K3_SLUG_RE = re.compile(r"(?:^|[^a-z0-9])k3(?:[^a-z0-9]|$)")
 
 # Canonical low→high ordering for nearest-level clamping. Includes "none" so an explicit
-# disable can be clamped when a provider publishes it as a level. ``ultra`` is Hermes-internal
-# (the Codex product tier): no wire accepts it, every declared set stops at ``max``.
+# disable can be clamped when a provider publishes it as a level. Astra on Codex accepts
+# ``ultra``; the direct OpenAI API and older model wires retain their own ceilings.
 EFFORT_LADDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 #: Widest OpenAI-compatible wire vocabulary (OpenRouter, Nous Portal).
 OPENAI_COMPAT_WIRE_EFFORTS: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 #: OpenAI/Codex Responses per model generation (live-verified): ``minimal`` is rejected by
-#: both (clamps to low); ``max`` is gpt-5.6-only.
+#: both older generations (clamps to low); GPT-5.6 additionally accepts ``max``.
 CODEX_GPT56_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
 CODEX_LEGACY_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh")
 # GPT-6 Astra is account-gated and its Responses API accepts no disable/minimal
 # wire level; callers normalize those requests to ``low`` at the transport boundary.
-CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+# Codex catalog verified through codex-lb; keep the official API vocabulary separate.
+OPENAI_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+CODEX_ASTRA_EFFORTS: tuple[str, ...] = (*OPENAI_ASTRA_EFFORTS, "ultra")
 ASTRA_MODEL_IDS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6-astra-900k"})
 
 #: xAI Responses — Grok 4.6+ accepts xhigh; older Grok tops out at high.

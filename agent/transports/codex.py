@@ -11,10 +11,10 @@ import re
 from typing import Any, Callable, Optional
 
 from agent.reasoning_effort import (
-    ACTUAL_RELAY_EFFORTS, CODEX_ASTRA_EFFORTS, CODEX_LEGACY_EFFORTS,
+    ACTUAL_RELAY_EFFORTS, OPENAI_ASTRA_EFFORTS, CODEX_LEGACY_EFFORTS,
     XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS, clamp_effort, is_astra_model,
     # Same declared vocabulary + shared clamp as the main Codex transport (agent.reasoning_effort):
-    # per-model — "max" is gpt-5.6-only, "minimal"/"ultra" always rejected (live-verified, #68365).
+    # per-model and per-route: Codex Astra accepts ultra; the official API stops at max.
     codex_supported_efforts,
 )
 from agent.transports.base import ProviderTransport
@@ -276,11 +276,14 @@ def _is_official_openai_responses_route(model: Any, base_url: Any) -> bool:
 
 
 def _codex_efforts_for_route(model: Any, base_url: Any, *, is_codex_backend: bool = False) -> tuple[str, ...]:
-    """Keep Astra's new vocabulary off unrelated Responses-compatible endpoints."""
-    if is_astra_model(model) and not (
-        is_codex_backend or _is_official_openai_responses_route(model, base_url)
-    ):
-        return CODEX_LEGACY_EFFORTS
+    """Keep each Astra endpoint's vocabulary off unrelated Responses-compatible endpoints."""
+    if is_astra_model(model):
+        from agent.codex_headers import is_local_codex_base_url
+
+        if _is_official_openai_responses_route(model, base_url):
+            return OPENAI_ASTRA_EFFORTS
+        if not (is_codex_backend or is_local_codex_base_url(str(base_url or ""))):
+            return CODEX_LEGACY_EFFORTS
     return codex_supported_efforts(str(model or ""))
 
 
@@ -295,7 +298,7 @@ def _sanitize_astra_request_kwargs(kwargs: dict[str, Any], model: Any, base_url:
     reasoning = kwargs.get("reasoning")
     if isinstance(reasoning, dict):
         requested = str(reasoning.get("effort") or "").strip().lower()
-        reasoning["effort"] = clamp_effort(requested, CODEX_ASTRA_EFFORTS) if requested else "low"
+        reasoning["effort"] = clamp_effort(requested, OPENAI_ASTRA_EFFORTS) if requested else "low"
     for key in ("temperature", "top_p", "top_logprobs", "logprobs", "prompt_cache_retention"):
         kwargs.pop(key, None)
     include = kwargs.get("include")

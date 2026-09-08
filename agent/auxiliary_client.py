@@ -1380,7 +1380,7 @@ class _CodexCompletionsAdapter:
             # ``enabled: False`` leaves reasoning/include unset (Codex still thinks by default).
             if isinstance(reasoning_cfg, dict) and reasoning_cfg.get("enabled") is not False:
                 # Truthy-only: Codex 400s on e.g. {"effort": null}, so falsy → default. Shared
-                # per-model clamp with the main transport ("max" is gpt-5.6-only; "minimal"/"ultra" rejected).
+                # per-model/route clamp with the main transport, including Codex Astra ultra.
                 from agent.codex_responses_adapter import classify_responses_route
                 from agent.reasoning_effort import clamp_effort
                 from agent.transports.codex import _codex_efforts_for_route

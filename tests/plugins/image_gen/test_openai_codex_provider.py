@@ -141,7 +141,7 @@ class TestGenerate:
         result = provider.generate("a cat", aspect_ratio="portrait")
         assert result["success"] is True
 
-        assert captured["model"] == "gpt-5.6-sol"
+        assert captured["model"] == "gpt-6-astra"
         assert captured["store"] is False
         assert captured["reasoning"] == {"effort": "xhigh", "summary": "auto"}
         assert captured["include"] == ["reasoning.encrypted_content"]
