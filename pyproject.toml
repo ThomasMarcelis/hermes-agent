@@ -445,8 +445,10 @@ override-dependencies = [
   # and its three advisories (see the cryptography pin in
   # [project].dependencies). The package uses cryptography only to sign
   # requests with RSA and AES, and that API did not break in 49 or 50.
+  # Match the exact project pin: uv overrides replace direct requirements too,
+  # so a wider range can make editable installs incompatible with our metadata.
   # Remove this line when alibabacloud-tea-openapi lifts the cap.
-  "cryptography>=50,<51",
+  "cryptography==50.0.0",
 ]
 exclude-newer = "14 days"
 # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,

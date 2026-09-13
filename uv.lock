@@ -113,7 +113,7 @@ youtube-transcript-api = false
 
 [manifest]
 overrides = [
-    { name = "cryptography", specifier = ">=50,<51" },
+    { name = "cryptography", specifier = "==50.0.0" },
     { name = "pynacl", specifier = ">=1.6,<1.7" },
 ]
 

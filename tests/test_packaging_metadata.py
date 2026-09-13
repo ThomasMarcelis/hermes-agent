@@ -3,9 +3,37 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_cryptography_override_matches_declared_requirement_and_lock():
+    """Overrides bypass transitive caps without widening Hermes's own pin."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    declared = next(
+        req for spec in data["project"]["dependencies"]
+        if (req := Requirement(spec)).name == "cryptography"
+    )
+    override = next(
+        req for spec in data["tool"]["uv"]["override-dependencies"]
+        if (req := Requirement(spec)).name == "cryptography"
+    )
+    assert override.specifier == declared.specifier, (
+        "uv overrides replace even direct requirements; a wider override can "
+        "install a version incompatible with editable distribution metadata"
+    )
+    locked_override = next(
+        entry for entry in lock["manifest"]["overrides"]
+        if entry["name"] == "cryptography"
+    )
+    assert SpecifierSet(locked_override["specifier"]) == declared.specifier
+    locked_versions = _locked_versions("cryptography")
+    assert locked_versions
+    assert all(version in declared.specifier for version in locked_versions)
 
 
 def _distribution_name(requirement: str) -> str:
