@@ -472,6 +472,21 @@ def _rewind_active_session_history(
             agent._last_flushed_db_idx = len(installed) if session_key else 0
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = installed[:] if session_key else None
+        # Every rewind entry point (session.undo, command.dispatch /undo and
+        # /retry, rollback) must invalidate the same agent-owned state.
+        memory_manager = getattr(agent, "_memory_manager", None)
+        with contextlib.suppress(Exception):
+            if memory_manager is not None and session_key:
+                memory_manager.queue_session_switch(
+                    session_key,
+                    parent_session_id="",
+                    reset=False,
+                    rewound=True,
+                    rewound_turns=len(user_indices) - user_ordinal,
+                )
+        with contextlib.suppress(Exception):
+            if hasattr(agent, "_invalidate_system_prompt"):
+                agent._invalidate_system_prompt()
     return installed, live_view, rewound_count
 
 

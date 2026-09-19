@@ -537,6 +537,7 @@ IMAGE_CACHE_DIR = get_hermes_dir("cache/images", "image_cache")
 # notes/short clips while still bounding a hostile upload.
 # --------------------------------------------------------------------------- See #13145.
 DEFAULT_INBOUND_MEDIA_MAX_BYTES = 128 * 1024 * 1024
+DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 DEFAULT_INBOUND_IMAGE_MAX_PIXELS = 40_000_000
 DEFAULT_INBOUND_IMAGE_MAX_TOTAL_PIXELS = 100_000_000
 DEFAULT_INBOUND_IMAGE_MAX_FRAMES = 256
@@ -643,7 +644,7 @@ async def download_media_bytes_from_url(
     url: str,
     *,
     media_type: str = "media",
-    timeout: float = 30.0,
+    timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
     headers: Optional[dict] = None,
     proxy_url: Optional[str] = None,
     max_bytes: Optional[int] = None,
@@ -810,42 +811,65 @@ async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg") -> str:
     return await asyncio.to_thread(cache_image_from_bytes, data, ext)
 
 
-async def _cache_media_from_url(url: str, ext: str, retries: int, *, media_type: str, accept: str,
-                                cache_fn, log_label: str, max_bytes: Optional[int] = None) -> str:
+async def _cache_media_from_url(
+    url: str, ext: str, retries: int, *, media_type: str, accept: str,
+    cache_fn, log_label: str, max_bytes: Optional[int] = None,
+    timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+) -> str:
     """Shared downloader behind ``cache_*_from_url``: SSRF-checked (pre-flight + per-redirect;
-    raises ValueError), size-capped, linear-backoff retries on timeouts / 429 / 5xx."""
-    from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+    raises ValueError), size-capped, linear-backoff retries on timeouts / 429 / 5xx.
+    One total deadline covers validation, every attempt, backoff, body read, and cache write.
+    """
+    from tools.url_safety import async_is_safe_url, create_ssrf_safe_async_client
     import httpx
-    if not is_safe_url(url):
-        raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
     headers = {"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)", "Accept": accept}
-    async with create_ssrf_safe_async_client(
-        timeout=30.0, follow_redirects=True, event_hooks={"response": [_ssrf_redirect_guard]},
-    ) as client:
-        for attempt in range(retries + 1):
-            try:
-                async with client.stream("GET", url, headers=headers) as response:
-                    response.raise_for_status()
-                    content = await _read_httpx_body_with_limit(response, media_type=media_type, max_bytes=max_bytes)
-                return await asyncio.to_thread(cache_fn, content, ext)
-            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+    deadline = time.monotonic() + timeout
+    async with asyncio.timeout(timeout):
+        if not await async_is_safe_url(url):
+            raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
+        async with create_ssrf_safe_async_client(
+            timeout=timeout, follow_redirects=True, event_hooks={"response": [_ssrf_redirect_guard]},
+        ) as client:
+            for attempt in range(retries + 1):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"{media_type} download deadline expired")
+                # Bound the *whole* request/stream attempt, not just each HTTP
+                # socket operation.  Dividing the remaining budget leaves a
+                # conservative opportunity for later attempts; the outer
+                # deadline still owns validation, backoff, and the cache write.
+                attempts_left = retries - attempt + 1
+                attempt_timeout = remaining / attempts_left
+                try:
+                    async with asyncio.timeout(attempt_timeout):
+                        async with client.stream(
+                            "GET", url, headers=headers, timeout=attempt_timeout,
+                        ) as response:
+                            response.raise_for_status()
+                            content = await _read_httpx_body_with_limit(
+                                response, media_type=media_type, max_bytes=max_bytes,
+                            )
+                    return await asyncio.to_thread(cache_fn, content, ext)
+                except (TimeoutError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                        raise
+                    if attempt < retries:
+                        wait = 1.5 * (attempt + 1)
+                        logger.debug("%s cache retry %d/%d for %s (%.1fs): %s", log_label, attempt + 1,
+                                     retries, safe_url_for_log(url), wait, exc)
+                        await asyncio.sleep(wait)
+                        continue
                     raise
-                if attempt < retries:
-                    wait = 1.5 * (attempt + 1)
-                    logger.debug("%s cache retry %d/%d for %s (%.1fs): %s", log_label, attempt + 1,
-                                 retries, safe_url_for_log(url), wait, exc)
-                    await asyncio.sleep(wait)
-                    continue
-                raise
 
 
 async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2,
-                               *, max_bytes: Optional[int] = None) -> str:
+                               *, max_bytes: Optional[int] = None,
+                               timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS) -> str:
     """Download an image URL into the image cache; return the absolute path."""
     return await _cache_media_from_url(
         url, ext, retries, media_type="image", accept="image/*,*/*;q=0.8",
-        cache_fn=cache_image_from_bytes, log_label="Media", max_bytes=max_bytes)
+        cache_fn=cache_image_from_bytes, log_label="Media", max_bytes=max_bytes,
+        timeout=timeout)
 
 
 def _cleanup_cache_dir(cache_dir: Path, max_age_hours: int) -> int:
@@ -880,11 +904,13 @@ async def cache_audio_from_bytes_async(data: bytes, ext: str = ".ogg") -> str:
 
 
 async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2,
-                               *, max_bytes: Optional[int] = None) -> str:
+                               *, max_bytes: Optional[int] = None,
+                               timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS) -> str:
     """Download an audio URL into the audio cache; return the absolute path."""
     return await _cache_media_from_url(
         url, ext, retries, media_type="audio", accept="audio/*,*/*;q=0.8",
-        cache_fn=cache_audio_from_bytes, log_label="Audio", max_bytes=max_bytes)
+        cache_fn=cache_audio_from_bytes, log_label="Audio", max_bytes=max_bytes,
+        timeout=timeout)
 
 
 # Video cache utilities (same pattern; referenced by local path).

@@ -61,6 +61,27 @@ def test_retry_last_truncates_history_before_requeueing_message():
     ]
 
 
+def test_retry_last_notifies_memory_provider_of_rewind():
+    cli = _make_cli()
+    cli._session_db = None
+    cli.session_id = "cli-retry-memory"
+    cli.agent = SimpleNamespace(_memory_manager=MagicMock())
+    cli.conversation_history = [
+        {"role": "user", "content": "retry me"},
+        {"role": "assistant", "content": "failed answer"},
+    ]
+
+    assert cli.retry_last() == "retry me"
+
+    cli.agent._memory_manager.queue_session_switch.assert_called_once_with(
+        "cli-retry-memory",
+        parent_session_id="",
+        reset=False,
+        rewound=True,
+        rewound_turns=1,
+    )
+
+
 def test_process_command_retry_requeues_original_message_not_retry_command():
     cli = _make_cli()
     cli._session_db = None

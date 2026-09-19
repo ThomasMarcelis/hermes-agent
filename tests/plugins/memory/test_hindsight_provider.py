@@ -1758,6 +1758,138 @@ class TestSessionSwitchBufferFlush:
         assert removed_state.invalidated is True
         p._client.aretain_batch.assert_not_called()
 
+    def test_consecutive_rewind_replaces_queued_repair_behind_blocked_writer(
+        self, provider_with_config, monkeypatch
+    ):
+        """A second rewind inherits cleanup owned by a not-yet-started repair."""
+        import threading
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        p = provider_with_config(retain_async=False)
+        client = MagicMock()
+        client.aretain_batch.return_value = SimpleNamespace(
+            operation_id=None, operation_ids=None,
+        )
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+        for ordinal in range(1, 4):
+            p.sync_turn(f"user {ordinal}", f"assistant {ordinal}")
+            p._retain_queue.join()
+
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+
+        def _block_writer():
+            blocker_started.set()
+            assert release_blocker.wait(timeout=2.0)
+
+        p._retain_queue.put(_block_writer)
+        assert blocker_started.wait(timeout=2.0)
+
+        p.on_session_switch("test-session", rewound=True, rewound_turns=1)
+        first_repair = p._active_delivery_state
+        assert first_repair.rewind_repair is True
+        p.on_session_switch("test-session", rewound=True, rewound_turns=1)
+        successor_repair = p._active_delivery_state
+
+        assert first_repair.invalidated is True
+        assert successor_repair is not first_repair
+        assert successor_repair.rewind_repair is True
+        release_blocker.set()
+        p._retain_queue.join()
+
+        # Three original appends plus only the successor replacement.  The
+        # invalidated first repair never writes the now-stale two-turn prefix.
+        assert client.aretain_batch.call_count == 4
+        repair_call = client.aretain_batch.call_args_list[-1]
+        repair_item = repair_call.kwargs["items"][0]
+        repair_text = json.dumps(json.loads(repair_item["content"]))
+        assert repair_item["update_mode"] == "replace"
+        assert "user 1" in repair_text
+        assert "user 2" not in repair_text
+        assert "user 3" not in repair_text
+
+    @pytest.mark.parametrize("append_capable", [True, False], ids=["append", "replacement"])
+    def test_completed_retain_rewind_rewrites_surviving_transcript(
+        self, provider_with_config, monkeypatch, append_capable
+    ):
+        """A completed remote document loses discarded turns in both write modes."""
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: append_capable,
+        )
+        p = provider_with_config(retain_async=False)
+        client = MagicMock()
+        client.aretain_batch.return_value = SimpleNamespace(
+            operation_id=None, operation_ids=None,
+        )
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+        for ordinal in range(1, 4):
+            p.sync_turn(f"user {ordinal}", f"assistant {ordinal}")
+            p._retain_queue.join()
+
+        retained_document = p._active_delivery_state.document_id
+        if append_capable:
+            assert p._active_delivery_state.turn_base == 3
+            assert len(p._active_delivery_state.confirmed_turns) == 3
+            assert p._active_delivery_state.committed == 0
+            assert p._session_turns == []
+        else:
+            assert p._active_delivery_state.committed == 3
+            assert len(p._session_turns) == 3
+
+        p.on_session_switch(
+            "test-session", rewound=True, rewound_turns=1,
+        )
+        p._retain_queue.join()
+
+        assert client.aretain_batch.call_count == 4
+        repair_call = client.aretain_batch.call_args_list[3]
+        repair_item = repair_call.kwargs["items"][0]
+        repair_content = json.loads(repair_item["content"])
+        repair_text = json.dumps(repair_content)
+        assert len(repair_content) == 2
+        assert repair_call.kwargs["document_id"] == retained_document
+        assert "user 1" in repair_text and "user 2" in repair_text
+        assert "user 3" not in repair_text
+        if append_capable:
+            assert repair_item["update_mode"] == "replace"
+            assert p._active_delivery_state.update_mode == "append"
+        else:
+            assert "update_mode" not in repair_item
+            assert p._active_delivery_state.update_mode is None
+
+        # Future delivery continues from the repaired prefix rather than
+        # resurrecting the discarded turn or replacing the prefix itself.
+        p.sync_turn("user 4", "assistant 4")
+        p._retain_queue.join()
+        next_item = client.aretain_batch.call_args_list[4].kwargs["items"][0]
+        next_content = json.loads(next_item["content"])
+        next_text = json.dumps(next_content)
+        assert "user 3" not in next_text and "user 4" in next_text
+        if append_capable:
+            assert len(next_content) == 1
+            assert "user 1" not in next_text
+            assert next_item["update_mode"] == "append"
+        else:
+            assert len(next_content) == 3
+            assert "user 1" in next_text and "user 2" in next_text
+            assert "update_mode" not in next_item
+
+        # Rewinding the entire retained transcript deletes the document;
+        # rewriting an empty JSON array would leave extracted remote units.
+        p.on_session_switch(
+            "test-session", rewound=True, rewound_turns=3,
+        )
+        p._retain_queue.join()
+        client.documents.delete_document.assert_called_once_with(
+            "test-bank", retained_document,
+        )
+
     def test_sync_turn_rejects_mismatched_session_ownership(self, provider):
         provider.sync_turn(
             "wrong user",

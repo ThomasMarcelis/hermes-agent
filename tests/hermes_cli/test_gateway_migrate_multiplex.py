@@ -483,13 +483,16 @@ def test_update_hook_folds_a_unit_less_default_when_every_secondary_shares_one_m
 
 
 def test_auto_multiplex_migration_false_opts_out_of_the_update_hook_but_not_the_explicit_command(fleet, capsys):
-    """``gateway.auto_multiplex_migration: false`` is a durable opt-out: an otherwise-eligible fleet is
+    """The target-schema gateway.auto_multiplex_migration false opts out of automatic migration.
     left alone by ``hermes update`` (no output, no ops, no flag flip), while the operator typing
-    ``migrate --multiplex`` still migrates. Only the nested key counts."""
+    ``migrate --multiplex`` still migrates through the real config setting path."""
     assert gm.build_migration_plan().eligible_for_migration()  # would migrate but for the flag
-    (fleet.root / "config.yaml").write_text(
-        "model:\n  default: x\nauto_multiplex_migration: false\ngateway:\n  auto_multiplex_migration: false\n",
-        encoding="utf-8")
+    from hermes_cli.config import _validate_config_key, load_config, set_config_value
+
+    assert _validate_config_key("gateway.auto_multiplex_migration") == (True, None)
+    set_config_value("gateway.auto_multiplex_migration", "false")
+    assert load_config()["gateway"]["auto_multiplex_migration"] is False
+    capsys.readouterr()
 
     gm.maybe_auto_migrate_after_update()
     assert capsys.readouterr().out == ""
@@ -510,12 +513,27 @@ def test_auto_multiplex_migration_false_opts_out_of_the_update_hook_but_not_the_
     assert auto_migration_opted_out(fleet.root) is False
 
     # The opt-out governs the AUTOMATIC path only: an explicit --multiplex is an explicit request.
-    (fleet.root / "config.yaml").write_text(
-        "model:\n  default: x\ngateway:\n  auto_multiplex_migration: false\n", encoding="utf-8")
     with pytest.raises(SystemExit) as exc:
         gm.cmd_migrate(SimpleNamespace(multiplex=True, dry_run=False, yes=True))
     assert exc.value.code == 0
     assert _config_flag(fleet.root) is True and not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
+def test_stale_auto_migrate_does_not_override_target_opt_out(fleet):
+    from hermes_cli.gateway_migrate_guards import auto_migration_opted_out
+
+    (fleet.root / "config.yaml").write_text(
+        "model:\n  default: x\ngateway:\n  auto_migrate: false\n",
+        encoding="utf-8",
+    )
+    assert auto_migration_opted_out(fleet.root) is False
+
+    # The target-schema key owns the decision even beside a stale opposite value.
+    (fleet.root / "config.yaml").write_text(
+        "model:\n  default: x\ngateway:\n  auto_migrate: true\n  auto_multiplex_migration: false\n",
+        encoding="utf-8",
+    )
+    assert auto_migration_opted_out(fleet.root) is True
 
 
 def test_explicit_migrate_with_no_standalone_secondaries_still_flips_flag_and_restarts_default(fleet, capsys, monkeypatch):

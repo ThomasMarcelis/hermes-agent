@@ -86,6 +86,15 @@ def _make_stream_client(*, responses=None, side_effect=None):
     return mock_client
 
 
+@pytest.fixture(autouse=True)
+def _inline_thread_offloads(monkeypatch):
+    """Keep these transport unit tests independent of executor shutdown."""
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+
 # ---------------------------------------------------------------------------
 # cache_image_from_bytes (base.py)
 # ---------------------------------------------------------------------------
@@ -112,7 +121,11 @@ class TestCacheImageFromBytes:
 # cache_image_from_url (base.py)
 # ---------------------------------------------------------------------------
 
-@patch("tools.url_safety.is_safe_url", return_value=True)
+@patch(
+    "tools.url_safety.async_is_safe_url",
+    new_callable=AsyncMock,
+    return_value=True,
+)
 class TestCacheImageFromUrl:
     """Tests for gateway.platforms.base.cache_image_from_url"""
 
@@ -125,7 +138,10 @@ class TestCacheImageFromUrl:
         )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch(
+                "tools.url_safety.create_ssrf_safe_async_client",
+                return_value=mock_client,
+            ):
                 from gateway.platforms.base import cache_image_from_url
                 return await cache_image_from_url(
                     "http://example.com/img.jpg", ext=".jpg"
@@ -145,7 +161,10 @@ class TestCacheImageFromUrl:
         mock_sleep = AsyncMock()
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
+            with patch(
+                "tools.url_safety.create_ssrf_safe_async_client",
+                return_value=mock_client,
+            ), \
                  patch("asyncio.sleep", mock_sleep):
                 from gateway.platforms.base import cache_image_from_url
                 return await cache_image_from_url(
@@ -156,6 +175,73 @@ class TestCacheImageFromUrl:
         assert path.endswith(".jpg")
         assert mock_client.stream.call_count == 2
         mock_sleep.assert_called_once()
+
+    def test_slow_attempt_timeout_leaves_budget_for_second_attempt(
+        self, _mock_safe, tmp_path, monkeypatch
+    ):
+        """A whole-attempt timeout is a slice, not the complete operation budget."""
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        never_release = asyncio.Event()
+        response = _make_stream_response()
+        attempt_timeouts = []
+        calls = 0
+
+        class StreamContext:
+            def __init__(self, first):
+                self.first = first
+
+            async def __aenter__(self):
+                if self.first:
+                    first_started.set()
+                    await never_release.wait()
+                second_started.set()
+                return response
+
+            async def __aexit__(self, *_args):
+                return False
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        def stream(_method, _url, **kwargs):
+            nonlocal calls
+            calls += 1
+            attempt_timeouts.append(kwargs["timeout"])
+            return StreamContext(first=calls == 1)
+
+        client.stream = MagicMock(side_effect=stream)
+
+        async def no_backoff(_delay):
+            return None
+
+        async def run():
+            with patch(
+                "tools.url_safety.create_ssrf_safe_async_client",
+                return_value=client,
+            ), patch(
+                "gateway.platforms.base.asyncio.sleep", side_effect=no_backoff,
+            ):
+                from gateway.platforms.base import cache_image_from_url
+
+                task = asyncio.create_task(cache_image_from_url(
+                    "http://example.com/img.jpg", ext=".jpg", retries=1, timeout=3.0,
+                ))
+                try:
+                    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+                    await asyncio.wait_for(second_started.wait(), timeout=2.0)
+                    return await asyncio.wait_for(task, timeout=2.0)
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
+        path = asyncio.run(run())
+        assert path.endswith(".jpg")
+        assert calls == 2
+        assert 0 < attempt_timeouts[0] < 3.0
 
 
 class TestCacheImageFromUrlConnectGuard:
@@ -215,10 +301,35 @@ class TestCacheImageFromUrlConnectGuard:
 # cache_audio_from_url (base.py)
 # ---------------------------------------------------------------------------
 
-@patch("tools.url_safety.is_safe_url", return_value=True)
+@patch(
+    "tools.url_safety.async_is_safe_url",
+    new_callable=AsyncMock,
+    return_value=True,
+)
 class TestCacheAudioFromUrl:
     """Tests for gateway.platforms.base.cache_audio_from_url"""
 
+    def test_success_on_first_attempt(self, _mock_safe, tmp_path, monkeypatch):
+        """A clean 200 response caches the audio and returns a path."""
+        monkeypatch.setattr("gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio")
+
+        mock_client = _make_stream_client(
+            responses=[_make_stream_response(b"\x00\x01 fake audio")]
+        )
+
+        async def run():
+            with patch(
+                "tools.url_safety.create_ssrf_safe_async_client",
+                return_value=mock_client,
+            ):
+                from gateway.platforms.base import cache_audio_from_url
+                return await cache_audio_from_url(
+                    "http://example.com/voice.ogg", ext=".ogg"
+                )
+
+        path = asyncio.run(run())
+        assert path.endswith(".ogg")
+        mock_client.stream.assert_called_once()
 
     def test_retries_on_timeout_then_succeeds(self, _mock_safe, tmp_path, monkeypatch):
         """A timeout on the first attempt is retried; second attempt succeeds."""
@@ -230,7 +341,10 @@ class TestCacheAudioFromUrl:
         mock_sleep = AsyncMock()
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
+            with patch(
+                "tools.url_safety.create_ssrf_safe_async_client",
+                return_value=mock_client,
+            ), \
                  patch("asyncio.sleep", mock_sleep):
                 from gateway.platforms.base import cache_audio_from_url
                 return await cache_audio_from_url(
@@ -299,8 +413,15 @@ class TestSSRFRedirectGuard:
             return url == "https://public.example.com/image.png"
 
         async def run():
-            with patch("tools.url_safety.is_safe_url", side_effect=fake_safe), \
-                 patch("httpx.AsyncClient", side_effect=factory):
+            with patch(
+                "tools.url_safety.async_is_safe_url",
+                new_callable=AsyncMock,
+                side_effect=fake_safe,
+            ), \
+                 patch(
+                     "tools.url_safety.create_ssrf_safe_async_client",
+                     side_effect=factory,
+                 ):
                 from gateway.platforms.base import cache_image_from_url
                 await cache_image_from_url(
                     "https://public.example.com/image.png", ext=".png"
@@ -557,4 +678,3 @@ class TestMattermostSendUrlAsFile:
         adapter.send.assert_called_once()
         text_arg = adapter.send.call_args[0][1]
         assert "http://cdn.example.com/img.png" in text_arg
-

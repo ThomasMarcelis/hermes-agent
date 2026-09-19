@@ -264,7 +264,7 @@ from gateway.platforms.helpers import cancel_task
 from utils import atomic_json_write, env_float
 from gateway.platforms.base_exec_approval import EA_HEADER_TEXT, EA_REASON_LABEL_TEXT
 from gateway.platforms.base import (
-    download_media_bytes_from_url, get_inbound_media_max_bytes,
+    DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS, download_media_bytes_from_url, get_inbound_media_max_bytes,
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
@@ -280,6 +280,14 @@ from gateway.platforms._shared import (
 
 # Every refusal (slash command, approval button, picker, prompt) says the same thing.
 _UNAUTHORIZED = unauthorized_action_notice(Platform.DISCORD)
+
+
+def _remaining_attachment_timeout(deadline: float) -> float:
+    """Return the positive remainder of one attachment operation deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Discord attachment download deadline expired")
+    return remaining
 
 
 async def _read_url_image_with_redirect_guard(
@@ -5821,6 +5829,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         *,
         media_type: str = "media",
         max_bytes: Optional[int] = None,
+        timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
     ) -> Optional[bytes]:
         """Read an attachment via discord.py's authenticated bot session.
 
@@ -5852,8 +5861,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         reader = getattr(att, "read", None)
         if reader is None or not callable(reader):
             return None
+        read_deadline = time.monotonic() + timeout
         try:
-            raw_bytes = await reader()
+            async with asyncio.timeout(timeout):
+                raw_bytes = await reader()
+        except TimeoutError as e:
+            # discord.py/aiohttp can raise TimeoutError itself before our
+            # operation budget is spent.  That is an authenticated-read
+            # failure and may use the URL fallback; only an exhausted budget
+            # aborts the complete attachment operation.
+            if time.monotonic() >= read_deadline:
+                raise
+            logger.warning(
+                "[Discord] Authenticated attachment read failed for %s: %s",
+                getattr(att, "filename", None) or getattr(att, "url", "<unknown>"),
+                e,
+            )
+            return None
         except Exception as e:
             logger.warning(
                 "[Discord] Authenticated attachment read failed for %s: %s",
@@ -5879,7 +5903,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         ]
         return min(limits) if limits else 0
 
-    async def _cache_discord_image(self, att, ext: str) -> str:
+    async def _cache_discord_image(
+        self, att, ext: str, *, timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+    ) -> str:
         """Cache a Discord image attachment to local disk.
 
         Primary path: ``att.read()`` + ``cache_image_from_bytes``
@@ -5887,21 +5913,29 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
         Fallback: ``cache_image_from_url`` (plain httpx, SSRF-gated).
         """
-        limit = self._discord_attachment_limit()
-        raw_bytes = await self._read_attachment_bytes(
-            att, media_type="image", max_bytes=limit
-        )
-        if raw_bytes is not None:
-            try:
-                return await cache_image_from_bytes_async(raw_bytes, ext=ext)
-            except Exception as e:
-                logger.debug(
-                    "[Discord] cache_image_from_bytes rejected att.read() data; falling back to URL: %s",
-                    e,
-                )
-        return await cache_image_from_url(att.url, ext=ext, max_bytes=limit)
+        deadline = time.monotonic() + timeout
+        async with asyncio.timeout(timeout):
+            limit = self._discord_attachment_limit()
+            raw_bytes = await self._read_attachment_bytes(
+                att, media_type="image", max_bytes=limit,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
+            if raw_bytes is not None:
+                try:
+                    return await cache_image_from_bytes_async(raw_bytes, ext=ext)
+                except Exception as e:
+                    logger.debug(
+                        "[Discord] cache_image_from_bytes rejected att.read() data; falling back to URL: %s",
+                        e,
+                    )
+            return await cache_image_from_url(
+                att.url, ext=ext, max_bytes=limit,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
 
-    async def _cache_discord_audio(self, att, ext: str) -> str:
+    async def _cache_discord_audio(
+        self, att, ext: str, *, timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+    ) -> str:
         """Cache a Discord audio attachment to local disk.
 
         Primary path: ``att.read()`` + ``cache_audio_from_bytes``
@@ -5909,21 +5943,29 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
         Fallback: ``cache_audio_from_url`` (plain httpx, SSRF-gated).
         """
-        limit = self._discord_attachment_limit()
-        raw_bytes = await self._read_attachment_bytes(
-            att, media_type="audio", max_bytes=limit
-        )
-        if raw_bytes is not None:
-            try:
-                return await cache_audio_from_bytes_async(raw_bytes, ext=ext)
-            except Exception as e:
-                logger.debug(
-                    "[Discord] cache_audio_from_bytes failed; falling back to URL: %s",
-                    e,
-                )
-        return await cache_audio_from_url(att.url, ext=ext, max_bytes=limit)
+        deadline = time.monotonic() + timeout
+        async with asyncio.timeout(timeout):
+            limit = self._discord_attachment_limit()
+            raw_bytes = await self._read_attachment_bytes(
+                att, media_type="audio", max_bytes=limit,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
+            if raw_bytes is not None:
+                try:
+                    return await cache_audio_from_bytes_async(raw_bytes, ext=ext)
+                except Exception as e:
+                    logger.debug(
+                        "[Discord] cache_audio_from_bytes failed; falling back to URL: %s",
+                        e,
+                    )
+            return await cache_audio_from_url(
+                att.url, ext=ext, max_bytes=limit,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
 
-    async def _cache_discord_document(self, att, ext: str) -> bytes:
+    async def _cache_discord_document(
+        self, att, ext: str, *, timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+    ) -> bytes:
         """Download a Discord document attachment and return the raw bytes.
 
         Primary path: ``att.read()`` (authenticated, no SSRF gate).
@@ -5932,27 +5974,30 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         initial URL and every redirect target before streaming under the
         configured inbound-media byte ceiling.
         """
-        local_max = self._discord_attachment_limit()
-        raw_bytes = await self._read_attachment_bytes(
-            att, media_type="document", max_bytes=local_max
-        )
-        if raw_bytes is not None:
-            return raw_bytes
+        deadline = time.monotonic() + timeout
+        async with asyncio.timeout(timeout):
+            local_max = self._discord_attachment_limit()
+            raw_bytes = await self._read_attachment_bytes(
+                att, media_type="document", max_bytes=local_max,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
+            if raw_bytes is not None:
+                return raw_bytes
 
-        from gateway.platforms.base import resolve_proxy_url
+            from gateway.platforms.base import resolve_proxy_url
 
-        proxy_url = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
-        return await download_media_bytes_from_url(
-            att.url,
-            media_type="document",
-            timeout=30.0,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                "Accept": "*/*",
-            },
-            proxy_url=proxy_url,
-            max_bytes=local_max or None,
-        )
+            proxy_url = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+            return await download_media_bytes_from_url(
+                att.url,
+                media_type="document",
+                timeout=_remaining_attachment_timeout(deadline),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                    "Accept": "*/*",
+                },
+                proxy_url=proxy_url,
+                max_bytes=local_max or None,
+            )
 
     async def _cache_simple_media(self, att: Any, content_type: str, kind: str, exts: set, default_ext: str) -> Optional[str]:
         """Cache attachments; images that fail validation never reach model input as remote URLs."""

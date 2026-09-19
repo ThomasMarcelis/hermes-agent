@@ -161,10 +161,10 @@ def auto_migration_blockers(plan: MigrationPlan) -> list[str]:
 
 
 def auto_migration_opted_out(default_home: Path) -> bool:
-    """``gateway.auto_multiplex_migration: false`` in the DEFAULT profile's EFFECTIVE config: the same
-    ``load_config`` the rest of the CLI reads (``DEFAULT_CONFIG`` + config.yaml + the managed overlay), so
-    an administrator's managed ``false`` wins over a user's ``true`` and a YAML string ``"false"`` is
-    false, not truthy. Only the nested key counts, there is no top-level alias."""
+    """Respect the default profile's effective gateway.auto_multiplex_migration setting.
+
+    The managed overlay wins over user config; auto_migrate is not a target-schema key.
+    """
     from hermes_cli.config import load_config_readonly
     from hermes_cli.gateway_migrate import _home_env
     from utils import is_truthy_value

@@ -3485,21 +3485,19 @@ def _should_skip_same_provider_retry(task: Optional[str], exc: Exception) -> boo
 
 
 def _evict_cached_clients(provider: str) -> None:
-    """Drop this profile's cached auxiliary clients for a provider so fresh creds are used.
-
-    Scoped to the calling profile (``hermes_home_key()`` is the first key slot): a rotation in
-    one profile must not drop another profile's client for the same provider in a multiplexing
-    gateway, since that profile's credentials did not change. Entries are popped, not closed:
-    a concurrent caller may be mid-request on the shared client (closing it raises ReadError /
-    "client has been closed" for them); the dropped client is retired by GC like the FIFO
-    overflow path in ``_get_cached_client``.
-    """
+    """Retire this profile's provider clients without closing in-flight transports."""
     normalized = _normalize_aux_provider(provider)
-    home = hermes_home_key()
+    active_home = hermes_home_key()
     with _client_cache_lock:
-        for key in [key for key in _client_cache
-                    if key[0] == home and _normalize_aux_provider(str(key[1])) == normalized]:
-            _client_cache.pop(key, None)
+        for key in list(_client_cache):
+            if isinstance(key, _ClientCacheKey):
+                key_provider, key_home = key.provider, key.hermes_home
+            else:
+                # Test/plugin-injected legacy tuples may be provider-first.
+                key_provider = str(key[1]) if len(key) >= 11 else str(key[0])
+                key_home = str(key[0]) if len(key) >= 11 else active_home
+            if key_home == active_home and _normalize_aux_provider(key_provider) == normalized:
+                _client_cache.pop(key, None)
 
 
 def _evict_cached_client_instance(target: Any) -> bool:
@@ -5755,7 +5753,7 @@ def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> di
 # ── Centralized LLM Call API: call_llm()/async_call_llm() own resolve → cached client → shape
 # request → call → return. Every auxiliary LLM consumer should use these.
 
-# Client cache: (provider, async_mode, base_url, api_key, api_mode, runtime_key) -> (client, default_model, loop)
+# Client cache: _ClientCacheKey -> (client, default_model, owner_loop)
 # Loop identity is NOT part of the key: stale-loop entries are replaced in place on async hits,
 # bounding growth to one entry per provider config (avoids fd accumulation in gateways).
 # This bounds cache growth to one entry per unique provider config rather than one per (config ×
@@ -5763,6 +5761,27 @@ def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> di
 _client_cache: Dict[tuple, tuple] = {}
 _client_cache_lock = threading.Lock()
 _CLIENT_CACHE_MAX_SIZE = 64  # safety belt — evict oldest when exceeded
+
+
+class _ClientCacheKey(NamedTuple):
+    """Owned shape of an auxiliary client cache key.
+
+    Named fields keep credential-revision pruning coupled to the key builder
+    instead of relying on positional indexes that silently drift as the key
+    gains new discriminators.
+    """
+
+    hermes_home: str
+    provider: str
+    async_mode: bool
+    base_url: str
+    api_key: Any
+    api_mode: str
+    runtime: tuple
+    is_vision: bool
+    task: Any
+    pool_hint: str
+    model: str
 
 
 class _CallableCacheDiscriminator:
@@ -5798,7 +5817,7 @@ def _client_cache_key(
     main_runtime: Optional[Dict[str, Any]] = None, is_vision: bool = False,
     task: Optional[str] = None, model: Optional[str] = None,
     selected_pool: Optional[auxiliary_pool.SelectedPoolContext] = None,
-) -> tuple:
+) -> _ClientCacheKey:
     runtime = _normalize_main_runtime(main_runtime)
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
     runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
@@ -5810,7 +5829,19 @@ def _client_cache_key(
     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
     # Profile home leads the key: callers that omit api_key (pool / Nous auth.json paths) would
     # otherwise share one client across multiplex profiles holding different credentials.
-    return (hermes_home_key(), provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
+    return _ClientCacheKey(
+        hermes_home=hermes_home_key(),
+        provider=provider,
+        async_mode=async_mode,
+        base_url=base_url or "",
+        api_key=api_key_key,
+        api_mode=api_mode or "",
+        runtime=runtime_key,
+        is_vision=is_vision,
+        task=task_key,
+        pool_hint=pool_hint,
+        model=model_key,
+    )
 
 
 def _current_event_loop() -> Any:
@@ -5822,27 +5853,37 @@ def _current_event_loop() -> Any:
         return None
 
 
-def _prune_superseded_pool_cache_entries_unlocked(cache_key: tuple) -> None:
-    """Forget older token revisions without closing in-flight clients."""
-    if len(cache_key) <= 8:
-        return
-    pool_hint = cache_key[8]
+def _prune_superseded_pool_cache_entries_unlocked(
+    cache_key: _ClientCacheKey,
+) -> None:
+    """Forget older revisions for one profile-local pool identity."""
+    pool_hint = cache_key.pool_hint
     if not isinstance(pool_hint, str) or pool_hint.count(":") < 2:
         return
     identity = pool_hint.rsplit(":", 1)[0]
     for old_key in list(_client_cache):
-        if old_key == cache_key or len(old_key) <= 8:
+        if old_key == cache_key or not isinstance(old_key, _ClientCacheKey):
             continue
-        old_hint = old_key[8]
+        old_hint = old_key.pool_hint
         if (
-            isinstance(old_hint, str)
+            old_key.hermes_home == cache_key.hermes_home
+            and isinstance(old_hint, str)
             and old_hint.count(":") >= 2
             and old_hint.rsplit(":", 1)[0] == identity
             and old_hint != pool_hint
         ):
-            del _client_cache[old_key]
+            # Do not close here: a request may still own this client.  Dropping
+            # only the cache reference is the ownership-safe retirement path.
+            _client_cache.pop(old_key)
 
-def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
+
+def _store_cached_client(
+    cache_key: _ClientCacheKey,
+    client: Any,
+    default_model: Optional[str],
+    *,
+    bound_loop: Any = None,
+) -> None:
     if isinstance(client, _AuxProbeClientStub):
         return  # probe stubs must never be cached — the next hit would get a dud client
     with _client_cache_lock:
@@ -6049,6 +6090,8 @@ def _get_cached_client(
                 )
                 if loop_ok:
                     return cached_client, _compat_model(cached_client, model, cached_default)
+                # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
+                # foreign loop stays force-neutered.
                 _close_cached_client(
                     cached_client,
                     close_async=cached_loop is not None and cached_loop.is_closed(),
@@ -6068,16 +6111,22 @@ def _get_cached_client(
         return client, model or default_model
     if client is not None:
         auxiliary_pool.bind_selected_pool_context(client, selected_pool)
+        unused_client = None
         with _client_cache_lock:
             _prune_superseded_pool_cache_entries_unlocked(cache_key)
             if cache_key not in _client_cache:
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
-                    del _client_cache[next(iter(_client_cache))]
+                    # Cache ownership is not request ownership; an evicted
+                    # client may still be serving the caller that acquired it.
+                    _client_cache.pop(next(iter(_client_cache)))
                 _client_cache[cache_key] = (client, default_model, current_loop)
             else:
-                built_client = client
+                unused_client = client
                 client, default_model, _ = _client_cache[cache_key]
-                _close_cached_client(built_client, close_async=async_mode)
+        # This race loser was never returned or published, so it has no
+        # possible in-flight request and can be closed eagerly.
+        if unused_client is not None:
+            _close_cached_client(unused_client, close_async=async_mode)
     return client, _compat_model(client, model, default_model)
 
 

@@ -9,7 +9,7 @@ passthrough.
 """
 
 import os
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -142,7 +142,9 @@ class TestInboundCacheUsesSniffer:
             "tools.url_safety.create_ssrf_safe_async_client",
             lambda **k: _FakeClient(),
         )
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: True)
+        monkeypatch.setattr(
+            "tools.url_safety.async_is_safe_url", AsyncMock(return_value=True)
+        )
 
         result = await base.cache_audio_from_url("https://example.com/voice.ogg", ext=".ogg")
         assert result.endswith(".mp3")

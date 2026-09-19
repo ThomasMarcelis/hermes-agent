@@ -1227,22 +1227,11 @@ class HindsightMemoryProvider(HindsightDurabilityMixin, MemoryProvider):
             return
         rewound = is_truthy_value(kwargs.get("rewound"), default=False)
         if rewound:
-            # The active suffix was removed from the transcript. Invalidate
-            # closures still blocked in the writer queue instead of uploading
-            # exactly the turns the user discarded.
-            with self._delivery_lock:
-                if self._active_delivery_state is not None:
-                    self._active_delivery_state.invalidated = True
-                    self._delivery_states = [
-                        state for state in self._delivery_states
-                        if state is not self._active_delivery_state
-                    ]
-                self._session_turns = []
-                self._turn_counter = 0
-                self._turn_index = 0
-                self._last_retained_turn_count = 0
-                self._queued_retained_turn_count = 0
-                self._active_delivery_state = None
+            try:
+                rewound_turns = int(kwargs.get("rewound_turns") or len(self._session_turns) or 1)
+            except (TypeError, ValueError):
+                rewound_turns = len(self._session_turns) or 1
+            self._rewind_active_delivery(rewound_turns)
         else:
             # Force-admit the complete old suffix before rebinding. The state
             # owns bank/session/document metadata immutably, so its queued
@@ -1267,7 +1256,10 @@ class HindsightMemoryProvider(HindsightDurabilityMixin, MemoryProvider):
             with self._prefetch_lock:
                 self._prefetch_result = ""
                 self._prefetch_count = 0
-            logger.debug("Hindsight on_session_switch: rewound session=%s", self._session_id)
+            logger.debug(
+                "Hindsight on_session_switch: rewound session=%s turns=%d",
+                self._session_id, rewound_turns,
+            )
             return
 
         # Always assign parent lineage so switching back to a root clears a
@@ -1326,7 +1318,7 @@ class HindsightMemoryProvider(HindsightDurabilityMixin, MemoryProvider):
                 unresolved_ops = len(self._pending_retain_ops)
             with self._delivery_lock:
                 retryable_states = sum(
-                    not state.invalidated and state.committed < len(state.turns)
+                    not state.invalidated and self._state_has_pending_delivery(state)
                     for state in self._delivery_states
                 )
             logger.warning(

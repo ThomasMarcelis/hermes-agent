@@ -756,6 +756,16 @@ class CLISessionMixin:
                 return None
 
         self._publish_truncated_history(truncated, invalidate_prompt=False)
+        # Keep memory providers aligned with the durable rewind before the same
+        # user text is queued again.  Without this, Hindsight retains the failed
+        # exchange and appends the retry as an additional turn.
+        _mm = getattr(self.agent, "_memory_manager", None)
+        if _mm is not None and self.session_id:
+            with contextlib.suppress(Exception):
+                _mm.queue_session_switch(
+                    self.session_id, parent_session_id="", reset=False,
+                    rewound=True, rewound_turns=1,
+                )
         print(f"(^_^)b Retrying: \"{last_message[:60]}{'...' if len(last_message) > 60 else ''}\"")
         return last_message
 
@@ -810,7 +820,10 @@ class CLISessionMixin:
         # See #21910, #6672.
         if _mm is not None and self.session_id:
             with contextlib.suppress(Exception):
-                _mm.queue_session_switch(self.session_id, parent_session_id="", reset=False, rewound=True)
+                _mm.queue_session_switch(
+                    self.session_id, parent_session_id="", reset=False,
+                    rewound=True, rewound_turns=turns_undone,
+                )
 
         turn_word = "turn" if turns_undone == 1 else "turns"
         print(

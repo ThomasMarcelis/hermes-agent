@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
@@ -32,6 +32,9 @@ class _DeliveryState:
     metadata: Dict[str, str]
     tags: tuple[str, ...]
     turn_base: int = 0
+    # Confirmed append turns are no longer in the retry buffer, but rewind
+    # still needs their content to replace the remote document accurately.
+    confirmed_turns: list = field(default_factory=list)
     committed: int = 0
     queued: int = 0
     in_flight: tuple[int, int] | None = None
@@ -41,6 +44,11 @@ class _DeliveryState:
     delivery_due: bool = False
     failed: bool = False
     invalidated: bool = False
+    dispatch_started: bool = False
+    rewind_repair: bool = False
+    delete_document: bool = False
+    repair_completed: bool = False
+    normal_update_mode: str | None = None
     automatic_retries: int = 0
     retry_scheduled: bool = False
 
@@ -371,6 +379,7 @@ class HindsightDurabilityMixin:
             state.in_flight = None
             state.job_queued = False
             state.remote_pending = False
+            state.dispatch_started = False
             state.failed = True
             self._sync_active_delivery_watermarks(state)
 
@@ -412,11 +421,18 @@ class HindsightDurabilityMixin:
             state.in_flight = None
             state.job_queued = False
             state.remote_pending = False
+            state.dispatch_started = False
             state.failed = False
             state.automatic_retries = 0
-            if state.update_mode == "append":
-                # Only confirmed remote writes leave the retry buffer. Keep the
-                # same list object: new turns and this ledger share its identity.
+            if state.rewind_repair:
+                state.repair_completed = True
+                state.rewind_repair = False
+                state.delete_document = False
+                state.update_mode = state.normal_update_mode
+            elif state.update_mode == "append":
+                # Trim only a confirmed remote append; retain the shared list for
+                # failed/pending retries and for the rewind-repair replacement.
+                state.confirmed_turns.extend(state.turns[:end])
                 del state.turns[:end]
                 state.turn_base += end
                 state.committed = state.queued = 0
@@ -435,6 +451,78 @@ class HindsightDurabilityMixin:
             self._queue_delivery(state, force=state.force_settle, retry=True)
 
 
+    @staticmethod
+    def _state_has_pending_delivery(state: _DeliveryState) -> bool:
+        return (
+            (state.rewind_repair and not state.repair_completed)
+            or state.committed < len(state.turns)
+        )
+
+
+    def _rewind_active_delivery(self, rewound_turns: int) -> None:
+        """Rebind local state and durably repair an already-written document."""
+        repair_state: _DeliveryState | None = None
+        with self._delivery_lock:
+            old_state = self._active_delivery_state
+            old_turns = (
+                list(old_state.confirmed_turns) if old_state is not None else []
+            ) + list(self._session_turns)
+            remove_count = min(max(1, int(rewound_turns)), len(old_turns))
+            surviving_turns = old_turns[:-remove_count] if remove_count else old_turns
+
+            had_remote_write = bool(
+                old_state is not None
+                and (
+                    old_state.committed > 0
+                    or old_state.turn_base > 0
+                    or old_state.remote_pending
+                    or old_state.dispatch_started
+                    # A queued repair owns unresolved cleanup even before its
+                    # writer closure starts.  A consecutive rewind replaces
+                    # that closure, so its successor must inherit the repair.
+                    or (old_state.rewind_repair and not old_state.repair_completed)
+                )
+            )
+            if old_state is not None:
+                old_state.invalidated = True
+                self._delivery_states = [
+                    state for state in self._delivery_states if state is not old_state
+                ]
+
+            self._session_turns = surviving_turns
+            self._turn_counter = len(surviving_turns)
+            self._turn_index = len(surviving_turns)
+            self._last_retained_turn_count = 0
+            self._queued_retained_turn_count = 0
+            self._active_delivery_state = None
+
+            if old_state is not None:
+                normal_mode = old_state.normal_update_mode or old_state.update_mode
+                repair_state = _DeliveryState(
+                    turns=self._session_turns,
+                    bank_id=old_state.bank_id,
+                    session_id=old_state.session_id,
+                    parent_session_id=old_state.parent_session_id,
+                    document_id=old_state.document_id,
+                    update_mode=("replace" if normal_mode == "append" and had_remote_write else normal_mode),
+                    retain_async=old_state.retain_async,
+                    context=old_state.context,
+                    metadata=dict(old_state.metadata),
+                    tags=old_state.tags,
+                    rewind_repair=had_remote_write,
+                    delete_document=had_remote_write and not surviving_turns,
+                    normal_update_mode=normal_mode,
+                )
+                self._active_delivery_state = repair_state
+                self._delivery_states.append(repair_state)
+
+        if repair_state is not None and repair_state.rewind_repair:
+            # The writer serializes this behind older local jobs.  The job also
+            # waits for accepted remote ops before rewriting, so no stale append
+            # can land after the repair.
+            self._queue_delivery(repair_state, force=True)
+
+
     def _queue_delivery(
         self,
         state: _DeliveryState,
@@ -442,7 +530,7 @@ class HindsightDurabilityMixin:
         force: bool,
         retry: bool = False,
     ) -> bool:
-        """Queue one immutable append range or legacy full-document write."""
+        """Queue one immutable append range, replacement, or rewind repair."""
         if self._shutting_down.is_set():
             return False
         with self._delivery_lock:
@@ -470,14 +558,15 @@ class HindsightDurabilityMixin:
             if state.in_flight is not None or state.job_queued or state.remote_pending:
                 return False
             end = len(state.turns)
-            if end <= state.committed:
+            if end <= state.committed and not self._state_has_pending_delivery(state):
                 state.delivery_due = False
                 state.force_settle = False
                 self._sync_active_delivery_watermarks(state)
                 return False
-            start = state.committed if state.update_mode == "append" else 0
-            turns = list(state.turns[start:end]) if state.update_mode == "append" else list(state.turns[:end])
-            if not turns:
+            delivery_update_mode = state.update_mode
+            start = state.committed if delivery_update_mode == "append" else 0
+            turns = list(state.turns[start:end]) if delivery_update_mode == "append" else list(state.turns[:end])
+            if not turns and not state.delete_document:
                 return False
             state.in_flight = (start, end)
             state.job_queued = True
@@ -504,7 +593,7 @@ class HindsightDurabilityMixin:
                     and end <= len(state.turns)
                     and (
                         list(state.turns[start:end]) == turns
-                        if state.update_mode == "append"
+                        if delivery_update_mode == "append"
                         else list(state.turns[:end]) == turns
                     )
                 )
@@ -514,6 +603,36 @@ class HindsightDurabilityMixin:
                         state.job_queued = False
                         state.queued = state.committed
                     return
+                state.dispatch_started = True
+
+            if state.rewind_repair:
+                wait_budget = max(0.0, float(self._prefetch_retain_drain_timeout))
+                deadline = time.monotonic() + wait_budget
+                if not self._wait_for_server_retain_ops(
+                    deadline, wait_budget, purpose="rewind repair",
+                ):
+                    self._mark_delivery_failed(state)
+                    if state.force_settle:
+                        self._schedule_delivery_retry(state)
+                    raise TimeoutError(
+                        "Hindsight rewind repair timed out waiting for prior remote writes"
+                    )
+
+            if state.delete_document:
+                try:
+                    self._run_hindsight_operation(
+                        lambda client: client.documents.delete_document(
+                            state.bank_id, state.document_id,
+                        ),
+                        timeout=self._prefetch_retain_drain_timeout,
+                    )
+                except Exception:
+                    self._mark_delivery_failed(state)
+                    if state.force_settle:
+                        self._schedule_delivery_retry(state)
+                    raise
+                self._complete_delivery(state, end)
+                return
 
             item = self._build_retain_kwargs(
                 content,
@@ -521,15 +640,15 @@ class HindsightDurabilityMixin:
                 metadata=metadata,
                 tags=list(state.tags) or None,
             )
-            if state.update_mode is not None:
-                item["update_mode"] = state.update_mode
+            if delivery_update_mode is not None:
+                item["update_mode"] = delivery_update_mode
             logger.debug(
                 "Hindsight retain: bank=%s session=%s doc=%s mode=%s "
                 "range=%d:%d async=%s",
                 state.bank_id,
                 state.session_id,
                 state.document_id,
-                state.update_mode,
+                delivery_update_mode,
                 start,
                 end,
                 state.retain_async,
@@ -584,7 +703,7 @@ class HindsightDurabilityMixin:
         with self._delivery_lock:
             states = list(self._delivery_states)
         for state in states:
-            if not state.invalidated and state.committed < len(state.turns):
+            if not state.invalidated and self._state_has_pending_delivery(state):
                 self._queue_delivery(state, force=True)
 
 
@@ -596,7 +715,7 @@ class HindsightDurabilityMixin:
             return False
         with self._delivery_lock:
             return not any(
-                not state.invalidated and state.committed < len(state.turns)
+                not state.invalidated and self._state_has_pending_delivery(state)
                 for state in self._delivery_states
             )
 
