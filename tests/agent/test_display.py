@@ -152,6 +152,13 @@ class TestBuildToolPreview:
 
 
 class TestPrepareToolPreview:
+    def test_zero_cap_keeps_complete_multiline_shell_and_code(self):
+        command = "python -m pytest tests/example.py && printf done\nprintf final-line"
+        for tool, key in (("terminal", "command"), ("execute_code", "code")):
+            preview = prepare_tool_preview(tool, {key: command}, fallback="", max_len=0)
+            assert preview.text == command
+            assert preview.truncated is False
+
     def test_zero_cap_preserves_full_paths_goals_and_memory_operations(self):
         path = "/home/example/workspace/project/deep/path/final-report.md"
         assert prepare_tool_preview("read_file", {"path": path}, fallback="", max_len=0).text == path

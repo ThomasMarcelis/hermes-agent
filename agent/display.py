@@ -445,7 +445,12 @@ def _preview_todo_list(args: dict, _max_len: int) -> str:
 def _preview_shell(key: str):
     def _build(args: dict, max_len: int) -> str | None:
         command = args.get(key)
-        return None if command is None else _tail_trunc(summarize_shell_command(str(command)), max_len) or None
+        if command is None:
+            return None
+        # A zero budget means no configured cap, including multiline shell or
+        # code payloads. A positive budget keeps the compact summary.
+        preview = str(command).rstrip() if max_len == 0 else summarize_shell_command(str(command))
+        return _tail_trunc(preview, max_len) or None
     return _build
 
 
