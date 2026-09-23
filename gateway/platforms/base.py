@@ -2306,16 +2306,18 @@ class BasePlatformAdapter(ABC):
         head = f"{get_tool_emoji(event.tool_name, default='⚙️')} {event.tool_name}"
         if mode == "verbose" and event.args:
             import json
-            args_str = json.dumps(event.args, ensure_ascii=False, default=str)
+            from agent.redact import redact_for_egress
+            args_str = redact_for_egress(json.dumps(event.args, ensure_ascii=False, default=str))
             if preview_max_len > 0 and len(args_str) > preview_max_len:
                 args_str = args_str[:preview_max_len - 3] + "..."
             return f"{head}({list(event.args.keys())})\n{args_str}"
         if not event.preview:
             return f"{head}..."
         if mode == "verbose":
-            return f'{head}: "{event.preview}"'
-        # "all" / "new": short capped preview (default 40; progress bubbles persist as messages).
-        cap = preview_max_len if preview_max_len > 0 else 40
+            from agent.redact import redact_for_egress
+            return f'{head}: "{redact_for_egress(event.preview)}"'
+        # Zero is the configured unlimited preview; the delivery path enforces message limits.
+        cap = preview_max_len
         prepared = prepare_tool_preview(
             event.tool_name, event.args, fallback=event.preview, max_len=cap)
         return f'{head}: "{self.format_tool_preview(prepared)}"'
@@ -2324,6 +2326,13 @@ class BasePlatformAdapter(ABC):
         """Platform-native formatting of a compact tool preview; rich-text adapters may use
         the preview's metadata (e.g. a URL shortened for display)."""
         return preview.text
+
+    def max_split_messages_for_chat(self, chat_id: str) -> int:
+        """Limit chunks from one logical progress line; 0 means no adapter ceiling."""
+        try:
+            return max(int(getattr(self, "MAX_SPLIT_MESSAGES", 0) or 0), 0)
+        except (TypeError, ValueError):
+            return 0
 
     has_fatal_error = property(lambda self: self._fatal_error_message is not None)
     fatal_error_message = property(lambda self: self._fatal_error_message)

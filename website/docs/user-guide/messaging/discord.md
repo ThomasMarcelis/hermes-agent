@@ -615,8 +615,14 @@ display:
 
 - `off` — no progress messages
 - `new` — only show the first tool call per turn
-- `all` — show all tool calls (truncated to 40 characters in gateway messages)
+- `all` — show all tool calls; on Discord the default preview length is `0` (no content cap),
+  so a terminal command retains all lines in a fenced block. Long progress rolls into
+  platform-sized messages; a pathological single preview has an explicit delivery-limit notice.
 - `verbose` — show full tool call details (can produce long messages)
+
+Set `display.platforms.discord.tool_preview_length` to a positive number to opt into
+compact previews; terminal commands then show a capped first line. Other platforms retain
+their own defaults. Secret-shaped values are redacted before previews are capped or delivered.
 
 #### `display.tool_progress_command`
 

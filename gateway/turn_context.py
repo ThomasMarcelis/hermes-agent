@@ -24,6 +24,7 @@ class TurnContext:
     _thinking_enabled: bool = False
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
+    tool_preview_max_len: int = 40
     tool_progress_enabled: bool = False
     progress_queue: Any = None
     log_queue: Any = None

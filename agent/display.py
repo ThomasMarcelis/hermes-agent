@@ -536,7 +536,10 @@ def _primary_arg_preview(tool_name: str, args: dict, max_len: int) -> str | None
 def prepare_tool_preview(tool_name: str, args: dict | None, *, fallback: str, max_len: int) -> ToolPreview:
     """Compact preview plus explicit truncation/URL facts (the uncapped preview is
     rebuilt from the arguments so an upstream display cap cannot drop its link target)."""
-    full_text = build_tool_preview(tool_name, args, max_len=0) or fallback
+    from agent.redact import redact_for_egress
+    # Redact the *uncapped* text first. Capping a credential midway through its
+    # value can defeat the pattern matcher and expose an unrecognisable prefix.
+    full_text = redact_for_egress(build_tool_preview(tool_name, args or {}, max_len=0) or fallback)
     text = truncate_tool_preview(tool_name, full_text, max_len)
     truncated = text != full_text
     url = _http_url(_display_url(full_text)) if truncated else None

@@ -27,6 +27,13 @@ class TestToolProgressProvenance:
 class TestResolveDisplaySetting:
     """resolve_display_setting() resolves with correct priority."""
 
+    def test_discord_zero_default_and_explicit_cap(self):
+        from gateway.display_config import resolve_display_setting
+        assert resolve_display_setting({}, "discord", "tool_preview_length") == 0
+        assert resolve_display_setting({}, "telegram", "tool_preview_length") == 40
+        assert resolve_display_setting({"display": {"platforms": {"discord": {"tool_preview_length": 75}}}},
+                                       "discord", "tool_preview_length") == 75
+
     def test_explicit_platform_override_wins(self):
         """display.platforms.<plat>.<key> takes top priority."""
         from gateway.display_config import resolve_display_setting

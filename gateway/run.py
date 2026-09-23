@@ -4532,6 +4532,7 @@ class GatewayRunner(
         resolve_display_setting: Any = None
         progress_mode: Any = None
         progress_grouping: Any = None
+        tool_preview_max_len: int = 40
         _display_surface_mode: Any = None
         tool_progress_enabled: Any = None
         _live_status_mode: Any = None

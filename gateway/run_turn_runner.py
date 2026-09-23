@@ -228,18 +228,15 @@ class TurnRunner:
         except Exception as err:
             logger.debug("tool-progress onboarding hint failed: %s", err)
 
-    @staticmethod
-    def _preview_cap() -> int:
-        """tool_preview_length (default 40): the one-line preview budget for "all"/"new" modes."""
-        from agent.display import get_tool_preview_max_len
-        pl = get_tool_preview_max_len()
-        return pl if pl > 0 else 40
+    def _preview_cap(self) -> int:
+        """Snapshot the platform's preview budget for this turn (0 = no content cap)."""
+        return self._ctx.tool_preview_max_len
 
     def _progress_terminal_blocks(self, adapter, tool_name, args, emoji):
         """(full, short) fenced blocks for a terminal command on markdown platforms, else (None, None).
 
-        No language tag: Slack mrkdwn renders it as a literal first code line. Verbose shows the FULL
-        command; "all"/"new" truncate to one line capped at ``tool_preview_length``. Consecutive
+        No language tag: Slack mrkdwn renders it as a literal first code line. Zero keeps the full
+        command in "all"/"new"; positive caps retain the compact first-line summary. Consecutive
         terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
         """
         if not (
@@ -247,9 +244,13 @@ class TurnRunner:
             and isinstance(args.get("command"), str) and args["command"].strip()
         ):
             return None, None
-        cmd_full = args["command"].rstrip()
+        from gateway.run import _redact_gateway_user_facing_secrets
+        cmd_full = _redact_gateway_user_facing_secrets(args["command"].rstrip())
         header = "" if self._ctx.last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
         cap = self._preview_cap()
+        if cap == 0:
+            block = f"{header}```\n{cmd_full}\n```"
+            return block, block
         lines = cmd_full.splitlines()
         cmd_short = lines[0] if lines else cmd_full
         if len(cmd_short) > cap:
@@ -273,8 +274,7 @@ class TurnRunner:
         ctx.last_was_terminal_block[0] = code is not None
         if verbose:
             if code is None and args:
-                from agent.display import get_tool_preview_max_len
-                pl = get_tool_preview_max_len()
+                pl = self._preview_cap()
                 args_str = json.dumps(args, ensure_ascii=False, default=str)
                 # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
                 # for full detail and platform message-length limits handle the rest.
@@ -283,7 +283,8 @@ class TurnRunner:
                 code = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
             elif code is None:
                 code = f"{emoji} {tool_name}: \"{preview}\"" if preview else f"{emoji} {tool_name}..."
-            ctx.progress_queue.put(code)
+            from gateway.run import _redact_gateway_user_facing_secrets
+            ctx.progress_queue.put(_redact_gateway_user_facing_secrets(code))
             return None
         if code is not None:
             return code
@@ -296,8 +297,11 @@ class TurnRunner:
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
         verb = get_tool_verb(tool_name)
         if not verb:
-            return f"{emoji} {tool_name}: \"{preview}\""
-        return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
+            message = f"{emoji} {tool_name}: \"{preview}\""
+        else:
+            message = f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
+        from gateway.run import _redact_gateway_user_facing_secrets
+        return _redact_gateway_user_facing_secrets(message)
 
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
@@ -581,11 +585,24 @@ class TurnRunner:
         groups: list[list] = []
         current: list = []
         for line in lines:
-            candidate = current + [line]
-            if current and st._progress_len_fn(self._progress_text(candidate)) > st._PROGRESS_TEXT_LIMIT:
-                groups.append(current)
-                candidate = [line]
-            current = candidate
+            pieces = BasePlatformAdapter.truncate_message(
+                str(line), st._PROGRESS_TEXT_LIMIT, len_fn=st._progress_len_fn)
+            # A single pathological preview must not flood a Discord chat. Keep an
+            # explicit omission marker rather than silently dropping the tail.
+            try:
+                max_pieces = int(st.adapter.max_split_messages_for_chat(str(self._ctx.source.chat_id)))
+            except (AttributeError, TypeError, ValueError):
+                max_pieces = 0
+            if max_pieces > 0 and len(pieces) > max_pieces:
+                omitted = sum(st._progress_len_fn(p) for p in pieces[max_pieces - 1:])
+                pieces = pieces[:max_pieces - 1] + [f"⚠️ Preview truncated at delivery limit ({omitted} characters omitted)."]
+            for piece in pieces:
+                candidate = current + [piece]
+                if current and st._progress_len_fn(self._progress_text(candidate)) > st._PROGRESS_TEXT_LIMIT:
+                    groups.append(current)
+                    current = [piece]
+                else:
+                    current = candidate
         return groups + ([current] if current else [])
 
     async def _send_progress_text(self, st, text: str):

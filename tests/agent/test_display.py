@@ -164,6 +164,13 @@ class TestPrepareToolPreview:
         assert preview.truncated is True
         assert preview.url is None
 
+    def test_redacts_before_positive_cap_splits_credential(self):
+        secret = "abcdefghijklmnopqrstuvwxyz0123456789"
+        text = "request Authorization: Bearer " + secret
+        preview = prepare_tool_preview("web_search", {"query": text}, fallback=text, max_len=45)
+        assert secret[:12] not in preview.text
+        assert preview.url is None
+
     def test_recovers_and_describes_truncated_url(self):
         url = "https://example.com/a/very/long/path/to/a/page"
         set_tool_preview_max_len(20)

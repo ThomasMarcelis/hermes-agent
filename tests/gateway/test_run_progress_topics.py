@@ -794,7 +794,7 @@ def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_p
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"tool_preview_length": 0}}),
+        yaml.dump({"display": {"tool_preview_length": 40}}),
         encoding="utf-8",
     )
 
@@ -830,6 +830,51 @@ def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_p
     visible = UrlPreviewAgent.URL[:37] + "..."
     label = visible.removeprefix("https://")
     assert f"[{label}](<{UrlPreviewAgent.URL}>)" in adapter.sent[0]["content"]
+
+
+def test_discord_zero_preview_keeps_full_multiline_command_and_redacts():
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    class MarkdownAdapter(DiscordProgressCaptureAdapter):
+        supports_code_blocks = True
+
+    command = "git show v2026.9.21:gateway/run_turn_runner.py | grep -n 'preview'\n" \
+              "python -m pytest tests/gateway/test_run_progress_topics.py -q\n" \
+              "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789' https://example.org"
+    adapter = MarkdownAdapter()
+    runner = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda _s: adapter),  # type: ignore[arg-type]
+                        TurnContext(source=SimpleNamespace(chat_id="123"), progress_mode="all",
+                                    tool_preview_max_len=0))
+    rendered = runner._progress_build_message("terminal", "short upstream preview", {"command": command})
+    assert rendered is not None
+    assert "git show v2026.9.21:gateway/run_turn_runner.py" in rendered
+    assert "python -m pytest tests/gateway/test_run_progress_topics.py -q" in rendered
+    assert "https://example.org" in rendered
+    assert "abcdefghijklmnopqrstuvwxyz0123456789" not in rendered
+    assert "Authorization: Bearer" in rendered
+    runner._ctx.tool_preview_max_len = 40
+    capped = runner._progress_build_message("terminal", "short upstream preview", {"command": command})
+    assert capped is not None
+    assert "python -m pytest" not in capped
+    assert "..." in capped
+
+
+def test_discord_overlong_progress_line_rolls_at_physical_limit():
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    class BoundedAdapter(SmallLimitProgressAdapter):
+        MAX_SPLIT_MESSAGES = 8
+
+    adapter = BoundedAdapter(platform=Platform.DISCORD)
+    runner = TurnRunner(None, TurnContext(source=SimpleNamespace(chat_id="123")))  # type: ignore[arg-type]
+    st = runner._progress_edit_state(adapter)
+    command_block = "💻 terminal\n```\n" + "a" * 2000 + "\n```"
+    groups = runner._split_progress_groups(st, [command_block])
+    assert len(groups) <= adapter.MAX_SPLIT_MESSAGES
+    assert all(len(runner._progress_text(g)) <= st._PROGRESS_TEXT_LIMIT for g in groups)
+    assert "characters omitted" in runner._progress_text(groups[-1])
 
 
 class CommentaryAgent:
@@ -1876,6 +1921,31 @@ class TerminalCommandAgent:
         # Let the async progress task drain the queue and send before returning.
         time.sleep(0.35)
         return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+@pytest.mark.asyncio
+async def test_discord_default_all_progress_keeps_full_multiline_command(monkeypatch, tmp_path):
+    """No display override: the actual turn path preserves the command's final line."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    setattr(fake_dotenv, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    setattr(fake_run_agent, "AIAgent", TerminalCommandAgent)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(platform=Platform.DISCORD, chat_id="12345", chat_type="dm", thread_id=None)
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id="sess-discord-full-command", session_key="agent:main:discord:dm:12345",
+    )
+    assert result["final_response"] == "done"
+    content = "\n".join(call["content"] for call in adapter.sent + adapter.edits)
+    assert TerminalCommandAgent.CMD in content
 
 
 @pytest.mark.asyncio

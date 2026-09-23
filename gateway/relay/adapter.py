@@ -247,6 +247,11 @@ class RelayAdapter(BasePlatformAdapter):
     def message_len_fn_for_chat(self, chat_id: str) -> Callable[[str], int]:
         return _LEN_FNS.get(self._descriptor_for_chat(chat_id).len_unit, len)
 
+    def max_split_messages_for_chat(self, chat_id: str) -> int:
+        # Mirror native Discord's per-logical-send anti-flood ceiling even when
+        # the relay's primary descriptor belongs to a different platform.
+        return 8 if self._descriptor_for_chat(chat_id).platform == Platform.DISCORD.value else 0
+
     def supports_draft_streaming(
         self,
         chat_type: Optional[str] = None,
