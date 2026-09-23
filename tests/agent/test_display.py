@@ -152,6 +152,23 @@ class TestBuildToolPreview:
 
 
 class TestPrepareToolPreview:
+    def test_zero_cap_preserves_full_paths_goals_and_memory_operations(self):
+        path = "/home/example/workspace/project/deep/path/final-report.md"
+        assert prepare_tool_preview("read_file", {"path": path}, fallback="", max_len=0).text == path
+        goals = [{"goal": "first goal " + "a" * 90}, {"goal": "second goal " + "b" * 90}]
+        delegate = prepare_tool_preview("delegate_task", {"tasks": goals}, fallback="", max_len=0)
+        assert all(goal["goal"] in delegate.text for goal in goals)
+        operations = [{"action": "add", "content": "complete memory entry " + "c" * 90},
+                      {"action": "remove", "old_text": "old entry " + "d" * 90}]
+        memory = prepare_tool_preview("memory", {"target": "user", "operations": operations}, fallback="", max_len=0)
+        assert operations[0]["content"] in memory.text and operations[1]["old_text"] in memory.text
+
+    def test_patch_preview_lists_all_touched_paths_without_payload(self):
+        patch = "*** Begin Patch\n*** Update File: first.py\n@@\n-old\n+new\n*** Update File: second.py\n@@\n-a\n+b\n*** End Patch"
+        preview = prepare_tool_preview("patch", {"mode": "patch", "patch": patch}, fallback="", max_len=0)
+        assert "first.py" in preview.text and "second.py" in preview.text
+        assert "new" not in preview.text
+
     def test_file_path_preserves_filename_tail(self):
         path = "/home/example/workspace/project/deep/path/final-report.md"
 

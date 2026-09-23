@@ -2950,15 +2950,13 @@ class GatewayTurnMixin:
             user_config, platform_key, "tool_preview_length", 40)))
         enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
         adapter = self._delivery_adapter_for(source)
-        # Tool preview length (0 = no limit) and friendly tool labels (default on), per-platform.
-        for _setter, _setting, _default, _cast in (
-            ("set_tool_preview_max_len", "tool_preview_length", 0, lambda v: int(v) if v else 0),
-            ("set_friendly_tool_labels", "friendly_tool_labels", True, bool),
-        ):
-            with suppress(Exception):
-                from agent import display as _agent_display
-                _val = resolve_display_setting(user_config, platform_key, _setting, _default)
-                getattr(_agent_display, _setter)(_cast(_val))
+        # The agent producer must not pre-cap previews in a process-global
+        # setting: concurrent profile turns can have different budgets. The
+        # final gateway renderer uses the turn-local value above exactly once.
+        from agent import display as _agent_display
+        _agent_display.set_tool_preview_max_len(0)
+        _agent_display.set_friendly_tool_labels(bool(resolve_display_setting(
+            user_config, platform_key, "friendly_tool_labels", True)))
 
         # Resolve the mode and its provenance together: null inherits, tier off is not intent.
         # A raw os.getenv here reads whichever profile's env loaded last under multiplexing

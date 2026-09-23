@@ -105,15 +105,14 @@ class TestCodexItemToArgs:
 
 
 class TestCodexItemToPreview:
-    def test_command_preview_truncated(self):
+    def test_command_preview_keeps_complete_command(self):
         long_cmd = "echo " + "x" * 500
         preview = _codex_item_to_preview({
             "type": "commandExecution", "command": long_cmd
         })
-        assert preview is not None
-        assert len(preview) <= 120
+        assert preview == long_cmd
 
-    def test_file_change_preview_lists_first_three_paths(self):
+    def test_file_change_preview_lists_all_paths(self):
         preview = _codex_item_to_preview({
             "type": "fileChange",
             "changes": [
@@ -121,8 +120,7 @@ class TestCodexItemToPreview:
                 for i in range(5)
             ],
         })
-        assert "/p0.py" in preview and "/p2.py" in preview
-        assert "+2 more" in preview
+        assert preview == ", ".join(f"/p{i}.py" for i in range(5))
 
 
 

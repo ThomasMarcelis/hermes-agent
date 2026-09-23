@@ -265,7 +265,8 @@ _CODEX_TOOL_ITEM_TYPES = frozenset({"commandExecution", "fileChange", "mcpToolCa
 _STATIC_TOOL_NAMES = {"commandExecution": "exec_command", "fileChange": "apply_patch", "webSearch": "web_search"}
 _STABLE_ID_PREFIXES = {"commandExecution": "exec", "fileChange": "apply_patch"}
 _MCP_LIKE_ITEM_TYPES = {"mcpToolCall", "dynamicToolCall"}
-# Item types whose preview is the first 120 chars of one string field.
+# Item types whose preview is one string field. The gateway applies its own
+# per-turn cap and physical message boundary after secret redaction.
 _PREVIEW_FIELDS = {"commandExecution": "command", "webSearch": "query"}
 
 
@@ -299,18 +300,18 @@ def _codex_item_to_args(item: dict) -> dict:
 
 
 def _codex_item_to_preview(item: dict) -> Any:
-    """Short preview for the tool.started bubble; None when nothing useful (UI tolerates None)."""
+    """Complete tool.started preview; None when nothing useful (UI tolerates None)."""
     item_type = item.get("type") or ""
     if item_type in _PREVIEW_FIELDS:
-        return (item.get(_PREVIEW_FIELDS[item_type]) or "")[:120] or None
+        return item.get(_PREVIEW_FIELDS[item_type]) or None
     if item_type == "fileChange":
-        paths = [c.get("path") for c in _item_changes(item) if c.get("path")]
-        return (", ".join(paths[:3]) + (f", +{len(paths) - 3} more" if len(paths) > 3 else "")) if paths else None
+        paths = [str(c["path"]) for c in _item_changes(item) if c.get("path")]
+        return ", ".join(paths) if paths else None
     if item_type in _MCP_LIKE_ITEM_TYPES:
         args = item.get("arguments") or {}
         if isinstance(args, dict) and args:
             with suppress(TypeError, ValueError):
-                return json.dumps(args, ensure_ascii=False)[:120]
+                return json.dumps(args, ensure_ascii=False)
     return None
 
 

@@ -372,12 +372,12 @@ def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | No
     return args
 
 
-def _delegate_task_goals(tasks: Any, *, per_goal_len: int) -> list[str]:
-    """One truncated goal string per dict task (``?`` when missing)."""
+def _delegate_task_goals(tasks: Any) -> list[str]:
+    """One complete goal string per dict task (``?`` when missing)."""
     if not isinstance(tasks, list):
         return []
     raw_goals = (task.get("goal") for task in tasks if isinstance(task, dict))
-    return [_tail_trunc(("?" if g is None else _oneline(str(g))) or "?", per_goal_len) for g in raw_goals]
+    return [("?" if g is None else _oneline(str(g))) or "?" for g in raw_goals]
 
 
 def _browser_exec_step_label(args: dict, max_chars: int = 80) -> str | None:
@@ -421,18 +421,19 @@ def _preview_delegate_task(args: dict, max_len: int) -> str | None:
     if action_preview is not None:
         return _tail_trunc(action_preview, max_len)
     if tasks and isinstance(tasks, list):
-        goals = _delegate_task_goals(tasks, per_goal_len=40)
+        goals = _delegate_task_goals(tasks)
         preview = f"{len(goals)} tasks: " + " | ".join(goals) if goals else f"{len(tasks)} parallel tasks"
         return _tail_trunc(preview, max_len)
     goal = args.get("goal", "")
     return None if goal is None else _tail_trunc(_oneline(str(goal)), max_len) or None
 
 
-def _preview_process_manage(args: dict, _max_len: int) -> str | None:
+def _preview_process_manage(args: dict, max_len: int) -> str | None:
     action, sid, data, timeout_val = (args.get(k) for k in ("action", "session_id", "data", "timeout"))
-    parts = [str(action) if action else "", str(sid)[:16] if sid else "",
-             f'"{_oneline(str(data)[:20])}"' if data else "", f"{timeout_val}s" if timeout_val and action == "wait" else ""]
-    return " ".join(p for p in parts if p) or None
+    parts = [str(action) if action else "", str(sid) if sid else "",
+             f'"{_oneline(str(data))}"' if data else "", f"{timeout_val}s" if timeout_val and action == "wait" else ""]
+    preview = " ".join(p for p in parts if p)
+    return _tail_trunc(preview, max_len) or None
 
 
 def _preview_todo_list(args: dict, _max_len: int) -> str:
@@ -453,34 +454,58 @@ def _preview_read_file(args: dict, max_len: int) -> str | None:
     if path is None:
         return None
     path_text = str(path)
-    label = Path(path_text.replace("\\", "/")).name or path_text
     line_label = _read_file_line_label(args)
-    short_preview = f"{label} {line_label}".strip()
-    full_preview = f"{path_text} {line_label}".strip()
-    if max_len > 0 and len(full_preview) > max_len:
-        return truncate_tool_preview("read_file", full_preview, max_len, key="path")
-    return short_preview or None
+    preview = f"{path_text} {line_label}".strip()
+    return truncate_tool_preview("read_file", preview, max_len, key="path") or None
 
 
-def _preview_memory(args: dict, _max_len: int) -> str:
-    action, target = args.get("action", ""), args.get("target", "")
-    if action == "add":
-        return f"+{target}: \"{_clip(_oneline(args.get('content', '')), 25)}\""
-    if action in ("replace", "remove"):
-        old = _oneline(args.get("old_text") or "") or "<missing old_text>"
-        return f"{'~' if action == 'replace' else '-'}{target}: \"{old[:20]}\""
-    return action
+def _preview_memory(args: dict, max_len: int) -> str:
+    target = str(args.get("target") or "")
+    def describe(op: dict) -> str:
+        action = str(op.get("action") or "")
+        old = _oneline(str(op.get("old_text") or "")) or "<missing old_text>"
+        content = _oneline(str(op.get("content") or op.get("new_text") or ""))
+        if action == "add":
+            return f'+{target}: "{content}"'
+        if action == "replace":
+            return f'~{target}: "{old}" → "{content}"'
+        if action == "remove":
+            return f'-{target}: "{old}"'
+        return action
+    operations = args.get("operations")
+    if isinstance(operations, list):
+        labels = [describe(op) for op in operations if isinstance(op, dict)]
+        preview = f"{len(labels)} ops: " + " | ".join(labels) if labels else "memory operations"
+    else:
+        preview = describe(args)
+    return _tail_trunc(preview, max_len)
 
 
-def _preview_send_message(args: dict, _max_len: int) -> str:
-    return f"to {args.get('target', '?')}: \"{_tail_trunc(_oneline(args.get('message', '')), 20)}\""
+def _preview_send_message(args: dict, max_len: int) -> str:
+    return _tail_trunc(f"to {args.get('target', '?')}: \"{_oneline(args.get('message', ''))}\"", max_len)
 
 
 def _preview_skill_view(args: dict, max_len: int) -> str | None:
     name = _oneline(str(args.get("name") or ""))
     file_path = args.get("file_path")
     label = (f"{name} → {_oneline(str(file_path))}" if name else _oneline(str(file_path))) if file_path else name
-    return _tail_trunc(label, max_len) or None
+    return truncate_tool_preview("skill_view", label, max_len, key="path" if file_path else None) or None
+
+def _preview_patch(args: dict, max_len: int) -> str | None:
+    if args.get("path"):
+        return truncate_tool_preview("patch", str(args["path"]), max_len, key="path")
+    if args.get("mode") != "patch" or not isinstance(args.get("patch"), str):
+        return None
+    try:
+        from tools.patch_parser import parse_v4a_patch
+        operations, error = parse_v4a_patch(args["patch"])
+    except Exception:
+        return None
+    if error or not operations:
+        return None
+    paths = [f"{op.file_path} → {op.new_path}" if op.new_path else op.file_path for op in operations]
+    noun = "file" if len(paths) == 1 else "files"
+    return truncate_tool_preview("patch", f"{len(paths)} {noun}: " + " | ".join(paths), max_len, key="path")
 
 
 def _preview_bridge_call(tool_name: str):
@@ -499,9 +524,10 @@ _PREVIEW_BUILDERS = {
     "browser_exec": _preview_browser_exec, "delegate_task": _preview_delegate_task,
     "process_manage": _preview_process_manage, "todo_list": _preview_todo_list,
     "terminal": _preview_shell("command"), "execute_code": _preview_shell("code"),
-    "read_file": _preview_read_file, "memory": _preview_memory, "send_message": _preview_send_message,
+    "read_file": _preview_read_file, "patch": _preview_patch,
+    "memory": _preview_memory, "send_message": _preview_send_message,
     "skill_view": _preview_skill_view,
-    "session_search": lambda args, _m: f"recall: \"{_clip(_oneline(args.get('query', '')), 25)}\"",
+    "session_search": lambda args, m: _tail_trunc(f"recall: \"{_oneline(args.get('query', ''))}\"", m),
     "tool_call": _preview_bridge_call("tool_call"),
     "tool_search": _preview_bridge_call("tool_search"),
     "tool_describe": _preview_bridge_call("tool_describe"),
@@ -539,10 +565,12 @@ def prepare_tool_preview(tool_name: str, args: dict | None, *, fallback: str, ma
     from agent.redact import redact_for_egress
     # Redact the *uncapped* text first. Capping a credential midway through its
     # value can defeat the pattern matcher and expose an unrecognisable prefix.
-    full_text = redact_for_egress(build_tool_preview(tool_name, args or {}, max_len=0) or fallback)
-    text = truncate_tool_preview(tool_name, full_text, max_len)
+    raw_text = build_tool_preview(tool_name, args or {}, max_len=0) or fallback
+    full_text = redact_for_egress(raw_text)
+    path_key = "path" if tool_name == "skill_view" and isinstance(args, dict) and args.get("file_path") else None
+    text = truncate_tool_preview(tool_name, full_text, max_len, key=path_key)
     truncated = text != full_text
-    url = _http_url(_display_url(full_text)) if truncated else None
+    url = _http_url(_display_url(full_text)) if truncated and full_text == raw_text else None
     return ToolPreview(text=text, truncated=truncated, url=url)
 
 
@@ -1150,7 +1178,7 @@ def _cute_delegate(a: dict, _r) -> str:
     if action_preview is not None:
         return f"┊ 🔀 delegate  {_cute_trunc(action_preview)}"
     if tasks and isinstance(tasks, list):
-        goals = _delegate_task_goals(tasks, per_goal_len=30)
+        goals = _delegate_task_goals(tasks)
         return f"┊ 🔀 delegate  {len(goals) or len(tasks)}x: {_cute_trunc(' | '.join(goals) if goals else 'parallel')}"
     return f"┊ 🔀 delegate  {_cute_trunc(a.get('goal', ''))}"
 
