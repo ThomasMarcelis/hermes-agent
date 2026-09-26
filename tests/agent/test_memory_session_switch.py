@@ -331,6 +331,3 @@ def test_hindsight_on_session_switch_clears_turn_buffers():
     assert provider._session_turns == []
     assert provider._turn_counter == 0
     assert provider._turn_index == 0
-
-
-

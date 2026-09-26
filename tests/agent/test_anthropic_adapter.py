@@ -943,6 +943,7 @@ class TestBuildAnthropicKwargs:
         legacy list stays on the manual path.
         """
         from agent.anthropic_adapter import (
+            _get_anthropic_max_output,
             _supports_adaptive_thinking,
             _supports_xhigh_effort,
             _forbids_sampling_params,

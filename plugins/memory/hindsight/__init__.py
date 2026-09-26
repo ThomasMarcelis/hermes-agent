@@ -56,14 +56,19 @@ _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 
 def _ensure_client_dependency() -> None:
-    """Lazily install the Hindsight client (``tools.lazy_deps``) before importing it."""
+    """The fork-owned plugin installs its SDK through the generic plugin policy."""
+    from importlib import import_module
+
     try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("memory.hindsight", prompt=False)
+        import_module("hindsight_client")
+        return
     except ImportError:
         pass
-    except Exception as exc:
-        raise ImportError(str(exc)) from exc
+    from tools.lazy_deps import install_specs
+
+    outcome = install_specs(["hindsight-client>=0.6.1,<1"], timeout=120)
+    if not outcome.ok:
+        raise ImportError(outcome.reason or outcome.stderr or "Hindsight client installation failed")
 
 
 def _scoped_setting(name: str, default: str = "") -> str:

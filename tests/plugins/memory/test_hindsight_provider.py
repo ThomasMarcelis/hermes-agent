@@ -148,33 +148,27 @@ def _provider_for_mode(tmp_path, monkeypatch, mode: str):
 
 def _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, mode: str):
     """Cloud/local-external clients must ensure lazy deps before importing."""
-    import builtins
 
     provider = _provider_for_mode(tmp_path, monkeypatch, mode)
     ensure_calls = []
-
-    def fake_ensure(feature, prompt=True):
-        ensure_calls.append((feature, prompt))
 
     class FakeHindsight:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-    real_import = builtins.__import__
+    def fake_install(specs, **kwargs):
+        ensure_calls.append((specs, kwargs))
+        sdk = ModuleType("hindsight_client")
+        sdk.Hindsight = FakeHindsight
+        monkeypatch.setitem(sys.modules, "hindsight_client", sdk)
+        return SimpleNamespace(ok=True)
 
-    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "hindsight_client":
-            if ensure_calls != [("memory.hindsight", False)]:
-                raise ModuleNotFoundError("No module named 'hindsight_client'")
-            return SimpleNamespace(Hindsight=FakeHindsight)
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr("tools.lazy_deps.ensure", fake_ensure)
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setitem(sys.modules, "hindsight_client", None)
+    monkeypatch.setattr("tools.lazy_deps.install_specs", fake_install)
 
     client = provider._get_client()
 
-    assert ensure_calls == [("memory.hindsight", False)]
+    assert ensure_calls == [(["hindsight-client>=0.6.1,<1"], {"timeout": 120})]
     assert isinstance(client, FakeHindsight)
     assert client.kwargs == {
         "base_url": "http://localhost:9999",
