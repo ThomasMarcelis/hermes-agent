@@ -11,7 +11,12 @@ import pytest
 
 
 def _configure_store(tmp_path, monkeypatch, provider):
-    hermes_home = tmp_path / "hermes"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    hermes_home = tmp_path / "hermes-root"
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root",
+        lambda: hermes_home,
+    )
     hermes_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     (hermes_home / "config.yaml").write_text(
@@ -45,7 +50,9 @@ for _ in range(6):
         subprocess.Popen(
             [sys.executable, "-c", code],
             cwd=Path(__file__).resolve().parents[2],
-            env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**os.environ, "HOME": str(tmp_path)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         for _ in range(2)
     ]

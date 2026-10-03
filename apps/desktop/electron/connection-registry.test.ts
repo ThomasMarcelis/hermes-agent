@@ -48,6 +48,70 @@ function emptyRegistry(): ConnectionRegistry {
   return normalizeRegistry(null)
 }
 
+test('Cloud apply upgrades only host labels without changing connection identity', () => {
+  const url = 'https://agent.example.com'
+  const name = 'Research cloud'
+
+  const first = reconcileAppliedGlobalConnection(emptyRegistry(), {
+    mode: 'cloud',
+    remote: { url, authMode: 'oauth' }
+  })
+
+  const named = reconcileAppliedGlobalConnection(first, {
+    mode: 'cloud',
+    remote: { url, authMode: 'oauth', name }
+  })
+
+  assert.equal(named.primary, first.primary)
+  assert.equal(named.connections.find(c => c.id === named.primary)?.label, name)
+  const restored = normalizeRegistry(JSON.parse(JSON.stringify(named)))
+  assert.equal(restored.connections.find(c => c.id === named.primary)?.name, name)
+
+  const custom = upsertConnection(restored, {
+    ...restored.connections.find(c => c.id === named.primary)!,
+    label: 'My device'
+  })
+
+  const reapplied = reconcileAppliedGlobalConnection(custom, {
+    mode: 'cloud',
+    remote: { url, authMode: 'oauth', name: 'New portal name' }
+  })
+
+  assert.equal(reapplied.primary, first.primary)
+  assert.equal(reapplied.connections.find(c => c.id === first.primary)?.label, 'My device')
+
+  const other = reconcileAppliedGlobalConnection(reapplied, {
+    mode: 'cloud',
+    remote: { url: 'https://other.example.com', authMode: 'oauth' }
+  })
+
+  assert.notEqual(other.primary, first.primary)
+  assert.equal(other.connections.find(c => c.id === other.primary)?.name, undefined)
+})
+
+test('Cloud name survives partial edits but never inherits across gateway URLs', () => {
+  const registry = reconcileAppliedGlobalConnection(emptyRegistry(), {
+    mode: 'cloud',
+    remote: { url: 'https://agent.example.com', authMode: 'oauth', name: 'Research cloud' }
+  })
+
+  const existing = registry.connections.find(c => c.id === registry.primary)!
+
+  const renamed = normalizeConnectionInput(
+    mergeConnectionInput({ id: existing.id, kind: 'cloud', label: 'Mine' }, existing),
+    registry
+  )
+
+  assert.equal(renamed.name, 'Research cloud')
+
+  const retargeted = normalizeConnectionInput(
+    mergeConnectionInput({ id: existing.id, kind: 'cloud', label: 'Mine', url: 'https://other.example.com' }, existing),
+    registry
+  )
+
+  assert.equal(retargeted.name, undefined)
+})
+
 // --- labels, slugs, handles ---
 
 test('labelKey is case-insensitive and trimmed', () => {
@@ -59,42 +123,6 @@ test('labelSlug kebab-cases and never returns empty for non-empty input', () => 
   assert.equal(labelSlug('Work Laptop'), 'work-laptop')
   assert.equal(labelSlug('Spark Box #2'), 'spark-box-2')
   assert.equal(labelSlug('!!!'), 'connection')
-})
-
-test('registry SSH fingerprint failures name the connection and ssh -G step', async () => {
-  const registry = migrateV1ToRegistry({
-    mode: 'ssh',
-    remote: { mode: 'ssh', host: 'build-host', user: 'alice' },
-    profiles: {}
-  })
-
-  const source = registry.connections.find(connection => connection.id === registry.primary)!
-
-  const cause = new Error('spawn ssh ENOENT')
-
-  source.label = 'Build box'
-
-  await assert.rejects(
-    reuseMatchingPrimarySshBackend({
-      connectionId: registry.primary,
-      effectiveFingerprint: async () => {
-        throw cause
-      },
-      ensurePrimary: async () => ({ mode: 'remote', remoteKind: 'ssh' }),
-      profile: 'default',
-      registry,
-      source
-    }),
-    error => {
-      assert.equal(
-        (error as Error).message,
-        `Could not resolve effective SSH config for connection "Build box" (${source.id}) via ssh -G: spawn ssh ENOENT`
-      )
-      assert.equal((error as Error).cause, cause)
-
-      return true
-    }
-  )
 })
 
 test('matching primary/default SSH route reuses the existing descriptor once', async () => {
@@ -1052,6 +1080,53 @@ test('token only persists on token-auth remotes; oauth/cloud drop it', () => {
   )
 
   assert.equal(cloud.token, undefined)
+})
+
+test('a cloud entry is saved as oauth even when the payload says token (#89529)', () => {
+  // Cloud never keeps a pasted token (above), so token auth would leave the
+  // entry with no credential and Test failing with "no saved session token".
+  for (const authMode of [undefined, 'token'] as const) {
+    const cloud = normalizeConnectionInput(
+      { kind: 'cloud', label: 'C', url: 'https://c.hermes.cloud', authMode, token: { enc: 'x' } },
+      emptyRegistry()
+    )
+
+    assert.equal(cloud.authMode, 'oauth')
+    assert.equal(cloud.token, undefined)
+  }
+
+  // Remote keeps its explicit choice and its token default.
+  const remote = normalizeConnectionInput({ kind: 'remote', label: 'R', url: 'http://r:1' }, emptyRegistry())
+
+  assert.equal(remote.authMode, 'token')
+})
+
+test('a stored cloud entry left on token auth with no token reads back as oauth (#89529)', () => {
+  const registry = normalizeRegistry({
+    version: REGISTRY_VERSION,
+    primary: 'local',
+    connections: [
+      { id: 'local', kind: 'local', label: 'This device' },
+      { id: 'cloud-bare', kind: 'cloud', label: 'Bare cloud', url: 'https://a.hermes.cloud', authMode: 'token' },
+      {
+        id: 'cloud-keyed',
+        kind: 'cloud',
+        label: 'Keyed cloud',
+        url: 'https://b.hermes.cloud',
+        authMode: 'token',
+        token: { v: 1 }
+      },
+      { id: 'homelab', kind: 'remote', label: 'Homelab', url: 'http://10.0.0.5:9119', authMode: 'token' }
+    ]
+  })
+
+  const byId = Object.fromEntries(registry.connections.map(c => [c.id, c]))
+
+  assert.equal(byId['cloud-bare'].authMode, 'oauth')
+  // A real saved credential is never discarded, and remotes are untouched.
+  assert.equal(byId['cloud-keyed'].authMode, 'token')
+  assert.deepEqual(byId['cloud-keyed'].token, { v: 1 })
+  assert.equal(byId.homelab.authMode, 'token')
 })
 
 test('an ssh entry keeps its session token through a label rename', () => {

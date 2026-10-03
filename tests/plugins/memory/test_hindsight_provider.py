@@ -5,6 +5,7 @@ prefetch (auto_recall, preamble, query truncation), sync_turn (auto_retain,
 turn counting, tags), and schema completeness.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -14,7 +15,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
@@ -62,6 +63,30 @@ def _clean_env(tmp_path, monkeypatch):
     # Patch the actual API and keep all legacy profile writes in tmp_path.
     isolated_home = tmp_path / "user-home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: isolated_home))
+
+    # These tests provide client doubles, so they must not attempt a network
+    # install merely because the optional SDK is absent from the test env.
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
+
+    # The retain-operation path imports this exception solely to classify a
+    # fake client's response. Supply the smallest matching SDK surface so the
+    # mocked tests remain runnable without the optional Hindsight extra.
+    # Only when the real SDK is absent: shadowing an installed SDK with a
+    # fake (no ``__path__``) breaks ``import hindsight_client`` and turns the
+    # pinned-client test into a permanent skip.
+    if importlib.util.find_spec("hindsight_client_api") is not None:
+        return
+    client_api = ModuleType("hindsight_client_api")
+    exceptions = ModuleType("hindsight_client_api.exceptions")
+
+    class NotFoundException(Exception):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args)
+
+    exceptions.NotFoundException = NotFoundException
+    client_api.exceptions = exceptions
+    monkeypatch.setitem(sys.modules, "hindsight_client_api", client_api)
+    monkeypatch.setitem(sys.modules, "hindsight_client_api.exceptions", exceptions)
 
 
 def _make_mock_client():
@@ -123,33 +148,27 @@ def _provider_for_mode(tmp_path, monkeypatch, mode: str):
 
 def _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, mode: str):
     """Cloud/local-external clients must ensure lazy deps before importing."""
-    import builtins
 
     provider = _provider_for_mode(tmp_path, monkeypatch, mode)
     ensure_calls = []
-
-    def fake_ensure(feature, prompt=True):
-        ensure_calls.append((feature, prompt))
 
     class FakeHindsight:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-    real_import = builtins.__import__
+    def fake_install(specs, **kwargs):
+        ensure_calls.append((specs, kwargs))
+        sdk = ModuleType("hindsight_client")
+        sdk.Hindsight = FakeHindsight
+        monkeypatch.setitem(sys.modules, "hindsight_client", sdk)
+        return SimpleNamespace(ok=True)
 
-    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "hindsight_client":
-            if ensure_calls != [("memory.hindsight", False)]:
-                raise ModuleNotFoundError("No module named 'hindsight_client'")
-            return SimpleNamespace(Hindsight=FakeHindsight)
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr("tools.lazy_deps.ensure", fake_ensure)
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setitem(sys.modules, "hindsight_client", None)
+    monkeypatch.setattr("tools.lazy_deps.install_specs", fake_install)
 
     client = provider._get_client()
 
-    assert ensure_calls == [("memory.hindsight", False)]
+    assert ensure_calls == [(["hindsight-client>=0.6.1,<1"], {"timeout": 120})]
     assert isinstance(client, FakeHindsight)
     assert client.kwargs == {
         "base_url": "http://localhost:9999",
@@ -942,7 +961,11 @@ class TestPrefetchServerRetainVisibility:
 
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
-        from hindsight_client_api.exceptions import NotFoundException
+        exceptions = pytest.importorskip(
+            "hindsight_client_api.exceptions",
+            reason="Hindsight SDK is not installed",
+        )
+        NotFoundException = exceptions.NotFoundException
 
         client = _make_mock_client()
         client.operations = MagicMock()
@@ -1032,8 +1055,9 @@ class TestPrefetchServerRetainVisibility:
         assert provider._queued_retained_turn_count == 1
 
         assert provider.drain_pending(timeout=1.0)
-        assert state.committed == 1
-        assert provider._last_retained_turn_count == 1
+        assert state.turn_base == 1 and state.turns == []
+        assert state.committed == 0
+        assert provider._last_retained_turn_count == 0
 
     def test_failed_remote_append_retries_bounded_and_remains_retryable(
         self, provider_with_config, monkeypatch
@@ -1495,8 +1519,8 @@ class TestDeliveryLedger:
             client.aretain_batch.call_args_list[1].kwargs["items"][0]["content"]
         )
         assert len(retry_content) == 2
-        assert state.committed == 2
-        assert state.queued == 2
+        assert state.turn_base == 2 and state.turns == []
+        assert state.committed == state.queued == 0
 
     def test_completed_active_ledger_is_pruned_then_reowned_for_partial_suffix(
         self, provider_with_config, monkeypatch
@@ -1601,7 +1625,7 @@ class TestDeliveryLedger:
         )
         assert len(first) == 2
         assert len(remainder) == 1
-        assert old_state.committed == 3
+        assert old_state.turn_base == 3 and old_state.turns == []
         assert p._session_id == "new-session"
 
 
@@ -1727,6 +1751,138 @@ class TestSessionSwitchBufferFlush:
 
         assert removed_state.invalidated is True
         p._client.aretain_batch.assert_not_called()
+
+    def test_consecutive_rewind_replaces_queued_repair_behind_blocked_writer(
+        self, provider_with_config, monkeypatch
+    ):
+        """A second rewind inherits cleanup owned by a not-yet-started repair."""
+        import threading
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: True,
+        )
+        p = provider_with_config(retain_async=False)
+        client = MagicMock()
+        client.aretain_batch.return_value = SimpleNamespace(
+            operation_id=None, operation_ids=None,
+        )
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+        for ordinal in range(1, 4):
+            p.sync_turn(f"user {ordinal}", f"assistant {ordinal}")
+            p._retain_queue.join()
+
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+
+        def _block_writer():
+            blocker_started.set()
+            assert release_blocker.wait(timeout=2.0)
+
+        p._retain_queue.put(_block_writer)
+        assert blocker_started.wait(timeout=2.0)
+
+        p.on_session_switch("test-session", rewound=True, rewound_turns=1)
+        first_repair = p._active_delivery_state
+        assert first_repair.rewind_repair is True
+        p.on_session_switch("test-session", rewound=True, rewound_turns=1)
+        successor_repair = p._active_delivery_state
+
+        assert first_repair.invalidated is True
+        assert successor_repair is not first_repair
+        assert successor_repair.rewind_repair is True
+        release_blocker.set()
+        p._retain_queue.join()
+
+        # Three original appends plus only the successor replacement.  The
+        # invalidated first repair never writes the now-stale two-turn prefix.
+        assert client.aretain_batch.call_count == 4
+        repair_call = client.aretain_batch.call_args_list[-1]
+        repair_item = repair_call.kwargs["items"][0]
+        repair_text = json.dumps(json.loads(repair_item["content"]))
+        assert repair_item["update_mode"] == "replace"
+        assert "user 1" in repair_text
+        assert "user 2" not in repair_text
+        assert "user 3" not in repair_text
+
+    @pytest.mark.parametrize("append_capable", [True, False], ids=["append", "replacement"])
+    def test_completed_retain_rewind_rewrites_surviving_transcript(
+        self, provider_with_config, monkeypatch, append_capable
+    ):
+        """A completed remote document loses discarded turns in both write modes."""
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_api_supports_update_mode_append",
+            lambda *_args, **_kwargs: append_capable,
+        )
+        p = provider_with_config(retain_async=False)
+        client = MagicMock()
+        client.aretain_batch.return_value = SimpleNamespace(
+            operation_id=None, operation_ids=None,
+        )
+        p._run_hindsight_operation = lambda operation, **_kwargs: operation(client)
+        p._client = None
+        for ordinal in range(1, 4):
+            p.sync_turn(f"user {ordinal}", f"assistant {ordinal}")
+            p._retain_queue.join()
+
+        retained_document = p._active_delivery_state.document_id
+        if append_capable:
+            assert p._active_delivery_state.turn_base == 3
+            assert len(p._active_delivery_state.confirmed_turns) == 3
+            assert p._active_delivery_state.committed == 0
+            assert p._session_turns == []
+        else:
+            assert p._active_delivery_state.committed == 3
+            assert len(p._session_turns) == 3
+
+        p.on_session_switch(
+            "test-session", rewound=True, rewound_turns=1,
+        )
+        p._retain_queue.join()
+
+        assert client.aretain_batch.call_count == 4
+        repair_call = client.aretain_batch.call_args_list[3]
+        repair_item = repair_call.kwargs["items"][0]
+        repair_content = json.loads(repair_item["content"])
+        repair_text = json.dumps(repair_content)
+        assert len(repair_content) == 2
+        assert repair_call.kwargs["document_id"] == retained_document
+        assert "user 1" in repair_text and "user 2" in repair_text
+        assert "user 3" not in repair_text
+        if append_capable:
+            assert repair_item["update_mode"] == "replace"
+            assert p._active_delivery_state.update_mode == "append"
+        else:
+            assert "update_mode" not in repair_item
+            assert p._active_delivery_state.update_mode is None
+
+        # Future delivery continues from the repaired prefix rather than
+        # resurrecting the discarded turn or replacing the prefix itself.
+        p.sync_turn("user 4", "assistant 4")
+        p._retain_queue.join()
+        next_item = client.aretain_batch.call_args_list[4].kwargs["items"][0]
+        next_content = json.loads(next_item["content"])
+        next_text = json.dumps(next_content)
+        assert "user 3" not in next_text and "user 4" in next_text
+        if append_capable:
+            assert len(next_content) == 1
+            assert "user 1" not in next_text
+            assert next_item["update_mode"] == "append"
+        else:
+            assert len(next_content) == 3
+            assert "user 1" in next_text and "user 2" in next_text
+            assert "update_mode" not in next_item
+
+        # Rewinding the entire retained transcript deletes the document;
+        # rewriting an empty JSON array would leave extracted remote units.
+        p.on_session_switch(
+            "test-session", rewound=True, rewound_turns=3,
+        )
+        p._retain_queue.join()
+        client.documents.delete_document.assert_called_once_with(
+            "test-bank", retained_document,
+        )
 
     def test_sync_turn_rejects_mismatched_session_ownership(self, provider):
         provider.sync_turn(
@@ -2261,6 +2417,23 @@ def test_save_config_sets_owner_only_permissions(tmp_path):
     assert mode == 0o600, f"Expected 0o600 (owner-only), got {oct(mode)}"
 
 
+def test_load_config_corrupt_profile_file_falls_through_to_env(tmp_path, monkeypatch):
+    """A corrupt $HERMES_HOME/hindsight/config.json is not the config: the loader falls through
+    (legacy file, then env) instead of returning an empty, silently-unconfigured mapping."""
+    home = tmp_path / "home"
+    (home / "hindsight").mkdir(parents=True)
+    (home / "hindsight" / "config.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "nohome")
+    monkeypatch.setenv("HINDSIGHT_MODE", "local")
+    monkeypatch.setenv("HINDSIGHT_BANK_ID", "from-env")
+
+    cfg = _load_config()
+
+    assert cfg["mode"] == "local"
+    assert cfg["banks"]["hermes"]["bankId"] == "from-env"
+
+
 class TestLoadSimpleEnv:
     def test_bom_first_key_is_recognized(self, tmp_path):
         """A Notepad-edited .env carries a BOM; the first key must still parse
@@ -2431,3 +2604,24 @@ class TestMultiplexBackgroundScope:
                 t.join(timeout=5)
         assert created == ["p1-secret"]
         assert "Daemon started successfully" in (home / "logs" / "hindsight-embed.log").read_text()
+
+
+def test_append_mode_trims_retained_turns_without_dropping_any(provider, monkeypatch):
+    """Confirmed append ranges leave the retry buffer; every turn ships once."""
+    provider._auto_retain = True
+    provider._retain_every_n_turns = 3
+    monkeypatch.setattr(provider, "_ensure_writer", lambda: None)
+    monkeypatch.setattr(provider, "_register_atexit", lambda: None)
+    monkeypatch.setattr(provider, "_resolve_retain_target", lambda doc: ("doc", "append"))
+    shipped: list[str] = []
+    monkeypatch.setattr(provider, "_retain_batch",
+                        lambda item, **kw: shipped.extend(json.loads(item["content"])))
+    provider._retain_async = False
+    provider._retain_queue = MagicMock(put=lambda job: job())
+
+    for i in range(7):
+        provider.sync_turn(f"user {i}", f"assistant {i}")
+
+    assert len(provider._session_turns) == 1  # only the un-retained tail (turn 7)
+    assert provider._last_retained_turn_count == 0
+    assert len(shipped) == 6 and len({json.dumps(turn) for turn in shipped}) == 6

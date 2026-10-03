@@ -1,12 +1,9 @@
-"""Tests for /undo handling in tui_gateway.
+"""Tests for rewind handling in tui_gateway.
 
-The TUI routes ``/undo`` through ``command.dispatch`` (it's in
-``_PENDING_INPUT_COMMANDS`` because the CLI handler queues input the
-slash-worker subprocess can't read). The server handles it directly,
-mutates SessionDB to soft-delete rows, refreshes the in-memory session
-history, fires the memory-provider hook with ``rewound=True``, and
-returns ``{"type": "prefill", "message": <text>, "notice": ...}`` so
-the Ink client drops the message into the composer for editing.
+The normal Ink TUI routes ``/undo`` and ``/retry`` through ``session.undo``;
+``command.dispatch`` remains a second server-side route. Both must soft-delete
+the durable suffix, refresh warm history, and fire the memory-provider rewind
+hook. The command route additionally returns a composer prefill.
 
 ``/undo N`` backs up N user turns at once (default 1). See issue #21910.
 """
@@ -55,8 +52,7 @@ def server(hermes_home):
     mod._methods.clear()
     mod._methods.update(methods)
     mod._sessions.clear()
-    mod._pending.clear()
-    mod._answers.clear()
+    __import__("tui_gateway.server_requests", fromlist=["x"]).reset_for_tests()
     mod._db = None
 
 
@@ -105,7 +101,6 @@ def test_undo_returns_prefill_with_target_text(server, session_with_history):
     assert result["type"] == "prefill"
     # Default /undo backs up one user turn — "question 3"
     assert result["message"] == "question 3"
-    assert "Undid" in result["notice"]
     assert s["history"]
     assert all("_row_id" in message for message in s["history"])
     agent._memory_manager.queue_session_switch.assert_called_once_with(
@@ -113,5 +108,24 @@ def test_undo_returns_prefill_with_target_text(server, session_with_history):
         parent_session_id="",
         reset=False,
         rewound=True,
+        rewound_turns=1,
     )
 
+
+def test_session_undo_rpc_propagates_memory_rewind(server, session_with_history):
+    sid, session_key, session, agent = session_with_history
+
+    resp = _call(server, "session.undo", session_id=sid)
+
+    assert resp["result"]["removed"] == 2
+    assert [message["content"] for message in session["history"]] == [
+        "question 1", "answer 1", "question 2", "answer 2",
+    ]
+    agent._memory_manager.queue_session_switch.assert_called_once_with(
+        session_key,
+        parent_session_id="",
+        reset=False,
+        rewound=True,
+        rewound_turns=1,
+    )
+    agent._invalidate_system_prompt.assert_called_once_with()

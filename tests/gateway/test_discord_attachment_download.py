@@ -14,6 +14,7 @@ helpers. Verifies that:
   defense-in-depth. (issue #11345)
 """
 
+import asyncio
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -145,6 +146,65 @@ class TestReadAttachmentBytes:
         )
         with pytest.raises(ValueError, match="Inbound media payload is too large"):
             await adapter._read_attachment_bytes(lying, max_bytes=64)
+
+    @pytest.mark.asyncio
+    async def test_blocked_authenticated_reader_exhausts_shared_deadline_without_url_fallback(self):
+        adapter = _make_adapter()
+        cancelled = False
+
+        async def blocked_reader():
+            nonlocal cancelled
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled = True
+
+        att = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/file.png",
+            filename="file.png",
+            size=1,
+            read=blocked_reader,
+        )
+        with patch(
+            "plugins.platforms.discord.adapter.cache_image_from_url",
+            new_callable=AsyncMock,
+        ) as fallback:
+            with pytest.raises(TimeoutError):
+                await adapter._cache_discord_image(att, ".png", timeout=2.0)
+
+        assert cancelled
+        fallback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method_name", "fallback_name", "extension", "cached_path"),
+        [
+            ("_cache_discord_image", "cache_image_from_url", ".png", "/tmp/fallback.png"),
+            ("_cache_discord_audio", "cache_audio_from_url", ".ogg", "/tmp/fallback.ogg"),
+        ],
+    )
+    async def test_early_reader_timeout_uses_url_fallback_with_remaining_budget(
+        self, method_name, fallback_name, extension, cached_path
+    ):
+        adapter = _make_adapter()
+        att = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/file",
+            filename=f"file{extension}",
+            size=1,
+            read=AsyncMock(side_effect=TimeoutError("authenticated read timed out early")),
+        )
+
+        with patch(
+            f"plugins.platforms.discord.adapter.{fallback_name}",
+            new_callable=AsyncMock,
+            return_value=cached_path,
+        ) as fallback:
+            result = await getattr(adapter, method_name)(att, extension, timeout=2.0)
+
+        assert result == cached_path
+        fallback.assert_awaited_once()
+        remaining = fallback.await_args.kwargs["timeout"]
+        assert 0 < remaining <= 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -328,5 +388,3 @@ class TestHandleMessageUsesAuthenticatedRead:
         assert "fresh screenshot or JPEG" in event.text
         assert "why is it doing this?" in event.text
         assert att.url not in event.text
-
-

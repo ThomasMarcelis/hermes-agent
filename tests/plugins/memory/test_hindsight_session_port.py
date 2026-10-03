@@ -33,3 +33,47 @@ def test_hindsight_local_config_and_manager_session_boundaries(monkeypatch):
     assert provider._bank_id == 'owned-root'
     assert provider._client is None
     manager.shutdown_all()
+
+
+def test_fork_provider_discovery_and_client_factory_are_profile_scoped(tmp_path, monkeypatch):
+    """A→B→A discovers the durable fork and builds each SDK client with its own credentials."""
+    import json
+    import sys
+    from pathlib import Path
+    from types import ModuleType
+
+    from agent import secret_scope
+    from gateway.run import _profile_runtime_scope
+    from plugins.memory import find_provider_dir, load_memory_provider
+
+    calls = []
+    sdk = ModuleType("hindsight_client")
+    sdk.Hindsight = lambda **kwargs: calls.append(kwargs) or object()
+    monkeypatch.setitem(sys.modules, "hindsight_client", sdk)
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setattr("plugins.memory.hindsight._maybe_upgrade_client", lambda: None)
+    homes = [tmp_path / name for name in ("a", "b")]
+    for home in homes:
+        home.mkdir()
+        (home / "config.yaml").write_text("memory:\n  provider: hindsight\n")
+        directory = home / "hindsight"
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps({
+            "mode": "local_external", "api_url": f"http://{home.name}.invalid",
+            "auto_retain": False, "auto_recall": False,
+        }))
+    for home in (homes[0], homes[1], homes[0]):
+        with _profile_runtime_scope(home, {"HINDSIGHT_API_KEY": f"key-{home.name}"}):
+            assert find_provider_dir("hindsight").resolve() == (
+                Path(__file__).resolve().parents[3]
+                / "plugins" / "memory" / "hindsight"
+            )
+            provider = load_memory_provider("hindsight", register_skills=False)
+            assert isinstance(provider, HindsightMemoryProvider)
+            provider.initialize(session_id=f"session-{home.name}", platform="cli")
+            provider._new_cloud_client()
+            provider.shutdown()
+    assert [call["api_key"] for call in calls] == ["key-a", "key-b", "key-a"]
+    assert [call["base_url"] for call in calls] == [
+        "http://a.invalid", "http://b.invalid", "http://a.invalid",
+    ]

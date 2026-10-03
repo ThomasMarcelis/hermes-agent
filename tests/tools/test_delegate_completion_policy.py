@@ -75,7 +75,8 @@ def test_model_schema_describes_the_configured_completion_contract(mode, tmp_pat
         assert "END YOUR TURN" not in description
     else:
         assert "Runs detached" in description
-        assert "independent_completions" in description and "group" in description
+        assert "one message per call" in description
+        assert "group" not in description
         assert "wait or poll" in description and "BETWEEN your turns" in description
 
 

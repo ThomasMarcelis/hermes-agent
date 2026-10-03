@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import os
 from typing import Any
 
 
@@ -37,8 +36,8 @@ def select_pool_context(provider: str) -> SelectedPoolContext:
         from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL, _xai_validate_inference_base_url
 
         base_url = _xai_validate_inference_base_url(
-            str(os.getenv("HERMES_XAI_BASE_URL", "") or "").strip().rstrip("/")
-            or str(os.getenv("XAI_BASE_URL", "") or "").strip().rstrip("/")
+            aux._scoped_key_env("HERMES_XAI_BASE_URL").rstrip("/")
+            or aux._scoped_key_env("XAI_BASE_URL").rstrip("/")
             or base_url,
             fallback=DEFAULT_XAI_OAUTH_BASE_URL,
         )
