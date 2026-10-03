@@ -430,6 +430,10 @@ class GatewayTurnMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
+            from gateway.run_session_messages import session_message_event_is_current
+            if not session_message_event_is_current(self, event, session_entry):
+                return
+            pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
             if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
                 logger.warning(
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
@@ -1132,6 +1136,8 @@ class GatewayTurnMixin:
                 _hyg_in_place = False
             else:
                 session_entry.session_id = _hyg_new_sid
+                from gateway.run_session_messages import alias_session_message_route
+                alias_session_message_route(self, session_entry.session_key, _hyg_new_sid)
                 # The held turn lease follows the rotation (alias keys still serialize on this turn).
                 self._rebind_turn_lease(_quick_key, run_generation, _hyg_new_sid)
                 await self.async_session_store._save()
@@ -1577,6 +1583,8 @@ class GatewayTurnMixin:
         if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
             if session_entry.session_id == _run_start_session_id:
                 session_entry.session_id = agent_result["session_id"]
+                from gateway.run_session_messages import alias_session_message_route
+                alias_session_message_route(self, session_key, session_entry.session_id)
                 # The held turn lease follows the rotation (persistence writes to the NEW id).
                 self._rebind_turn_lease(_quick_key, run_generation, session_entry.session_id)
                 await self.async_session_store._save()
@@ -2933,6 +2941,10 @@ class GatewayTurnMixin:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
         with self._profile_scope_for_source(source):
+            from gateway.run_session_messages import ensure_session_message_route
+            session_key, generation = turn_kwargs.get("session_key"), turn_kwargs.get("run_generation")
+            if generation is None or self._is_session_run_current(session_key, generation):
+                ensure_session_message_route(self, source, session_key, session_id)
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
@@ -3650,6 +3662,10 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         if result and adapter and session_key:
+            if result.get("pending_steer"):
+                from gateway.run_session_messages import queue_leftover_steer
+                if queue_leftover_steer(self, adapter, source, session_key, result["pending_steer"]):
+                    result.pop("pending_steer")
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
@@ -3831,6 +3847,12 @@ class GatewayTurnMixin:
         next_display_kind = display_kind_for_event(pending_event)
         # See #60671.
         if pending_event is not None:
+            if (getattr(pending_event, "metadata", None) or {}).get("gateway_session_message_route"):
+                from gateway.run_session_messages import session_message_event_is_current
+                entry = self.session_store._entries.get(session_key)
+                if not session_message_event_is_current(self, pending_event, entry):
+                    logger.info("Discarding session message after conversation replacement: %s", session_key)
+                    return result
             next_source = getattr(pending_event, "source", None) or source
             if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                 logger.info(

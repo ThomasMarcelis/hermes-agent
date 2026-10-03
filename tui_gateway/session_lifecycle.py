@@ -178,6 +178,7 @@ def _take_over_detached_runtime_lease(sid: str, session: dict, key: str) -> bool
         del other["active_session_lease"]
         other["_lease_taken_over"] = True
         _attach_lease(session, lease)
+    _close_plugin_session_route(other)
     logger.info("Session %s took over lease for %s from detached runtime %s", sid, key, other_sid)
     try:
         _interrupt_session_turn(other_sid, other, request_id=f"lease-takeover-{sid}")
@@ -356,6 +357,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
+    _close_plugin_session_route(session)
     _lock_vault_managers(session)
     if (history_ready := session.get("resume_history_ready")) is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"

@@ -469,6 +469,8 @@ class CLITuiRuntimeMixin:
                        set_unlock_prompt_callback, set_save_login_prompt_callback, set_code_prompt_callback):
             _unset(None)
         _vault_lock()  # session tokens for external password managers die with the session
+        from hermes_cli.cli_session_messages import close_cli_session_route
+        close_cli_session_route(self)
         # On SIGHUP/SIGTERM the agent thread may be reaped before its own persistence runs.
         self._persist_active_session_before_close()
 

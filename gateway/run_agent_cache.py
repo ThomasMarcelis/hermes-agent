@@ -364,6 +364,8 @@ class GatewayAgentCacheMixin:
         from gateway.run import _CONVERSATION_SCOPED_STATE
         if not session_key:
             return
+        from gateway.run_session_messages import close_session_message_route
+        close_session_message_route(self, session_key)
         state = self._peek_session_state(session_key)
         if state is not None:
             state.conversation.clear()

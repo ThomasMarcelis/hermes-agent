@@ -493,6 +493,8 @@ class CLISessionMixin:
             CLI_CONFIG, _parse_service_tier_config,
             _sync_process_session_id, datetime)
         from hermes_cli.cli_model_switch_mixin import _resolve_cli_reasoning
+        from hermes_cli.cli_session_messages import close_cli_session_route, register_cli_session_route
+        close_cli_session_route(self)
         old_session_id = self.session_id
         _boundary_snapshot = None
         if self.agent:
@@ -582,6 +584,8 @@ class CLISessionMixin:
                         self.session_id, parent_session_id=old_session_id or "",
                         reset=True, reason="new_session")
             self._notify_session_boundary("on_session_reset")
+
+        register_cli_session_route(self)
 
         if not silent:
             if title:

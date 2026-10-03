@@ -504,6 +504,12 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
 
     try:
         _arm_exit_watchdog()
+        with suppress(Exception):
+            from hermes_cli.plugins import get_plugin_manager
+            from hermes_cli.cli_session_messages import close_cli_session_route
+            cli = get_plugin_manager()._cli_ref
+            if cli is not None:
+                close_cli_session_route(cli)
         # Reset terminal input modes FIRST: teardown below can take seconds and a later
         # step raising must not skip the reset. No-op unless the TUI ran.
         # See #36823.

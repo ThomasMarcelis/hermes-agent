@@ -3452,16 +3452,10 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
     # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
     # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
     # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
-    _lock = getattr(agent, "_pending_steer_lock", None)
-    if _lock is not None:
-        with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
-    else:
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+    from agent.interrupt_control import _ic_lock
+    from agent.steer_messages import combine_steer
+    with _ic_lock(agent, "_pending_steer_lock"):
+        agent._pending_steer = combine_steer(getattr(agent, "_pending_steer", None), steer_text)
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
@@ -3499,10 +3493,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         _requeue_pending_steer(agent, steer_text)
         return
     messages.append(steer_user_row(steer_text))
-    _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
-        steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
-    )
+    _ra().logger.info("Delivered steering after tool batch (%d chars)", len(steer_text))
 
 
 def _shutdown_socket(sock: Any) -> None:

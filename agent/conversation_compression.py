@@ -1691,6 +1691,9 @@ def _adopt_live_compression_child(
         return None
     agent.session_id = child_session_id
     _rebind_session_context(child_session_id)
+    from hermes_cli.session_messages import alias_session_route
+    from hermes_constants import get_hermes_home
+    alias_session_route(get_hermes_home(), parent_session_id, child_session_id)
     agent._session_db_created = True
     if child.get("system_prompt"):
         agent._cached_system_prompt = child["system_prompt"]
@@ -3369,6 +3372,9 @@ def _publish_rotated_compaction(
     agent.session_id = new_session_id
     agent._db_flush_scan_prefix = None
     _rebind_session_context(agent.session_id)
+    from hermes_cli.session_messages import alias_session_route
+    from hermes_constants import get_hermes_home
+    alias_session_route(get_hermes_home(), old_session_id, new_session_id)
     agent._session_db_created = True
     _carry_session_state_to_child(agent, old_session_id, old_title)
 

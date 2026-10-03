@@ -129,7 +129,7 @@ VALID_HOOKS: Set[str] = {
     # Run-all-then-pick-first (see get_plugin_error_classification). Privacy: error_message/
     # error_body may be unredacted.
     "transform_api_error_classification", "on_session_start", "on_session_end",
-    "on_session_finalize", "on_session_reset",
+    "on_session_finalize", "on_session_reset", "on_session_message_route_closed",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
@@ -632,6 +632,35 @@ class PluginContext:
             logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id,
                            exc_info=True)
             return False
+
+    def session_message_route(self, session_id: str) -> dict | None:
+        """Return this profile's live conversation route, including its compression tip."""
+        from hermes_cli.session_messages import get_session_message_route
+        return get_session_message_route(self._manager.home_path, session_id)
+
+    def inject_session_message(
+        self, session_id: str, content: str, *, message_id: str, busy_mode: str = "steer",
+        expected_route_id: str | None = None,
+    ) -> dict:
+        """Admit a message to an exact live conversation on CLI, gateway or Desktop/TUI.
+
+        Requires this plugin's ``allow_gateway_injection`` grant on every surface.
+        Accepted means steered/queued/started, not that the model consumed the message.
+        Compression aliases stay valid; conversation replacement retires every alias.
+        Pass ``expected_route_id`` to reject replies from a replaced route's inbox.
+        """
+        from hermes_cli.session_messages import inject_session_message, profile_message_scope
+        try:
+            with profile_message_scope(self._manager.home_path):
+                if not self._gateway_injection_allowed():
+                    return {"accepted": False, "status": "denied"}
+        except Exception:
+            logger.warning("Session message profile scope unavailable for plugin %s", self.plugin_id)
+            return {"accepted": False, "status": "offline"}
+        return inject_session_message(
+            self._manager.home_path, session_id, content,
+            message_id=message_id, busy_mode=busy_mode, expected_route_id=expected_route_id,
+        )
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""

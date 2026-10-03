@@ -110,6 +110,7 @@ def _compute_host_adopt_frame_meta(session: dict, frame: dict) -> None:
             logger.warning("Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
                            frame.get("sid"), session.get("session_key"), new_key)
         session["session_key"] = new_key
+        _alias_plugin_session_route(session, new_key)
     if frame.get("history_version") is not None:
         with contextlib.suppress(Exception):
             session["history_version"] = max(int(session.get("history_version", 0)),

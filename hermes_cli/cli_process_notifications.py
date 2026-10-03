@@ -48,6 +48,10 @@ class CLIProcessNotificationsMixin:
     def _tui_unwrap_input(self, user_input):
         """Unwrap ``_VoiceInputMessage`` / ``_SeededQueryMessage`` -> ``(text_or_tuple, is_voice_input, is_seeded_query)``."""
         from cli import _VoiceInputMessage, _SeededQueryMessage
+        from hermes_cli.cli_session_messages import unwrap_cli_session_message
+        user_input, is_session_message = unwrap_cli_session_message(self, user_input)
+        if is_session_message:
+            return user_input, False, True
         from tools.process_registry import process_registry
         from tools.process_registry_notifications import (
             PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch, TimelineNotification)

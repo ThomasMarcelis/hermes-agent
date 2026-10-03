@@ -549,6 +549,9 @@ CONTROL_FRAME_OPENERS = (
 
 def format_steer_marker(steer_text: str) -> str:
     """Wrap a mid-turn steer in the self-describing marker (see note above)."""
+    from agent.steer_messages import ExternalSteerText
+    if isinstance(steer_text, ExternalSteerText):
+        return steer_text.model_text(format_steer_marker)
     return f"\n\n{STEER_MARKER_OPEN}\n{steer_text}\n{STEER_MARKER_CLOSE}"
 
 

@@ -624,6 +624,8 @@ class GatewaySessionCommandsMixin:
                 raise RuntimeError(
                     f"failed to persist compressed transcript for session {new_session_id}")
             session_entry.session_id = new_session_id
+            from gateway.run_session_messages import alias_session_message_route
+            alias_session_message_route(self, session_entry.session_key, new_session_id)
             await self.async_session_store._save()
             await asyncio.to_thread(self._sync_telegram_topic_binding, source, session_entry,
                                     reason="compress-command")
@@ -1069,6 +1071,8 @@ class GatewaySessionCommandsMixin:
         new_entry = await self.async_session_store.switch_session(dest_key, new_session_id)
         if not new_entry:
             return t("gateway.branch.switch_failed")
+        from gateway.run_session_messages import close_session_message_route
+        close_session_message_route(self, dest_key)
         self._clear_session_boundary_security_state(dest_key)
         self._evict_cached_agent(dest_key)
         msg_count = len([m for m in history if m.get("role") == "user"])

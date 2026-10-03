@@ -1013,6 +1013,7 @@ def _start_session_services(sid: str, key: str, current: dict) -> None:
     """Start the notification poller and fire the session-reset boundary hook."""
     with _sessions_lock:
         if (rec := _sessions.get(sid)) is not None:
+            _register_plugin_session_route(sid, rec)
             rec["_notif_stop"] = _start_notification_poller(sid, rec)
     _notify_session_boundary("on_session_reset", key, _session_source(current))
 
@@ -3368,7 +3369,7 @@ from . import (  # noqa: E402
     session_compression as _session_compression, model_switch as _model_switch,
     compute_host_bridge as _compute_host_bridge, session_workdir as _session_workdir,
     session_lifecycle as _session_lifecycle, session_reaper as _session_reaper,
-    session_transports as _session_transports,
+    session_transports as _session_transports, session_messages as _session_messages,
     methods_browser_control as _methods_browser_control, methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete, methods_config as _methods_config,
     methods_config_set as _methods_config_set, methods_images as _methods_images,
@@ -3382,7 +3383,7 @@ from . import (  # noqa: E402
     methods_onboarding as _methods_onboarding)
 
 for _m in (
-    _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
+    _session_transports, _session_reaper, _session_lifecycle, _session_messages, _session_workdir, _compute_host_bridge, _model_switch,
     _session_compression, _change_watcher, _tool_progress, _session_notifications,
     _prompt_attachments, _session_history, _agent_callbacks, _session_auto_continue, _rpc_dispatch,
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,

@@ -1947,6 +1947,8 @@ class CLITuiMixin:
         # Plugins get a CLI reference so they can inject messages.
         from hermes_cli.plugins import get_plugin_manager
         get_plugin_manager()._cli_ref = self
+        from hermes_cli.cli_session_messages import register_cli_session_route
+        register_cli_session_route(self)
 
         # Config file watcher — detect mcp_servers changes and auto-reload.
         from hermes_cli.config import get_config_path as _get_config_path

@@ -519,6 +519,7 @@ def _rebuild_session_agent(sid: str, session: dict, **kwargs):
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
+    _close_plugin_session_route(session)
     updates = dict(
         attached_images=[], queued_prompt=None,
         _queued_prompt_generation=int(session.get("_queued_prompt_generation", 0)) + 1,
@@ -545,6 +546,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     info = _session_info(new_agent, session)
     _emit("session.info", sid, info)
     _restart_slash_worker(sid, session)
+    _register_plugin_session_route(sid, session)
     return info
 
 

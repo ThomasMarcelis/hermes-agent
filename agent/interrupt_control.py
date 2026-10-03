@@ -249,7 +249,24 @@ class InterruptControlMixin:
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            from agent.steer_messages import combine_steer
+            self._pending_steer = combine_steer(existing, cleaned)
+        return True
+
+    def steer_session_message(self, text: str) -> bool:
+        """Admit external text only while this turn still accepts safe-boundary steering.
+
+        The host queues a False result against the same conversation. Unlike ``steer``,
+        this cannot append after the finalizer has drained its next-turn handoff.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return False
+        with _ic_lock(self, "_pending_steer_lock"):
+            if not getattr(self, "_session_message_steer_active", False):
+                return False
+            existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+            from agent.steer_messages import combine_steer
+            self._pending_steer = combine_steer(existing, text.strip(), external=True)
         return True
 
     def redirect(self, text: str) -> bool:

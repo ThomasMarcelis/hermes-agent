@@ -1627,24 +1627,39 @@ def run_conversation(
     from agent.turn_context import export_current_turn_boundary
     from tools.vision_tools_history_budget import native_turn_images
 
-    # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
-    # it does not embed the same pixels a second time into the same request (#76411).
-    with native_turn_images(user_message):
-        result = _run_conversation_turn(
-            agent,
-            user_message,
-            system_message=system_message,
-            conversation_history=conversation_history,
-            task_id=task_id,
-            stream_callback=stream_callback,
-            persist_user_message=persist_user_message,
-            persist_user_timestamp=persist_user_timestamp,
-            persist_user_display_kind=persist_user_display_kind,
-            persist_user_display_metadata=persist_user_display_metadata,
-            persist_user_platform_id=persist_user_platform_id,
-            moa_config=moa_config,
-            turn_author=turn_author,
-        )
+    from agent.interrupt_control import _ic_lock
+    result = None
+    with _ic_lock(agent, "_pending_steer_lock"):
+        agent._session_message_steer_active = True
+    try:
+        # Keep native images available to vision tools without embedding them twice.
+        with native_turn_images(user_message):
+            result = _run_conversation_turn(
+                agent,
+                user_message,
+                system_message=system_message,
+                conversation_history=conversation_history,
+                task_id=task_id,
+                stream_callback=stream_callback,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_platform_id=persist_user_platform_id,
+                moa_config=moa_config,
+                turn_author=turn_author,
+            )
+    finally:
+        # Includes early return paths which bypass finalize_turn. Close admission and
+        # drain atomically so no accepted plugin message disappears at turn teardown.
+        with _ic_lock(agent, "_pending_steer_lock"):
+            agent._session_message_steer_active = False
+            leftover = getattr(agent, "_pending_steer", None)
+            if isinstance(result, dict) and leftover:
+                existing = result.get("pending_steer")
+                from agent.steer_messages import combine_steer
+                result["pending_steer"] = combine_steer(existing, leftover)
+                agent._pending_steer = None
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)
     return result

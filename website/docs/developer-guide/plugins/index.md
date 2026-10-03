@@ -1034,6 +1034,49 @@ The same grant also gates `deregister()`: without it, a plugin cannot
 remove a tool it does not own (which would otherwise be a way around the
 override check).
 
+### Address a live conversation
+
+Native plugins can address an exact live CLI, messaging gateway, or Desktop/TUI conversation:
+
+```python
+route = ctx.session_message_route(session_id)
+receipt = ctx.inject_session_message(
+    session_id, "[External peer message] ...", message_id="unique-delivery-id", busy_mode="steer",
+    expected_route_id=route["route_id"],
+)
+```
+
+The session ID is the durable `session_id` supplied to tool handlers, not their `task_id`.
+`session_message_route` returns `{route_id, session_id}` or `None` when no live host owns it.
+The opaque `route_id` stays stable across compression and runtime-agent replacement; the
+returned session ID follows the compression tip. Old compression IDs remain valid aliases.
+`/new`, branching, replacement with another conversation, or actual host closure retires the
+route and every alias. A retired address never follows the current chat or focused tab.
+For delayed callbacks, pass the original `expected_route_id` so admission rejects a
+replacement host even if it reuses the same durable session ID.
+
+The owner is the profile that loaded this plugin, even when a background callback runs while
+another profile is active. On **every surface**, message injection requires the existing
+`plugins.entries.<plugin-id>.allow_gateway_injection: true` permission. It does not change
+legacy `ctx.inject_message` behavior. Busy mode `steer` uses a safe model/tool boundary,
+falling back to that conversation's next-turn queue; `queue` always waits until idle.
+Idle hosts start a turn through their original interface. Classic CLI admission reports
+`queued` because its ordinary input worker starts the turn asynchronously.
+
+Receipts have `accepted: bool` and `status`: `steered`, `queued`, `started`, `duplicate`,
+`offline`, `stale_session`, or `denied`. Acceptance means host admission, not model
+consumption or completed work. Failed admission may be retried with the same `message_id`;
+the most recent 2,048 accepted IDs are deduplicated for the lifetime of a route.
+
+Register `ctx.register_hook("on_session_message_route_closed", callback)` to retire private
+external inboxes. The callback receives `route_id` under the owning profile scope. Do not
+close inboxes from `on_session_end`, which fires after every turn. Routes are process-local;
+this API does not provide an offline mailbox. One-shot `-q`/`-Q` hosts accept messages
+while running and drain accepted replies before retiring their route at exit; they do not
+add an idle linger. External steering is labeled as plugin-delivered text and never uses
+the marker that grants direct human steering its user authority. Plugins should label external text as peer
+communication, retain existing user authority, and clean up their resources on unload.
+
 ### Register multiple hooks
 
 ```python
@@ -1062,6 +1105,7 @@ Each hook is documented in full on the **[Event Hooks reference](../../user-guid
 | `post_auxiliary_call` | After that attempt returns or raises | `pre_auxiliary_call` fields plus `api_duration: float, finish_reason, response_model, usage: dict \| None, response: dict \| None, error: str \| None, error_type: str \| None` | ignored |
 | [`on_session_start`](../../user-guide/features/hooks.md#on_session_start) | New session created (first turn only) | `session_id: str, model: str, platform: str` | ignored |
 | [`on_session_end`](../../user-guide/features/hooks.md#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
+| `on_session_message_route_closed` | A live conversation route retires, not each turn | `route_id: str` | ignored |
 | [`on_session_finalize`](../../user-guide/features/hooks.md#on_session_finalize) | CLI/gateway tears down an active session | `session_id: str \| None, platform: str` | ignored |
 | [`on_session_reset`](../../user-guide/features/hooks.md#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`) | `session_id: str, platform: str` | ignored |
 | [`gateway_platform_event`](../../user-guide/features/hooks.md#gateway_platform_event) | An authorized platform-native event is normalized at the gateway boundary (Telegram reactions currently) | `platform: str, event_type: str, payload: dict` | ignored |

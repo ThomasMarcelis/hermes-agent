@@ -308,6 +308,8 @@ def _parse_cron_flags(tokens):
 def _end_current_session(cli, reason: str) -> None:
     """Flush un-persisted messages, then end the current session row with ``reason``.
     Best-effort on both steps (the switch proceeds even if the DB write fails)."""
+    from hermes_cli.cli_session_messages import close_cli_session_route
+    close_cli_session_route(cli)
     if cli.agent:
         with suppress(Exception):
             cli.agent._flush_messages_to_session_db(
@@ -320,6 +322,8 @@ def _sync_agent_to_session(cli, session_id: str, *, parent_session_id: str, reas
     """Point an already-built agent at ``session_id`` after a /resume or /branch switch: reset
     per-session state, re-anchor the DB flush index, and notify memory providers with
     reset=False (their state stays valid and just targets the new id; parent keeps lineage)."""
+    from hermes_cli.cli_session_messages import register_cli_session_route
+    register_cli_session_route(cli)
     if not cli.agent:
         return
     cli.agent.session_id = session_id

@@ -1841,6 +1841,8 @@ class TurnRunner:
             # Only after this run published its split — a stale /stop→/new predecessor must not
             # mutate routing state.
             if persisted:
+                from gateway.run_session_messages import alias_session_message_route
+                alias_session_message_route(runner, ctx.session_key, agent_session_id)
                 src = ctx.source
                 if (
                     getattr(src, "platform", None) == Platform.TELEGRAM and getattr(src, "chat_type", None) == "dm"
