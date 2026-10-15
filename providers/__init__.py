@@ -691,7 +691,7 @@ def _run_discovery_steps() -> None:
         import providers as _pkg
 
         for _importer, modname, _ispkg in pkgutil.iter_modules(_pkg.__path__):
-            if modname.startswith("_") or modname == "base":
+            if modname.startswith("_") or modname in {"base", "routes"}:
                 continue
             try:
                 importlib.import_module(f"providers.{modname}")

@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import base64
 import json
+from io import BytesIO
 from types import SimpleNamespace
+
+from PIL import Image
 
 
 def _png_bytes():
@@ -111,10 +114,10 @@ class TestCacheMcpImageBlock:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_tool_content import _cache_mcp_image_block
 
-        # minimal JPEG SOI marker + filler
-        jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 100 + b"\xff\xd9"
+        buffer = BytesIO()
+        Image.new("RGB", (2, 2), "white").save(buffer, format="JPEG")
         block = SimpleNamespace(
-            data=base64.b64encode(jpeg).decode("ascii"),
+            data=base64.b64encode(buffer.getvalue()).decode("ascii"),
             mimeType="image/jpeg",
         )
         tag = _cache_mcp_image_block(block)
@@ -248,12 +251,14 @@ class TestNativeImageAttach:
         assert "already in context" in json.loads(repeat)["result"]  # still the handler's JSON envelope
         import io
         from PIL import Image
-        # A valid JPEG header over a truncated pixel stream passes the cache's and the sniff's header checks.
+        # A valid header cannot smuggle corrupt pixels across the cache boundary.
         buf = io.BytesIO()
         Image.effect_noise((256, 256), 64).convert("RGB").save(buf, "JPEG")
+        cached_before = set((tmp_path / "cache" / "images").iterdir())
         truncated = self._call(monkeypatch, tmp_path, {}, image=buf.getvalue()[: len(buf.getvalue()) // 2],
                                mime="image/jpeg")
-        assert isinstance(truncated, str) and "MEDIA:" in truncated
+        assert isinstance(truncated, str) and json.loads(truncated) == {"result": "snapshot"}
+        assert set((tmp_path / "cache" / "images").iterdir()) == cached_before
         # A 60000x64 strip: the resizer's 64 px short-edge floor cannot bring the long edge under 1568.
         buf = io.BytesIO()
         Image.new("RGB", (60000, 64), (20, 90, 200)).save(buf, "PNG")

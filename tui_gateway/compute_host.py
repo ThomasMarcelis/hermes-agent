@@ -391,7 +391,7 @@ class ComputeHost:
                 server._init_session(
                     sid, key, agent, list(history), cols=int(frame.get("cols") or 80),
                     cwd=str(frame.get("cwd") or "") or None, session_db=session_db,
-                    source=frame.get("source"))
+                    source=frame.get("source"), profile_home=profile_home or None)
             finally:
                 reset_transport(token)
         except Exception:
@@ -414,6 +414,7 @@ class ComputeHost:
         # The host pipe names no login; the record carries the one the gateway stamped at creation.
         session["auth_user_id"] = frame.get("auth_user_id")
         session["profile_home"] = profile_home or session.get("profile_home")
+        server._register_plugin_session_route(sid, session)
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
         # See _ensure_server_session's existing-session branch — a queued model

@@ -218,6 +218,14 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
+    from hermes_cli.cli_session_messages import drain_single_query_session_messages
+
+    def _peer_follow_up(text):
+        follow = cli.agent.run_conversation(
+            user_message=text, conversation_history=cli.conversation_history, **author_kwargs)
+        _sync_cli_session_id_from_agent(cli)
+        return follow
+
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
             result = cli.agent.run_conversation(
@@ -255,6 +263,10 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             lambda: result,
             emit=lambda msg: print(msg, file=sys.stderr, flush=True),
         )
+        if hasattr(cli, "_plugin_message_lock"):
+            if isinstance(result, dict) and result.get("messages"):
+                cli.conversation_history = result["messages"]
+            result = drain_single_query_session_messages(cli, result, _peer_follow_up)
         # The turn is over and persisted: the one-shot exit linger that follows protects nested
         # notify_on_complete replies and is NOT part of the spawner's delivery (#113608). The
         # report carries what this run will print, so a spawner booking a child still lingering
@@ -301,6 +313,13 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 result = continued
                 # A teammate's reply displaced the answer this run prints; tell the spawner.
                 _report_turn(result)
+        if hasattr(cli, "_plugin_message_lock"):
+            if isinstance(result, dict) and result.get("messages"):
+                cli.conversation_history = result["messages"]
+            # The earlier drain consumed its handoff. A linger follow-up can bring
+            # another accepted steer, which must also settle before exit.
+            result = drain_single_query_session_messages(cli, result, _peer_follow_up, close=True)
+            _report_turn(result)
         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
@@ -521,6 +540,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             sys.exit(0)
     if not cli._claim_active_session("cli", stderr=bool(quiet)):
         exit_single_query(1)
+    from hermes_cli.cli_session_messages import (
+        close_cli_session_route, drain_single_query_session_messages, register_cli_session_route,
+    )
+    register_cli_session_route(cli)
     try:
         query, single_query_images = _collect_query_images(query, image)
         single_query_image_urls = _collect_kanban_task_images(single_query_images)
@@ -596,6 +619,12 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
                 _run_kanban_goal_loop_chat(cli, response or "")
             except Exception as _goal_exc:
                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+        if hasattr(cli, "_plugin_message_lock"):
+            def _peer_chat(text):
+                cli.chat(text)
+                return cli._last_turn_result
+            drain_single_query_session_messages(
+                cli, cli._last_turn_result, _peer_chat, handoff_steer=False, close=True)
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
@@ -604,4 +633,5 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False),
             credentials_terminal=getattr(cli, "_credentials_terminal", False)))
     finally:
+        close_cli_session_route(cli)
         _finalize_single_query(cli)

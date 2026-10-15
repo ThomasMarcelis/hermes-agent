@@ -36,6 +36,29 @@ class TranscriptionProvider(CatalogProviderBase):
         """
 
     @property
+    def language_config_aliases(self) -> tuple[str, ...]:
+        """Additional provider language keys, after ``language`` and before global/env fallback."""
+        return ()
+
+    @property
+    def max_upload_bytes(self) -> int:
+        """Positive per-request byte cap, inclusive; default preserves the 25 MiB plugin cap.
+
+        The host re-encodes and, if needed, chunks oversized audio before dispatch.
+        Read per recording; do not perform network I/O in this property.
+        """
+        return 25 * 1024 * 1024
+
+    @property
+    def cloud_preprocessing(self) -> bool:
+        """Opt into the host's best-effort cloud silence trimming (default False).
+
+        Honours ``stt.cloud_trim_silence`` and its tuning settings. Runs after input/CAF
+        conversion, before upload limits, the once-per-recording hint hook and chunking.
+        """
+        return False
+
+    @property
     def streaming_capable(self) -> bool:
         """True when :meth:`open_stream_session` can transcribe live 16 kHz mono s16le PCM
         (``stt.streaming``). Default False: only the file-based :meth:`transcribe` is used."""

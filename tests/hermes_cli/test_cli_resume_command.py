@@ -39,6 +39,8 @@ class TestCliResumeCommand:
 
     def test_handle_resume_by_index_switches_to_numbered_session(self):
         cli_obj = _make_cli()
+        manager = MagicMock()
+        cli_obj.agent = MagicMock(_memory_manager=manager)
         cli_obj._list_recent_sessions = MagicMock(return_value=[
             {"id": "sess_002", "title": "Coding"},
             {"id": "sess_001", "title": "Research"},
@@ -63,6 +65,12 @@ class TestCliResumeCommand:
         printed = " ".join(str(call) for call in mock_cprint.call_args_list)
         assert cli_obj.session_id == "sess_001"
         assert "Research" in printed
+        manager.queue_session_switch.assert_called_once_with(
+            "sess_001",
+            parent_session_id="current_session",
+            reset=False,
+            reason="resume",
+        )
 
     def test_handle_resume_by_index_out_of_range(self):
         cli_obj = _make_cli()

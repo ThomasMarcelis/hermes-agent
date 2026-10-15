@@ -13,8 +13,6 @@ from typing import Any, Callable, Optional
 from agent.reasoning_effort import (
     CODEX_ASTRA_EFFORTS, CODEX_LEGACY_EFFORTS,
     XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS, clamp_effort, is_astra_model,
-    # Same declared vocabulary + shared clamp as the main Codex transport (agent.reasoning_effort):
-    # per-model — "max" availability varies; "minimal"/"ultra" clamp to a listed level.
     codex_supported_efforts,
 )
 from agent.transports.base import ProviderTransport
@@ -310,9 +308,8 @@ def _resolve_reasoning(model: str, params: dict[str, Any]) -> tuple[Any, bool]:
         # OpenAI's own origins have a known per-model ladder; a profile declaration speaks for
         # endpoints the transport cannot know (a custom relay, a catalog-driven router), never
         # for a ``custom:`` entry that merely points at api.openai.com.
-        declared = None
-        if not (is_codex_backend or _is_openai_api_origin(base_url)):
-            declared = _profile_declared_efforts(params.get("provider"), model, base_url)
+        provider = params.get("provider") or ("openai-codex" if is_codex_backend else None)
+        declared = _profile_declared_efforts(provider, model, base_url)
         supported = declared if declared is not None else _codex_efforts_for_route(
             model, base_url, is_codex_backend=is_codex_backend)
         if not supported:
@@ -438,16 +435,24 @@ def _content_cache_key(instructions: str, tools: Optional[list[dict[str, Any]]],
 
 
 def _profile_declared_efforts(provider: Any, model: Optional[str], base_url: Any = None) -> Optional[tuple]:
-    """Provider-profile-declared reasoning-effort vocabulary, or None (fail-open).
+    """Provider-declared vocabulary, or None when no declaration applies.
 
     Resolves by endpoint host first, then by provider name: a ``custom:<name>`` entry pointed
     at a host with a registered profile must follow that host's vocabulary, not the generic
     custom declaration. Lazy import: provider plugins import this transport during registry
     discovery.
     """
+    from providers.routes import ProviderDeclarationError, call_model_declaration, endpoint_profile
+    if _is_openai_api_origin(base_url):
+        return None
     try:
         from providers import get_provider_profile
 
+        route_profile = endpoint_profile(str(base_url or ""))
+        if route_profile is not None:
+            declared = call_model_declaration(route_profile, "supported_reasoning_efforts", model, base_url=base_url)
+            if declared is not None:
+                return tuple(declared)
         name = str(provider or "").strip().lower()
         declared = None
         if base_url:
@@ -457,10 +462,12 @@ def _profile_declared_efforts(provider: Any, model: Optional[str], base_url: Any
             if inferred and inferred != name:
                 inferred_profile = get_provider_profile(inferred)
                 if inferred_profile is not None:
-                    declared = inferred_profile.supported_reasoning_efforts(model)
+                    declared = call_model_declaration(inferred_profile, "supported_reasoning_efforts", model, base_url=base_url)
         if declared is None:
             profile = get_provider_profile(name) if name else None
-            declared = profile.supported_reasoning_efforts(model) if profile is not None else None
+            declared = call_model_declaration(profile, "supported_reasoning_efforts", model, base_url=base_url) if profile else None
+    except ProviderDeclarationError:
+        raise
     except Exception as exc:
         logger.debug("profile-declared efforts lookup failed: %s", exc)
         return None

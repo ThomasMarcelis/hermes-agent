@@ -52,6 +52,29 @@ def test_presence_is_checked_in_the_home_being_migrated(tmp_path, monkeypatch):
     assert mig.migrate_home(a, install=lambda n: installs.append(a) or {"ok": True}, say=lambda s: None) == "twin"
 
 
+@pytest.mark.parametrize("installed", [False, True])
+def test_durable_hindsight_never_migrates_to_catalog(tmp_path, monkeypatch, installed):
+    from plugins import memory
+
+    config = tmp_path / "config.yaml"
+    config.write_text("memory:\n  provider: hindsight\n")
+    before = config.read_bytes()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = tmp_path / "plugins" / "hindsight"
+    if installed:
+        provider.mkdir(parents=True)
+        (provider / "__init__.py").write_text("# MemoryProvider\nraise AssertionError('discovery must not import')\n")
+    assert memory.find_provider_dir("hindsight") == (provider if installed else None)
+    said = []
+    assert mig.migrate_home(tmp_path, install=lambda name: pytest.fail("must not substitute catalog provider"),
+                            say=said.append) is None
+    assert bool(said) is not installed
+    if said:
+        assert "hermes-hindsight-durable" in said[0]
+    assert mig.catalog_install_hint("hindsight") is None
+    assert config.read_bytes() == before
+
+
 def test_provider_unknown_to_catalog_is_reported_not_installed(home, monkeypatch):
     monkeypatch.setattr(mig, "catalog_source", lambda name: None)
     said: list[str] = []
@@ -98,9 +121,9 @@ def test_startup_recovery_attempts_each_profile_home(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(("name", "tty", "lazy", "consent"), [
-    ("hindsight", False, True, True),    # Desktop/gateway/scripted update: nobody can answer the prompt
-    ("hindsight", False, False, False),  # allow_lazy_installs off: still refused, with the install hint
-    ("hindsight", True, True, False),    # a terminal: the user is asked
+    ("byterover", False, True, True),    # Desktop/gateway/scripted update: nobody can answer the prompt
+    ("byterover", False, False, False),  # allow_lazy_installs off: still refused, with the install hint
+    ("byterover", True, True, False),    # a terminal: the user is asked
     ("someplugin", False, True, False),  # never bundled: a config naming it is not consent to install it
 ])
 def test_unattended_migration_install_carries_lazy_install_consent(tmp_path, monkeypatch, name, tty, lazy, consent):
@@ -125,8 +148,20 @@ def test_unattended_migration_install_carries_lazy_install_consent(tmp_path, mon
     assert seen.get("assume_deps_consent", False) is consent
 
 
-@pytest.mark.parametrize(("name", "installs"), [("hindsight", True), ("someplugin", False)])
-def test_startup_recovery_never_asks_a_dependency_question(tmp_path, monkeypatch, name, installs):
+@pytest.fixture
+def missing_bundled_providers(tmp_path, monkeypatch):
+    """Model a provider leaving core, even when this fork still bundles Hindsight."""
+    from plugins import memory
+
+    empty = tmp_path / "empty-bundled-memory"
+    empty.mkdir()
+    monkeypatch.setattr(memory, "_MEMORY_PLUGINS_DIR", empty)
+
+
+@pytest.mark.parametrize(("name", "installs"), [("byterover", True), ("someplugin", False)])
+def test_startup_recovery_never_asks_a_dependency_question(
+    tmp_path, monkeypatch, name, installs, missing_bundled_providers,
+):
     """Agent init cannot answer a prompt: in the CLI the question hangs the turn behind the chat input,
     with no terminal it is refused on every process start. A provider that shipped in core installs
     with its built-in's consent even on a terminal; any other one is not attempted and names the command."""
@@ -294,12 +329,14 @@ def test_recovery_copy_without_a_catalog_memory_entry_keeps_the_generic_hint(tmp
     assert "run: hermes memory setup" in capsys.readouterr().out
 
 
-def test_startup_recovery_backs_off_after_a_failed_install(tmp_path, monkeypatch):
+def test_startup_recovery_backs_off_after_a_failed_install(
+    tmp_path, monkeypatch, missing_bundled_providers,
+):
     """A failed agent-start install is not retried by every following process start (each `hermes chat`,
     cron run, Desktop restart): one failure, then a quiet hour; `hermes update` still retries."""
     from pm import install as pm_install
 
-    (tmp_path / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: byterover\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(mig, "catalog_source", lambda n: n)
     monkeypatch.setattr(pm_install, "lazy_installs_allowed", lambda: True)
@@ -308,10 +345,10 @@ def test_startup_recovery_backs_off_after_a_failed_install(tmp_path, monkeypatch
     said: list[str] = []
     for _process in range(3):
         monkeypatch.setattr(mig, "_attempted", set())  # a fresh process each time
-        assert mig.recover_at_startup("hindsight", say=said.append) is False
-    assert attempts == ["hindsight"]
-    assert "`hermes plugins install hindsight`" in said[-1]  # still told memory is off, and the fix
+        assert mig.recover_at_startup("byterover", say=said.append) is False
+    assert attempts == ["byterover"]
+    assert "`hermes plugins install byterover`" in said[-1]  # still told memory is off, and the fix
     monkeypatch.setattr(mig, "STARTUP_RETRY_SECONDS", 0.0)
     monkeypatch.setattr(mig, "_attempted", set())
-    mig.recover_at_startup("hindsight")
-    assert attempts == ["hindsight", "hindsight"]
+    mig.recover_at_startup("byterover")
+    assert attempts == ["byterover", "byterover"]

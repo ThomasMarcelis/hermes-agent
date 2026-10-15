@@ -187,6 +187,52 @@ each operation's previous content reflects earlier operations in that batch.
 Older Hermes versions can omit `previous_content`. Providers that require exact
 identity should skip destructive mirroring when it is absent.
 
+### Session ownership and rewind identity
+
+`agent.memory_provider.MEMORY_LIFECYCLE_API_VERSION >= 1` advertises the following
+host guarantees for in-process providers. Check this capability when a provider
+depends on them; a release version alone does not identify a backported host.
+
+Queued session switches run after previously admitted writes. Foreground provider
+methods (`handle_tool_call`, `on_turn_start`, and `prefetch`) wait up to five
+seconds for the latest queued rebind. Pending or failed switches withhold access
+to that provider, so the new conversation cannot read or write its old bank.
+Successful rebinding restores access; an individual provider failure does not
+remove a successfully rebound built-in provider.
+
+Providers with their own writer or remote-operation queues may implement
+`drain_pending(timeout=...)`. After its FIFO work completes, the manager's
+`flush_pending(timeout=...)` forwards the remaining shared time budget to that
+hook. Return `False` when durable work remains unresolved; accepting an operation
+does not by itself prove completion.
+
+CLI and TUI `on_session_switch(..., rewound=True)` callbacks receive
+`rewound_message_uids`, an immutable tuple of message IDs actually removed by the
+successful rewind. With SQLite, these come from the committed durable rewind;
+without it, they come from the removed live messages. The callback also
+receives the legacy `rewound_turns` count. Associate retained exchanges with the
+final assistant's `message_uid` in the optional `sync_turn(messages=...)` transcript.
+Finalization assigns that identity before persistence and memory sync, including
+sessions without SQLite; a persisted identity survives resume unchanged.
+A transcript turn count is not a retained-turn count: interrupted and empty turns
+may never have reached the provider. An explicit empty ID tuple means no identified
+retained rows were removed. Removing identities, rather than comparing a surviving
+warm prefix, also preserves previously retained evidence absent after compression.
+The IDs describe local transcript ownership; providers still own remote repair and
+pending-operation settlement. Older providers may ignore this optional keyword.
+Messaging-gateway `/undo` and `/retry` do not emit these callbacks: they alter the
+transcript without revoking already retained provider data.
+
+This fork distributes its durable Hindsight provider separately as
+`hermes-hindsight-durable`. Install its reviewed `hindsight` directory into every
+configured profile's `plugins/hindsight` directory before activating the extracted
+host. Keep `memory.provider: hindsight` and existing configuration. The bundled
+implementation and its special PM admission have been removed; the native external
+plugin declaration admits its pinned client. Automatic catalog migration is refused
+for a missing durable Hindsight installation because the catalog lineage has different
+delivery semantics. No server migration is performed. The distribution's README
+records supported host patches, installation steps and remaining limitations.
+
 ### Oversized prefetch results
 
 External `prefetch()` results are returned in full by default, preserving the

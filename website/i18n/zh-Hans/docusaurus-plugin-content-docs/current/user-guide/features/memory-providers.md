@@ -377,7 +377,7 @@ echo "HINDSIGHT_API_KEY=your-key" >> ~/.hermes/.env
 | `retain_assistant_prefix` | `Assistant` | 自动保留的对话记录中助手轮次前的标签 |
 | `recall_tags` | — | 召回时用于过滤的标签 |
 
-完整配置参考参见[插件 README](https://github.com/NousResearch/hermes-agent/blob/main/plugins/memory/hindsight/README.md)。
+本分支的持久化 Hindsight 实现已移至独立的 `hermes-hindsight-durable` 分发包。完整配置与迁移要求请参见该分发包的 README；请在每个配置了 Hindsight 的配置档案中显式安装经过审核的副本，不要用插件目录中的同名实现自动替换。
 
 ---
 

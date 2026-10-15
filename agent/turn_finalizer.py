@@ -18,7 +18,7 @@ from agent.interrupt_control import interrupted_during_api_call_reason
 from agent.turn_failure_copy import exit_reason_failure, stamp_failure
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
-from agent.message_metadata import append_message, stamp_message_timestamp
+from agent.message_metadata import append_message, stamp_message_timestamp, stamp_message_uid
 from agent.message_sanitization import _sanitize_surrogates
 from agent.served_model import result_model_fields
 
@@ -274,6 +274,9 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
             stamp_message_timestamp(_tail)
             _tail.pop(_DB_PERSISTED_MARKER, None)
             agent._db_flush_scan_prefix = None
+
+        # Memory sync and rewind share this identity even when SQLite is disabled.
+        stamp_message_uid(messages[-1])
 
     # Request is complete, so replace API-local voice/model/skill guidance with the
     # clean user input before the durable snapshot (earlier flushes still needed them).
@@ -744,6 +747,9 @@ def finalize_turn(
         result["cleanup_errors"] = _cleanup_errors
     # A /steer landing after the final assistant turn has no tool batch to drain into;
     # hand it back so it becomes the next user turn instead of being lost.
+    from agent.interrupt_control import _ic_lock
+    with _ic_lock(agent, "_pending_steer_lock"):
+        agent._session_message_steer_active = False
     _leftover_steer = agent._drain_pending_steer()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer

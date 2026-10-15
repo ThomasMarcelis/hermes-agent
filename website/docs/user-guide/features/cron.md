@@ -754,6 +754,44 @@ on a job to opt out of this thread-per-run behaviour.
 The mirror is written as a labelled user turn (`[Cron delivery: <task name>]`), which keeps
 the conversation history alternation-safe across all model providers.
 
+#### Discord thread-per-run compatibility
+
+For a live Discord adapter, prefer the native `attach_to_session: true` option
+when the delivered brief should be available to replies. The owned fork posts a
+visible starter message in the parent before opening that run's thread. Native
+continuation and the legacy thread-per-run option share one thread-creation
+decision; enabling both does not create two threads.
+
+Existing job records may retain `delivery_options.discord.thread_per_run`:
+
+```yaml
+delivery_options:
+  discord:
+    thread_per_run: true
+    thread_name_template: "{job_name} — {date} {time}"
+    thread_auto_archive_duration: 1440
+```
+
+This remains useful for a custom title/archive duration or delivery without a
+live adapter. Titles accept `{job_id}`, `{job_name}`, `{date}`, `{time}` and
+`{datetime}` in the configured Hermes timezone. Archive durations are Discord's
+60, 1440, 4320 or 10080 minutes; invalid values fall back to 1440. The older
+flat `discord_thread_per_run`, `discord_thread_name_template`,
+`discord_thread_title_template` and `discord_thread_auto_archive_duration` job
+fields, and the nested `thread_title_template` alias, remain accepted.
+
+Standalone delivery to an ordinary text channel creates a visible parent seed
+through REST, then reuses the resulting thread ID across all message chunks.
+An existing target thread is reused. Failed thread creation removes the starter
+where possible; it never creates an invisible unanchored thread as a fallback.
+Native live continuation can still deliver inline if thread creation fails.
+
+The legacy option alone does **not** enable history mirroring. Replacing it with
+`attach_to_session: true` changes retention and must be an explicit choice.
+Standalone fallback does not create the live adapter's continuation session, so
+keep a live adapter for reliable replyable history. No jobs or profiles are
+rewritten automatically.
+
 #### Flat, in-channel continuation (Slack)
 
 The thread-preferred behaviour above mints a dedicated thread on every

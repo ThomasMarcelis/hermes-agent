@@ -609,7 +609,9 @@ class CLIChatTurnMixin:
         if _leftover_steer:
             preview = _leftover_steer[:60] + ("..." if len(_leftover_steer) > 60 else "")
             _cprint(f"\n{t('cli.chat.delivering_leftover_steer', preview=preview)}")
-            self._pending_input.put(_leftover_steer)
+            from hermes_cli.cli_session_messages import SessionMessageInput
+            owner = getattr(self, "_plugin_message_owner", None)
+            self._pending_input.put(SessionMessageInput(owner, _leftover_steer, external=False) if owner else _leftover_steer)
 
         return response
 

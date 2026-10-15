@@ -41,6 +41,7 @@ def _b64_png() -> str:
 def _tmp_hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("OPENAI_IMAGE_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_BASE_URL", raising=False)
     yield tmp_path
 
 
@@ -137,7 +138,7 @@ class TestGenerate:
         assert request.headers["originator"] == "codex_cli_rs"
 
     @pytest.mark.parametrize("override", ["", "   "])
-    def test_blank_override_preserves_official_route(
+    def test_blank_override_keeps_canonical_endpoint(
         self, provider, codex_backend, monkeypatch, override,
     ):
         monkeypatch.setenv("HERMES_CODEX_BASE_URL", override)
@@ -317,3 +318,65 @@ class TestRegistration:
         codex_plugin.register(_Ctx())
         assert len(registered) == 1
         assert registered[0].name == "openai-codex"
+
+
+@pytest.mark.parametrize("source", ["singleton", "canonical-pool"])
+@pytest.mark.parametrize("edit", [False, True])
+def test_unconfigured_images_keep_canonical_endpoint_without_reselecting_credentials(
+    provider, codex_backend, monkeypatch, source, edit,
+):
+    from types import SimpleNamespace
+    from agent import auxiliary_client as aux
+
+    calls = []
+    row = SimpleNamespace(id="frozen", label="selected", runtime_api_key="pool-token",
+                          runtime_base_url="https://chatgpt.com/backend-api/codex")
+    def select(provider):
+        calls.append(provider)
+        return (True, row) if source == "canonical-pool" else (False, None)
+    monkeypatch.setattr(aux, "_select_pool_entry", select)
+    kwargs = {"image_url": "data:image/png;base64," + _b64_png()} if edit else {}
+    assert provider.generate("a cat", **kwargs)["success"]
+    (request,) = codex_backend["requests"]
+    path = "edits" if edit else "generations"
+    assert str(request.url) == f"https://chatgpt.com/backend-api/codex/images/{path}"
+    expected_token = "pool-token" if source == "canonical-pool" else "codex-token"
+    assert request.headers["Authorization"] == f"Bearer {expected_token}"
+    assert calls == ["openai-codex"]
+
+
+@pytest.mark.parametrize("source", ["scoped-env", "model-config", "pool-route"])
+def test_explicit_image_routes_preserve_the_resolved_token_and_host(
+    provider, codex_backend, tmp_path, monkeypatch, source,
+):
+    from types import SimpleNamespace
+    from agent import auxiliary_client as aux
+
+    canonical = "https://chatgpt.com/backend-api/codex"
+    expected = "https://own-pool.example/codex" if source == "pool-route" else canonical
+    row = SimpleNamespace(id="frozen", label="selected", runtime_api_key="pool-token",
+                          runtime_base_url=expected)
+    monkeypatch.setattr(aux, "_select_pool_entry", lambda provider: (True, row))
+    if source == "scoped-env":
+        monkeypatch.setenv("HERMES_CODEX_BASE_URL", canonical)
+    else:
+        # A model route must not replace a noncanonical pool row's own host.
+        configured = "https://ambient.example/codex" if source == "pool-route" else canonical
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  provider: openai-codex\n  base_url: " + configured + "\n")
+    assert provider.generate("a cat")["success"]
+    (request,) = codex_backend["requests"]
+    assert str(request.url) == expected + "/images/generations"
+    assert request.headers["Authorization"] == "Bearer pool-token"
+
+
+@pytest.mark.parametrize("model", ["", "gpt-5.5"])
+def test_scalar_model_config_keeps_canonical_image_endpoint(
+    provider, codex_backend, tmp_path, model,
+):
+    (tmp_path / "config.yaml").write_text("model: " + json.dumps(model) + "\n")
+
+    assert provider.generate("a cat")["success"] is True
+    (request,) = codex_backend["requests"]
+    assert str(request.url) == "https://chatgpt.com/backend-api/codex/images/generations"
+    assert request.headers["Authorization"] == "Bearer codex-token"

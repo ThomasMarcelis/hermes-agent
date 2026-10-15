@@ -70,7 +70,7 @@ def test_pool_rotation_evicts_client_built_with_revoked_credential(monkeypatch):
 
     pool = MagicMock()
     pool.has_credentials.return_value = True
-    pool.try_refresh_current.return_value = None
+    pool.try_refresh_matching.return_value = None
     pool.mark_exhausted_and_rotate.return_value = SimpleNamespace(id="fresh-oauth-entry")
     auth_error = Exception("revoked OAuth token")
     auth_error.status_code = 401
@@ -79,4 +79,13 @@ def test_pool_rotation_evicts_client_built_with_revoked_credential(monkeypatch):
         assert aux._recover_provider_pool("anthropic", auth_error, failed_api_key="revoked-token") is True
 
     assert stale_key not in aux._client_cache
-    pool.mark_exhausted_and_rotate.assert_called_once()
+    pool.try_refresh_matching.assert_called_once_with(
+        api_key_hint="revoked-token", credential_id=None,
+    )
+    pool.try_refresh_current.assert_not_called()
+    pool.mark_exhausted_and_rotate.assert_called_once_with(
+        status_code=401,
+        error_context={"message": "revoked OAuth token", "status_code": 401},
+        api_key_hint="revoked-token",
+        credential_id=None,
+    )

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from agent.codex_headers import CODEX_AUX_BASE_URL
 from typing import List, Optional
 
 from hermes_cli.route_identity import normalize_route_base_url
@@ -157,6 +158,49 @@ def _ranked_slugs(entries: object) -> list[str]:
     return _dedupe(slug for _, slug in sortable)
 
 
+def codex_discovery_base_url(fallback_base_url: str | None = None) -> str:
+    """Use the configured Codex route for discovery, preserving the legacy environment override."""
+    if fallback_base_url:
+        return str(fallback_base_url).strip().rstrip("/")
+    from agent.secret_scope import get_secret
+
+    env_url = (get_secret("HERMES_CODEX_BASE_URL") or "").strip().rstrip("/")
+    if env_url:
+        return env_url
+    from hermes_cli.config import load_config_readonly
+
+    model_cfg = load_config_readonly().get("model", {})
+    if isinstance(model_cfg, dict) and str(model_cfg.get("provider") or "").strip().lower() in {"codex", "openai-codex"}:
+        configured = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+        if configured:
+            return configured
+    return str(fallback_base_url or CODEX_AUX_BASE_URL).strip().rstrip("/")
+
+
+def get_resolved_codex_model_ids(*, required_base_url: str | None = None) -> list[str]:
+    """Read the credential and its catalog route together, without refreshing or persisting it.
+
+    A configured relay is terminal for discovery. A credential resolved to another route cannot
+    be retargeted to that relay, and must not make discovery fall back to its vendor host.
+    """
+    from hermes_cli.auth import _codex_access_token_is_expiring, resolve_codex_runtime_credentials
+
+    access_token, base_url = None, None
+    try:
+        creds = resolve_codex_runtime_credentials(read_only=True)
+        access_token, base_url = creds.get("api_key"), creds.get("base_url")
+        if _codex_access_token_is_expiring(access_token, 0):
+            access_token = None
+    except Exception:
+        access_token = None
+    endpoint = codex_discovery_base_url(base_url)
+    if required_base_url:
+        if normalize_route_base_url(endpoint) != normalize_route_base_url(required_base_url):
+            access_token = None
+        endpoint = required_base_url
+    return get_codex_model_ids(access_token=access_token, base_url=endpoint)
+
+
 def _fetch_models_from_api(access_token: str, base_url: Optional[str] = None) -> list[str]:
     """Fetch available models from the Codex API. Returns visible models sorted by priority.
 
@@ -184,12 +228,11 @@ def _fetch_models_from_api(access_token: str, base_url: Optional[str] = None) ->
     return _finalize_codex_models(_ranked_slugs(entries))
 
 
-def _read_default_model(codex_home: Path) -> Optional[str]:
+def _read_default_model(codex_home: Path) -> str | None:
     config_path = codex_home / "config.toml"
     if not config_path.exists():
         return None
     try:
-        import tomllib
         import tomllib
         payload = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
     except Exception:
@@ -211,22 +254,30 @@ def _read_cache_models(codex_home: Path) -> list[str]:
     return _ranked_slugs(entries if isinstance(entries, list) else [])
 
 
-def get_codex_model_ids(access_token: Optional[str] = None, base_url: Optional[str] = None) -> list[str]:
+def get_codex_model_ids(access_token: str | None = None, base_url: str | None = None) -> list[str]:
     """Available Codex model IDs: live API (if token) > config.toml default > local cache > defaults.
 
     Pass the ``base_url`` resolved together with ``access_token`` (runtime/pool route) so live
     discovery asks the credential's own host. Without a live answer the result is
     ``CuratedFallbackModels``: a cache placeholder that never replaces a verified catalog, since
     account-gated rows such as Astra are absent from the offline hints."""
+    endpoint = codex_discovery_base_url(base_url)
+    from providers.routes import endpoint_profile
+    profile = endpoint_profile(endpoint)
+    if profile is not None:
+        from hermes_cli.models_catalog_static import CuratedFallbackModels
+        from providers.routes import call_model_declaration
+        live = call_model_declaration(profile, "fetch_models", api_key=access_token, base_url=endpoint) if access_token else None
+        return live if live else CuratedFallbackModels(_finalize_codex_models(list(profile.fallback_models)))
     codex_home = Path(os.getenv("CODEX_HOME", "").strip() or str(Path.home() / ".codex")).expanduser()
     if access_token:
-        api_models = _fetch_models_from_api(access_token, base_url=base_url)
+        api_models = _fetch_models_from_api(access_token, base_url=endpoint)
         if api_models:
             return _finalize_codex_models(api_models)
     # Late: models_catalog_static builds its codex table from this module at import time.
     from hermes_cli.models_catalog_static import CuratedFallbackModels
 
     default_model = _read_default_model(codex_home)
-    return CuratedFallbackModels(_finalize_codex_models(_drop_undiscovered_astra(_dedupe([
-        *([default_model] if default_model else []), *_read_cache_models(codex_home),
-        *DEFAULT_CODEX_MODELS]))))
+    cached = [*([default_model] if default_model else []), *_read_cache_models(codex_home)]
+    models = _drop_undiscovered_astra(_dedupe([*cached, *DEFAULT_CODEX_MODELS]))
+    return CuratedFallbackModels(_finalize_codex_models(models))

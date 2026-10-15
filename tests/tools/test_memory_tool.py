@@ -851,7 +851,7 @@ class TestBomToleranceInMemoryFiles:
 
     def test_bom_is_stripped_from_first_entry(self, store, tmp_path):
         path = store._path_for("memory")
-        path.write_bytes("\ufeffFirst fact.".encode("utf-8"))
+        path.write_bytes("\ufeffFirst fact.".encode())
         raw, read_ok = MemoryStore._read_raw_checked(path)
         assert read_ok is True
         assert not raw.startswith("\ufeff")
@@ -859,7 +859,7 @@ class TestBomToleranceInMemoryFiles:
 
     def test_bom_file_add_keeps_existing_entry_intact(self, store):
         path = store._path_for("memory")
-        path.write_bytes("\ufeffExisting BOM fact.".encode("utf-8"))
+        path.write_bytes("\ufeffExisting BOM fact.".encode())
         result = store.add("memory", "A second fact.")
         assert result["success"] is True
         text = path.read_text(encoding="utf-8")
@@ -1000,6 +1000,57 @@ class TestBackgroundReviewDeleteGate:
         result = json.loads(memory_tool(action="remove", old_text="supervised turn", store=store))
         assert result["success"] is True
         assert "entry a supervised turn may remove" not in store._entries_for("memory")
+
+    def test_opt_in_config_applies_background_patch(self, store, monkeypatch):
+        import tools.memory_tool as mt
+        monkeypatch.setattr(mt, "_background_destructive_allowed", lambda: True)
+        original = "entry the opted-in fork may rewrite"
+        store.add("memory", original)
+        token = set_current_write_origin("background_review")
+        try:
+            result = json.loads(memory_tool(
+                action="patch", old_text=original, content="rewritten unattended", store=store))
+        finally:
+            reset_current_write_origin(token)
+        assert result["success"] is True
+        assert not result.get("staged")
+        assert "rewritten unattended" in store._entries_for("memory")
+
+    def test_opt_in_still_stages_whole_patch_of_undelimited_bulk_entry(self, store, tmp_path, monkeypatch):
+        # The safer span API still permits a whole-entry rewrite when old_text is the entry;
+        # an undelimited profile must keep the owned bulk-destruction guard.
+        import tools.memory_tool as mt
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(mt, "_background_destructive_allowed", lambda: True)
+        bulk = "Name and timezone.\n\nPrefers terse replies.\n\nCareer background and salary floor."
+        store.add("user", bulk)
+        token = set_current_write_origin("background_review")
+        try:
+            result = json.loads(memory_tool(
+                action="patch", target="user", old_text=bulk, content="Prefers terse.",
+                store=store))
+        finally:
+            reset_current_write_origin(token)
+        assert result["staged"] is True
+        assert bulk in store._entries_for("user")
+
+    def test_opt_in_still_stages_batch_touching_oversized_entry(self, store, tmp_path, monkeypatch):
+        import tools.memory_tool as mt
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(mt, "_background_destructive_allowed", lambda: True)
+        big = "x" * (store._char_limit("memory") // 2 + 1)
+        store.add("memory", "small rule")
+        store.add("memory", big)
+        token = set_current_write_origin("background_review")
+        try:
+            result = json.loads(memory_tool(operations=[
+                {"action": "patch", "old_text": "small rule", "content": "small rule v2"},
+                {"action": "remove", "old_text": "xxxx"},
+            ], store=store))
+        finally:
+            reset_current_write_origin(token)
+        assert result["staged"] is True
+        assert big in store._entries_for("memory")
 
     def test_attended_review_keeps_full_operation_set(self, store):
         # A user-requested /refine fork keeps the background_review origin (skill guards still

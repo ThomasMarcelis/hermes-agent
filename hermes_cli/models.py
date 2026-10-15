@@ -1402,25 +1402,9 @@ def _openai_discovery_base_url(provider: str) -> str:
 
 
 def _codex_catalog(normalized: str, force_refresh: bool) -> list[str]:
-    from hermes_cli.codex_models import get_codex_model_ids
+    from hermes_cli.codex_models import get_resolved_codex_model_ids
 
-    # Live OAuth token so the picker matches what ChatGPT lists for this account; hardcoded
-    # catalog without a token / when unreachable. Read-only (#68004): a picker never imports,
-    # refreshes or persists a credential, so an expired stored token means the hardcoded catalog
-    # until the runtime lease refreshes it.
-    # The token and the host it is routed to come from the same resolution (#121486): a pooled
-    # gateway key is only ever sent to that gateway, never to the chatgpt.com default.
-    base_url = None
-    try:
-        from hermes_cli.auth import _codex_access_token_is_expiring, resolve_codex_runtime_credentials
-
-        creds = resolve_codex_runtime_credentials(read_only=True)
-        access_token, base_url = creds.get("api_key"), creds.get("base_url")
-        if _codex_access_token_is_expiring(access_token, 0):
-            access_token = None
-    except Exception:
-        access_token = None
-    return get_codex_model_ids(access_token=access_token, base_url=base_url)
+    return get_resolved_codex_model_ids()
 
 
 _COPILOT_ACP_SESSION_MEMO_TTL = 300.0  # 5 min; SWR disk cache handles the rest
@@ -1769,11 +1753,16 @@ def _configured_relay_base_url(provider: str) -> str:
 
 
 def _relay_model_catalog(normalized: str, relay: str) -> Optional[list[str]]:
-    """Live catalog probed at a configured ``model.base_url`` relay, or None to fall through.
+    """Catalog at the configured relay, never a vendor endpoint on failure.
 
-    Returns only the relay's live ids (no curated merge): a relay user must see the relay's
-    catalog, and a failed/empty probe degrades to the canonical fetchers untouched.
+    API-key relays return only live ids; claimed Codex routes also supply curated picker hints.
     """
+    if normalized == "openai-codex":
+        from providers.routes import endpoint_profile
+        from hermes_cli.codex_models import get_resolved_codex_model_ids
+
+        if endpoint_profile(relay) is not None:
+            return get_resolved_codex_model_ids(required_base_url=relay)
     try:
         from providers import get_provider_profile
 
@@ -1992,14 +1981,16 @@ def _credential_fingerprint(provider: str) -> str:
         except Exception:
             pass
 
-    # Azure Foundry deployments are per-resource and the wizard writes only model.base_url, so a
-    # resource switch under the same key must not serve the previous resource's catalog (#27989).
+    # Azure resources and Codex endpoints own distinct model catalogs.
     if provider == "azure-foundry":
         try:
             from hermes_cli.runtime_provider import _config_base_url_for_provider
             parts.append(f"effective_base={_config_base_url_for_provider(_get_model_config_dict(), 'azure-foundry')}")
         except Exception:
             pass
+    if provider == "openai-codex":
+        from hermes_cli.codex_models import codex_discovery_base_url
+        parts.append(f"effective_base={codex_discovery_base_url()}")
 
     if provider == "ollama":
         provider_cfg = _get_provider_config_dict("ollama")
@@ -2098,8 +2089,16 @@ def _normalized_cache_slug(provider: Optional[str]) -> str:
 
 
 def _model_requires_account_discovery(provider: Optional[str], model: str) -> bool:
-    """Astra names cannot confer API/OAuth entitlement through picker state."""
-    return _normalized_cache_slug(provider) in {"openai", "openai-api", "openai-codex"} and is_astra_model(model)
+    """Official Astra names cannot confer entitlement; the configured local Codex proxy owns its catalog."""
+    normalized = _normalized_cache_slug(provider)
+    if normalized == "openai-codex":
+        from providers.routes import endpoint_profile
+        from hermes_cli.codex_models import codex_discovery_base_url
+
+        profile = endpoint_profile(codex_discovery_base_url())
+        if profile is not None and model in profile.fallback_models:
+            return False
+    return normalized in {"openai", "openai-api", "openai-codex"} and is_astra_model(model)
 
 
 def cached_provider_model_ids(
@@ -2881,6 +2880,11 @@ def fetch_api_models(
     api_mode: Optional[str] = None, headers: Optional[dict[str, str]] = None,
 ) -> Optional[list[str]]:
     """Fetch the list of available model IDs from the provider's ``/models`` endpoint."""
+    from providers.routes import call_model_declaration, endpoint_profile
+    profile = endpoint_profile(base_url or "")
+    if profile is not None:
+        return call_model_declaration(profile, "fetch_models", api_key=api_key, base_url=base_url,
+                                      timeout=timeout, headers=headers, api_mode=api_mode)
     result = probe_api_models(api_key, base_url, timeout=timeout, api_mode=api_mode, request_headers=headers)
     return result.get("models")
 

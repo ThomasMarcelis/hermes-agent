@@ -247,23 +247,40 @@ def _maybe_mirror_cron_delivery(
         )
 
 
-# chat_type slot a platform's adapter puts on a NON-DM in-thread reply. Discord (and the default)
-# key the shared "thread" lane; Slack, Matrix and Telegram (forum topics: ``_build_message_event``
-# types every supergroup "group") keep the parent channel/room's "group" — a seed on the wrong slot
-# is a row no reply ever resolves to (#111896, #112918).
+# chat_type slot used by each platform's adapter for an in-thread reply.
 _THREAD_REPLY_CHAT_TYPE = {"slack": "group", "matrix": "group", "telegram": "group"}
 
 
-def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Optional[str]:
-    """Open a thread for a continuable cron job via ``adapter.create_handoff_thread``. Returns the
-    thread_id, or ``None`` (no thread primitive / failed) = caller falls back to the DM mirror."""
+def _open_continuable_cron_thread(
+    job: dict, adapter, chat_id: str, loop, *,
+    thread_name: Optional[str] = None,
+    thread_auto_archive_duration: Optional[int] = None,
+) -> Optional[str]:
+    """Open a continuation thread or return None for the DM mirror fallback."""
     create_thread = getattr(adapter, "create_handoff_thread", None)
     if not callable(create_thread) or loop is None:
         return None
-    thread_name = f"Hermes — {_cron_display_name(job)}"
+    resolved_thread_name = thread_name or f"Hermes — {_cron_display_name(job)}"
     try:
         from agent.async_utils import safe_schedule_threadsafe
-        coro = create_thread(str(chat_id), thread_name)
+        import inspect
+
+        create_params = inspect.signature(create_thread).parameters
+        accepts_archive = (
+            "auto_archive_duration" in create_params
+            or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in create_params.values()
+            )
+        )
+        if thread_auto_archive_duration is not None and accepts_archive:
+            coro = create_thread(
+                str(chat_id),
+                resolved_thread_name,
+                auto_archive_duration=thread_auto_archive_duration,
+            )
+        else:
+            coro = create_thread(str(chat_id), resolved_thread_name)
         future = safe_schedule_threadsafe(coro, loop)  # type: ignore[arg-type]
         if future is None:
             return None
@@ -273,7 +290,8 @@ def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Opt
         logger.debug(
             "Job '%s': create_handoff_thread failed on %s — falling back to "
             "DM-session mirror: %s",
-            job.get("id", "?"), getattr(adapter, "name", "?"), e)
+            job.get("id", "?"), getattr(adapter, "name", "?"), e,
+        )
         return None
 
 
@@ -1111,6 +1129,72 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[d
     return targets
 
 
+def _truthy_delivery_option(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+
+def _format_discord_cron_thread_name(job: dict, template: str) -> str:
+    """Render a Discord-safe title for one cron run."""
+    now = _sched._hermes_now()
+    values = {
+        "job_id": str(job.get("id", "")),
+        "job_name": str(job.get("name") or job.get("id") or "Cron job"),
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M"),
+        "datetime": now.strftime("%Y-%m-%d %H:%M"),
+    }
+    try:
+        name = str(template or "").format(**values)
+    except (KeyError, ValueError, IndexError):
+        name = values["job_name"]
+    name = " ".join(name.split()).strip() or values["job_name"]
+    return name[:100]
+
+
+
+def _discord_thread_per_run_options(job: dict) -> Optional[dict]:
+    """Resolve the retained Discord thread-per-run delivery settings."""
+    delivery_options = job.get("delivery_options")
+    delivery_options = delivery_options if isinstance(delivery_options, dict) else {}
+    discord_options = delivery_options.get("discord")
+    discord_options = discord_options if isinstance(discord_options, dict) else {}
+
+    enabled = discord_options.get("thread_per_run", job.get("discord_thread_per_run"))
+    if not _truthy_delivery_option(enabled):
+        return None
+
+    template = (
+        discord_options.get("thread_name_template")
+        or discord_options.get("thread_title_template")
+        or job.get("discord_thread_name_template")
+        or job.get("discord_thread_title_template")
+        or "{job_name} — {date} {time}"
+    )
+    raw_archive = (
+        discord_options.get("thread_auto_archive_duration")
+        or job.get("discord_thread_auto_archive_duration")
+        or 1440
+    )
+    try:
+        archive = int(raw_archive)
+    except (TypeError, ValueError):
+        archive = 1440
+    if archive not in {60, 1440, 4320, 10080}:
+        archive = 1440
+    return {
+        "discord_thread_name": _format_discord_cron_thread_name(job, template),
+        "discord_thread_auto_archive_duration": archive,
+    }
+
+
+
 def _resolve_delivery_target(job: dict) -> Optional[dict]:
     """Resolve the concrete auto-delivery target for a cron job, if any."""
     targets = _resolve_delivery_targets(job)
@@ -1326,6 +1410,7 @@ class _TargetDelivery:
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
     live_error: Optional[str] = None  # the live lane's own rejection string, e.g. "send_path_degraded"
+    discord_thread_options: Optional[dict] = None
 
     @property
     def is_relay(self) -> bool:
@@ -1723,7 +1808,9 @@ def _standalone_send(
         # unstarted, and a wait_for wrapper created out here would be left never awaited.
         return await asyncio.wait_for(_send_to_platform(
             t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
-            media_files=media_files), timeout=send_timeout)
+            media_files=media_files,
+            **(t.discord_thread_options if t.discord_thread_options and not t.thread_id else {})),
+            timeout=send_timeout)
 
     def _warned(msg: str) -> tuple[None, str]:
         logger.warning("Job '%s': %s", job["id"], msg)
@@ -1851,6 +1938,10 @@ def _prepare_target_delivery(
     platform_name = target["platform"]
     chat_id = target["chat_id"]
     thread_id = target.get("thread_id")
+    discord_thread_options = (
+        _discord_thread_per_run_options(job)
+        if str(platform_name).lower() == "discord" and not thread_id else None
+    )
 
     origin = _resolve_origin(job) or {}
     origin_thread = origin.get("thread_id")
@@ -1921,22 +2012,27 @@ def _prepare_target_delivery(
         # on `inchannel_continuable` (SAME gate as the seed) AND `live_adapter_ready` (fallback
         # never seeds). Stay AFTER mirror_this_target/origin_user_id (need ORIGINAL thread_id).
         thread_id = None
+        # The explicit flat continuation surface owns this run; a thread-per-run option must
+        # not create a competing reply session or force the standalone sender.
+        discord_thread_options = None
 
     # Thread-preferred continuable cron: open a DEDICATED thread; its session is seeded after a
     # successful send. DM-only platforms return None → mirror the origin DM. in_channel SKIPS
     # this: it posts flat and _seed_cron_channel_session CREATES the session.
     opened_thread_id: Optional[str] = None
     if (
-        mirror_this_target
-        and not in_channel_surface
-        and runtime_adapter is not None
-        and loop is not None
+        live_adapter_ready
         and not thread_id  # never override an explicit origin thread/topic
+        and (discord_thread_options or (mirror_this_target and not in_channel_surface))
     ):
-        opened_thread_id = _open_continuable_cron_thread(
-            job, runtime_adapter, chat_id, loop) or None
-        if opened_thread_id:
-            thread_id = opened_thread_id
+        options = {} if not discord_thread_options else {
+            "thread_name": discord_thread_options["discord_thread_name"],
+            "thread_auto_archive_duration": discord_thread_options["discord_thread_auto_archive_duration"],
+        }
+        thread_id = _open_continuable_cron_thread(job, runtime_adapter, chat_id, loop, **options)
+        # Creating a visible thread is not consent to retain its transcript.
+        if mirror_this_target:
+            opened_thread_id = thread_id
     return _TargetDelivery(
         job=job, platform=platform, platform_name=platform_name, chat_id=chat_id,
         thread_id=thread_id, transport=transport, pconfig=pconfig, runtime_adapter=runtime_adapter,
@@ -1944,7 +2040,8 @@ def _prepare_target_delivery(
         origin=origin, origin_target=origin_target, origin_user_id=origin_user_id,
         is_dm_target=is_dm_target, mirror_text=mirror_text, mirror_this_target=mirror_this_target,
         in_channel_surface=in_channel_surface, inchannel_continuable=inchannel_continuable,
-        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
+        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready,
+        discord_thread_options=discord_thread_options)
 
 
 def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
@@ -2104,7 +2201,7 @@ def _deliver_result(
         if t is None:
             continue
         target_errors: list = []
-        delivered = t.live_adapter_ready and _deliver_via_live_adapter(
+        delivered = (t.live_adapter_ready and not (t.discord_thread_options and not t.thread_id)) and _deliver_via_live_adapter(
             t, cleaned_delivery_content, media_files,
             target_errors=target_errors, delivery_errors=delivery_errors,
             unverified_targets=unverified_targets,

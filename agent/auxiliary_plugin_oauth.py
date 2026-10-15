@@ -29,11 +29,12 @@ def resolve_plugin_oauth_client(req: Any) -> tuple[Any, Any]:
 
     provider = req.provider
     api_key = aux._normalize_api_key(req.explicit_api_key)
-    entry = None
+    selected = req.selected_pool
     if not api_key:
-        _exists, entry = aux._select_pool_entry(provider)
-        api_key = str(getattr(entry, "runtime_api_key", "") or "") if entry is not None else ""
-    base_url = (req.explicit_base_url or str(getattr(entry, "runtime_base_url", "") or "")
+        if selected is None:
+            selected = aux.auxiliary_pool.select_pool_context(provider)
+        api_key = selected.api_key
+    base_url = (req.explicit_base_url or (selected.base_url if selected is not None else "")
                 or _configured_endpoint(provider)).strip().rstrip("/")
     client = aux._api_key_profile_supplied_client(provider, api_key=api_key, base_url=base_url) if api_key else None
     if client is None:

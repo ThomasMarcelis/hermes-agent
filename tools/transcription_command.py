@@ -150,18 +150,14 @@ def _unregistered_stt_provider_error(provider: str) -> dict[str, Any]:
         error_type="provider_not_registered")
 
 
+_UNRESOLVED_PROVIDER = object()
+
+
 # --------------------------------------------------------------------------- Plugin provider dispatch
 # (issue follow-up to #30398 — STT pluggability)
 # ---------------------------------------------------------------------------
-def _dispatch_to_plugin_provider(
-    file_path: str, provider: str, stt_config: Optional[dict[str, Any]] = None, *,
-    model: Optional[str] = None, language: Optional[str] = None, prompt: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
-    """Route to a plugin-registered transcription provider; None when no plugin claims the name.
-    Invariants re-verified here so a caller refactor can't break them: built-in names never reach
-    the registry; a same-name command provider wins over a plugin. A matched plugin with
-    ``is_available() == False`` returns an error envelope — not None — because the user
-    explicitly opted in via ``stt.provider``. Provider exceptions become the error envelope."""
+def _get_plugin_provider(provider: str, stt_config: Optional[dict[str, Any]] = None):
+    """Resolve the same plugin for preprocessing and dispatch; built-ins/commands win."""
     key = (provider or "").lower().strip()
     if not key or key in _NON_COMMAND_STT_NAMES:
         return None
@@ -178,8 +174,24 @@ def _dispatch_to_plugin_provider(
             _ensure_plugins_discovered(force=True)
             plugin_provider = get_provider(key)
     except Exception as exc:
-        logger.debug("STT plugin dispatch skipped (discovery failed): %s", exc)
+        logger.debug("STT plugin dispatch skipped (discovery failed): %s", exc, exc_info=True)
         return None
+    return plugin_provider
+
+
+def _dispatch_to_plugin_provider(
+    file_path: str, provider: str, stt_config: Optional[dict[str, Any]] = None, *,
+    model: Optional[str] = None, language: Optional[str] = None, prompt: Optional[str] = None,
+    plugin_provider=_UNRESOLVED_PROVIDER,
+) -> Optional[dict[str, Any]]:
+    """Route to a plugin-registered transcription provider; None when no plugin claims the name.
+    The router or resolver preserves built-in/command precedence. An explicitly resolved
+    instance (including None) is retained for the whole recording. A matched plugin with
+    ``is_available() == False`` returns an error envelope — not None — because the user
+    explicitly opted in via ``stt.provider``. Provider exceptions become the error envelope."""
+    key = (provider or "").lower().strip()
+    if plugin_provider is _UNRESOLVED_PROVIDER:
+        plugin_provider = _get_plugin_provider(provider, stt_config)
     if plugin_provider is None:
         return None
     # ``is_available()`` MUST NOT raise per the ABC contract; defend anyway so

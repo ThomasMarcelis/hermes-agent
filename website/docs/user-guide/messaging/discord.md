@@ -461,6 +461,25 @@ Requires `discord.auto_thread: true` (with it off, nothing threads anywhere). [`
 
 `DISCORD_FREE_RESPONSE_AUTO_THREAD` wins over the `config.yaml` key when both are set — the YAML value only seeds the env var when it isn't already set, like every other `discord.*` bridge.
 
+#### Migrating `discord.thread_free_response_channels`
+
+For new configurations, use `free_response_channels` with
+`free_response_auto_thread: true` and `auto_thread: true`. Add channels that
+should stay inline to `no_thread_channels`.
+
+The owned fork still accepts `thread_free_response_channels` (and the legacy
+`DISCORD_THREAD_FREE_RESPONSE_CHANNELS` spelling). This category waives mentions
+**only in the parent channel**, while keeping auto-threading enabled there. Native
+`free_response_channels` also exempts existing child threads, even when
+`thread_require_mention: true`. Keep the legacy category when those threads must
+still require mentions. It also does not add channels to the native free-response
+backfill scope. No automatic rewrite is performed.
+
+If migrating a mix of inline and threaded free-response channels, first add the
+inline channels to `no_thread_channels`, then enable `free_response_auto_thread`.
+Review child-thread mention and backfill behavior before moving legacy entries;
+the two categories are not interchangeable.
+
 #### `discord.auto_thread`
 
 **Type:** boolean — **Default:** `true`
@@ -625,8 +644,14 @@ display:
 
 - `off` — no progress messages
 - `new` — only show the first tool call per turn
-- `all` — show all tool calls (truncated to 40 characters in gateway messages)
+- `all` — show all tool calls; on Discord the default preview length is `0` (no content cap),
+  so a terminal command retains all lines in a fenced block. Long progress rolls into
+  platform-sized messages; a pathological single preview has an explicit delivery-limit notice.
 - `verbose` — show full tool call details (can produce long messages)
+
+Set `display.platforms.discord.tool_preview_length` to a positive number to opt into
+compact previews; terminal commands then show a capped first line. Other platforms retain
+their own defaults. Secret-shaped values are redacted before previews are capped or delivered.
 
 #### `display.tool_progress_command`
 

@@ -1261,6 +1261,7 @@ def _memory_provider_init_kwargs(agent, platform) -> dict[str, Any]:
     gateway status travels a different path and the indicator no-ops without it)."""
     kwargs = {
         "session_id": agent.session_id,
+        "parent_session_id": agent._parent_session_id or "",
         "platform": platform or "cli",
         "hermes_home": str(get_hermes_home()),
         # platform="cron" (scheduler) / "subagent" (delegate_task) → providers skip writes (MemoryProvider.initialize).
@@ -1967,9 +1968,6 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         # External engines own compaction policy — the host threshold (and its Codex
         # autoraise) never reaches the plugin, so drop the notice.
         agent._compression_threshold_autoraised = None
-        # External engines own compaction policy: the host compression threshold (including the Codex
-        # gpt-5.5 autoraise above) only configures the built-in ContextCompressor and never reaches the
-        # plugin, so the autoraise notice would announce a change that does not apply. (#44439)
         from agent.model_metadata import get_model_context_length
         _plugin_ctx_len = get_model_context_length(
             agent.model, base_url=agent.base_url, api_key=getattr(agent, "api_key", ""),
@@ -2032,9 +2030,10 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.codex_responses_native_compaction = cs.codex_responses_native
     agent.codex_responses_compact_threshold = cs.codex_responses_compact_threshold
     from agent.native_compaction import resolve_native_compaction_capabilities
+    from agent.codex_responses_adapter import classify_responses_route
     agent.runtime_capabilities = resolve_native_compaction_capabilities(
         model=agent.model, base_url=agent.base_url, provider=agent.provider,
-        is_codex_backend=(agent.provider or "").strip().lower() == "openai-codex",
+        is_codex_backend=classify_responses_route(agent).is_codex_backend,
     )
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds

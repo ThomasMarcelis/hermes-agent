@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
@@ -32,6 +33,7 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_SESSION_SWITCH_TIMEOUT_S = 5.0
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -411,6 +413,9 @@ class MemoryManager:
         # the builtin-only path spawns no threads; one worker serializes a provider's writes.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
         self._sync_executor_lock = threading.Lock()
+        self._sync_worker = threading.local()
+        self._session_switch_lock = threading.RLock()
+        self._session_switch_future: Optional[Future] = None
         # Futures by durability class ("write" / "prefetch") so shutdown can drain FIFO
         # within a bound, then report exactly what it abandoned.
         self._background_futures: dict[Future, str] = {}
@@ -516,6 +521,7 @@ class MemoryManager:
         clean_query = _redact_for_provider(clean_query)
         parts = self._each_provider(
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
+            providers=self._session_ready_providers(),
         )
         return "\n\n".join(p for p in parts if p and p.strip())
 
@@ -632,7 +638,17 @@ class MemoryManager:
         """Queue ``fn`` on the serialized worker (created lazily; None once shutting down) and track its
         durability class. Runs under the caller's contextvars (``ctx_bound``). If the executor is
         unavailable outside shutdown, run inline — the historical fail-safe."""
-        fn = ctx_bound(fn)
+        task = fn
+
+        def _run() -> Any:
+            previous = getattr(self._sync_worker, "active", False)
+            self._sync_worker.active = True
+            try:
+                return task()
+            finally:
+                self._sync_worker.active = previous
+
+        fn = ctx_bound(_run)
         executor = None if self._shutting_down else self._sync_executor
         if executor is None and not self._shutting_down:
             with self._sync_executor_lock:
@@ -672,15 +688,56 @@ class MemoryManager:
             self._background_futures.pop(future, None)
 
     def flush_pending(self, timeout: Optional[float] = None) -> bool:
-        """Block until queued sync/prefetch work has drained (False on timeout).
-        With a single worker, a sentinel task completing proves every earlier task ran."""
+        """Block until manager and provider-owned background work has drained.
+
+        Single-worker executor means submitting a sentinel and waiting on
+        it guarantees every previously-submitted manager task has run. Some
+        providers accept work into their own writer/remote-operation queues,
+        so the same deadline is then forwarded to an optional duck-typed
+        ``drain_pending(timeout=remaining)`` hook. Returns False on any
+        timeout/error; one provider cannot silently extend the caller's budget.
+        """
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+
+        def _remaining() -> Optional[float]:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.monotonic())
+
         executor = self._sync_executor
-        if executor is None:
-            return True
-        try:
-            executor.submit(lambda: None).result(timeout=timeout)
-        except Exception as e:
-            return isinstance(e, RuntimeError)  # executor already shut down — nothing pending
+        if executor is not None:
+            try:
+                fut = executor.submit(lambda: None)
+            except RuntimeError:
+                # Executor already shut down — its queue is no longer an
+                # admissible source of work, but provider-owned queues may
+                # still need their durability barrier below.
+                fut = None
+            if fut is not None:
+                try:
+                    fut.result(timeout=_remaining())
+                except Exception as exc:
+                    logger.warning("Memory manager drain timed out or failed: %s", exc)
+                    return False
+
+        for provider in list(self._providers):
+            drain = getattr(provider, "drain_pending", None)
+            if not callable(drain):
+                continue
+            try:
+                if drain(timeout=_remaining()) is False:
+                    logger.warning(
+                        "Memory provider '%s' did not drain pending durable work",
+                        provider.name,
+                    )
+                    return False
+            except Exception as exc:
+                logger.warning(
+                    "Memory provider '%s' drain_pending failed: %s",
+                    provider.name,
+                    exc,
+                )
+                return False
         return True
 
     def get_all_tool_schemas(self) -> list[dict[str, Any]]:
@@ -717,6 +774,8 @@ class MemoryManager:
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
+        if provider not in self._session_ready_providers():
+            return tool_error(f"Memory provider '{provider.name}' session switch is pending or failed; retry after rebinding")
         args = _redact_for_provider(args)
         from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
         try:
@@ -737,7 +796,7 @@ class MemoryManager:
             accepted = kwargs if params is None or _has_var_kwargs(params) else {k: v for k, v in kwargs.items() if k in params}
             p.on_turn_start(turn_number, message, **accepted)
 
-        self._each_provider("on_turn_start failed", _tick)
+        self._each_provider("on_turn_start failed", _tick, providers=self._session_ready_providers())
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         messages = _redact_messages_for_egress(messages or [])
@@ -765,31 +824,102 @@ class MemoryManager:
             return
         snapshot = list(messages or [])
 
-        def _run() -> None:  # both hooks already guard per-provider
+        def _run() -> list[MemoryProvider]:  # both hooks already guard per-provider
             try:
                 self.on_session_end(snapshot)
             except Exception as e:  # pragma: no cover
                 logger.warning("Session-boundary extraction failed: %s", e)
-            try:
-                self.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=True, reason=reason)
-            except Exception as e:  # pragma: no cover
-                logger.warning("Session-boundary switch failed: %s", e)
+            return self.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=True, reason=reason)
 
-        self._submit_background(_run)
+        self._submit_session_switch(_run)
+
+    def queue_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Serialize a provider rebind behind all previously queued writes.
+
+        Providers cache session ownership internally. Calling their switch hook
+        inline can therefore overtake an end-of-turn write already admitted to
+        the manager executor and retarget it to the new session. Session-only
+        contextvars are captured by :meth:`_submit_background` at admission.
+        """
+        if not new_session_id or not self._providers:
+            return
+
+        def _run() -> list[MemoryProvider]:
+            switch_kwargs = dict(kwargs)
+            if rewound:
+                switch_kwargs["rewound"] = True
+            return self.on_session_switch(
+                new_session_id,
+                parent_session_id=parent_session_id,
+                reset=reset,
+                **switch_kwargs,
+            )
+
+        self._submit_session_switch(_run)
+
+    def _submit_session_switch(self, switch: Callable[[], list[MemoryProvider]]) -> None:
+        """Publish the fence before admission, including the inline executor fallback."""
+        completion: Future = Future()
+
+        def _run() -> None:
+            try:
+                completion.set_result(switch())
+            except Exception as exc:
+                completion.set_exception(exc)
+                logger.warning("Memory session switch failed: %s", exc, exc_info=True)
+
+        with self._session_switch_lock:
+            self._session_switch_future = completion
+            self._submit_background(_run, kind="write")
+
+    def _session_ready_providers(self) -> list[MemoryProvider]:
+        """Bound foreground waiting; a failed/timed-out rebind never exposes the old bank.
+
+        Queued work keeps its admission scope and FIFO position. A callback from that worker
+        cannot wait for a switch behind itself, so it withholds foreground access instead.
+        """
+        deadline = time.monotonic() + _SESSION_SWITCH_TIMEOUT_S
+        while True:
+            # Do not take the admission lock: its inline fallback may be running
+            # a slow provider. Waiting on the published Future stays bounded.
+            completion = self._session_switch_future
+            if completion is None:
+                return list(self._providers)
+            if not completion.done() and getattr(self._sync_worker, "active", False):
+                return []
+            try:
+                ready = completion.result(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception as exc:
+                logger.warning("Memory session switch pending or failed; withholding foreground calls: %s", exc, exc_info=True)
+                return []
+            if completion is self._session_switch_future:
+                return ready
+            if time.monotonic() >= deadline:
+                return []
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
-                          rewound: bool = False, **kwargs) -> None:
+                          rewound: bool = False, **kwargs) -> list[MemoryProvider]:
         """Notify providers that ``AIAgent.session_id`` rotated without teardown
         (``/resume``, ``/branch``, ``/reset``, ``/new``, compression). ``rewound=True``
-        (``/undo``): same id, truncated transcript."""
+        (``/undo``): same id, truncated transcript. Return successfully rebound providers."""
         if not new_session_id:
-            return
+            return list(self._providers)
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
-        self._each_provider(
-            "on_session_switch failed",
-            lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=reset, **kwargs),
-        )
+
+        def _switch(provider: MemoryProvider) -> MemoryProvider:
+            provider.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=reset, **kwargs)
+            return provider
+
+        return self._each_provider("on_session_switch failed", _switch)
 
     @staticmethod
     def _checkpoint_api_version(provider: MemoryProvider) -> Optional[int]:

@@ -8,6 +8,10 @@ for scoped writes) keep writing into the old session's record.
 """
 
 
+import contextvars
+import threading
+
+import pytest
 
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
@@ -107,6 +111,99 @@ def test_manager_isolates_provider_failures():
     assert good.switch_calls[0]["new"] == "new-sid"
 
 
-# ---------------------------------------------------------------------------
-# MemoryManager.sync_all / queue_prefetch_all — session_id propagation
-# ---------------------------------------------------------------------------
+def test_queued_switch_runs_after_write_with_caller_contexts():
+    """Writes and ownership changes share one FIFO and retain admission context."""
+    scope = contextvars.ContextVar("memory-switch-scope", default="missing")
+    calls = []
+
+    class _ContextProvider(_RecordingProvider):
+        def sync_turn(self, user_content, assistant_content, *, session_id=""):
+            calls.append(("write", session_id, scope.get()))
+
+        def on_session_switch(self, new_session_id, **kwargs):  # type: ignore[override]
+            calls.append(("switch", new_session_id, scope.get(), dict(kwargs)))
+
+    mm = MemoryManager()
+    mm.add_provider(_ContextProvider())
+
+    token = scope.set("write-context")
+    try:
+        mm.sync_all("old user", "old assistant", session_id="old-sid")
+    finally:
+        scope.reset(token)
+    token = scope.set("switch-context")
+    try:
+        mm.queue_session_switch(
+            "new-sid",
+            parent_session_id="old-sid",
+            reason="resume",
+        )
+    finally:
+        scope.reset(token)
+
+    assert mm.flush_pending(timeout=2.0)
+    assert calls == [
+        ("write", "old-sid", "write-context"),
+        (
+            "switch",
+            "new-sid",
+            "switch-context",
+            {"parent_session_id": "old-sid", "reset": False, "reason": "resume"},
+        ),
+    ]
+
+
+def test_queued_switch_only_forwards_rewound_when_true():
+    mm = MemoryManager()
+    provider = _RecordingProvider()
+    mm.add_provider(provider)
+
+    mm.queue_session_switch("next", rewound=False)
+    mm.queue_session_switch("next", rewound=True)
+
+    assert mm.flush_pending(timeout=2.0)
+    assert provider.switch_calls[0]["extra"] == {}
+    assert provider.switch_calls[1]["extra"] == {"rewound": True}
+
+
+def test_flush_pending_shares_one_deadline_with_provider_drain():
+    started = threading.Event()
+    release = threading.Event()
+
+    class _DrainingProvider(_RecordingProvider):
+        def __init__(self):
+            super().__init__()
+            self.drain_timeouts = []
+
+        def sync_turn(self, *args, **kwargs):  # type: ignore[override]
+            started.set()
+            assert release.wait(timeout=1.0)
+
+        def drain_pending(self, *, timeout=None):
+            self.drain_timeouts.append(timeout)
+            return True
+
+    mm = MemoryManager()
+    provider = _DrainingProvider()
+    mm.add_provider(provider)
+    mm.sync_all("u", "a")
+    assert started.wait(timeout=1.0)
+    threading.Timer(0.08, release.set).start()
+
+    assert mm.flush_pending(timeout=0.3)
+    assert len(provider.drain_timeouts) == 1
+    assert 0.0 <= provider.drain_timeouts[0] < 0.27
+
+
+@pytest.mark.parametrize("outcome", [False, RuntimeError("drain failed")])
+def test_flush_pending_reports_provider_drain_failure(outcome):
+    class _DrainingProvider(_RecordingProvider):
+        def drain_pending(self, *, timeout=None):
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    mm = MemoryManager()
+    mm.add_provider(_DrainingProvider())
+
+    assert mm.flush_pending(timeout=0.2) is False

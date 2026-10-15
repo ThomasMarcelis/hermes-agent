@@ -754,24 +754,39 @@ class TestValidateRequestedModelNousPortalRecommendations:
         )
         assert result["accepted"] is True
 
-    def test_non_nous_provider_does_not_consult_portal_feed(self):
-        """This fallback tier is Nous-specific; a non-Nous provider must
-        not have its rejection changed by (or trigger a call to) the Nous
-        Portal feed."""
-        probe_payload = {
-            "models": ["some/other-model"],
-            "probed_url": "https://api.example.com/v1/models",
-            "resolved_base_url": "https://api.example.com/v1",
-            "suggested_base_url": None,
-            "used_fallback": False,
-        }
-        with patch("hermes_cli.models.fetch_api_models", return_value=["some/other-model"]), \
-             patch("hermes_cli.models.probe_api_models", return_value=probe_payload), \
-             patch("hermes_cli.models.fetch_nous_recommended_models") as mock_portal, \
-             patch("hermes_cli.models._model_in_provider_catalog", return_value=False):
-            result = validate_requested_model("inclusionai/ling-3.0-flash:free", "openrouter")
+    @pytest.mark.parametrize("profile_models,api_models,expected", [
+        pytest.param([], ["some/other-model"], (False, False, False), id="live-missing"),
+        pytest.param([], ["fixture/portal-model"], (True, True, True), id="live-present"),
+        pytest.param(["fixture/portal-model"], ["some/other-model"], (True, True, True), id="profile-present"),
+        pytest.param(["some/other-model"], ["fixture/portal-model"], (True, True, True), id="profile-miss-live-present"),
+        pytest.param([], None, (True, True, False), id="catalog-unavailable"),
+        pytest.param(["some/other-model"], None, (True, True, False), id="unlisted-offline"),
+    ])
+    def test_non_nous_provider_does_not_consult_portal_feed(self, profile_models, api_models, expected):
+        """OpenRouter uses its own catalogs; Nous recommendations cannot change any verdict."""
+        requested = "fixture/portal-model"
+        with (
+            # The profile catalog precedes the generic listing. Pin both so neither live data
+            # nor the bundled OpenRouter snapshot can preempt the branch under test.
+            patch("hermes_cli.models.provider_model_ids", return_value=profile_models) as mock_profile,
+            patch("hermes_cli.models.fetch_api_models", return_value=api_models) as mock_api,
+            patch("hermes_cli.models.fetch_nous_recommended_models", return_value={
+                "freeRecommendedModels": [{"modelName": requested}],
+            }) as mock_portal,
+            patch("hermes_cli.models._model_in_provider_catalog", return_value=False),
+        ):
+            result = validate_requested_model(requested, "openrouter")
         mock_portal.assert_not_called()
-        assert result["accepted"] is False
+        mock_profile.assert_any_call("openrouter")
+        if requested in profile_models:
+            mock_api.assert_not_called()
+        else:
+            mock_api.assert_called_once_with(None, None)
+        assert (result["accepted"], result["persist"], result["recognized"]) == expected
+        if expected[2]:
+            assert result["message"] is None
+        else:
+            assert requested in result["message"]
 
 
 # -- validate — custom endpoint fallback when /models is unreachable (#12220) --

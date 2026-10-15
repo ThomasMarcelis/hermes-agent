@@ -541,8 +541,8 @@
           "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.14.7+20260901-aarch64-unknown-linux-musl-install_only.tar.gz"
         },
         "linux-x64": {
-          "sha256": "0ab3305457051cd3e7c031857e005f1bda17c218a1990567dacaaac6dd1d14f0",
-          "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.14.7+20260901-x86_64-unknown-linux-gnu-install_only.tar.gz"
+          "sha256": "9235341d1f595bb5d5d71f6ec42e56f30787b3ff51c854f64628e3fe4475976e",
+          "url": "file:///home/thomasmarcelis/.hermes/artifacts/python-jd-sqlite3534/cpython-3.14.7%2B20260901.jd-sqlite3534-x86_64-unknown-linux-gnu-install_only.tar.gz"
         },
         "linux-x64-musl": {
           "sha256": "75fe4a23502144a343c5c1f27df592ebca085b669fe665394e1812e37bcae258",
@@ -557,7 +557,7 @@
           "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.14.7+20260901-x86_64-pc-windows-msvc-install_only.tar.gz"
         }
       },
-      "version": "3.14.7+20260901"
+      "version": "3.14.7+20260901.jd-sqlite3534"
     },
     "ripgrep": {
       "artifacts": {

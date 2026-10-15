@@ -607,6 +607,49 @@ blocks discovery of the other providers.
 
 See [Building a Hermes Plugin](./plugins/index.md#distribute-via-pip) for the full entry-points setup.
 
+## Endpoint-qualified declarations
+
+A provider may override `matches_endpoint(base_url)` to claim policy for an exact
+endpoint used by native or custom routes. This does not transfer credential
+ownership: the route still owns its provider name, selected pool row, token,
+cache revision and failure attribution. Claims must be cheap, deterministic,
+credential-free and precise about scheme, host, port and path. Set
+`infer_from_hostname=False` for a shared host such as loopback; those endpoints
+must not participate in hostname inference or make persisted routes appear foreign to another provider.
+
+Matched profiles supply their live `fetch_models`, offline `fallback_models`, context bound,
+request projection and supported effort vocabulary. Context declarations may
+accept optional keyword-only `base_url` and `api_key`; the dispatcher inspects
+the signature, so existing `get_model_context_length(model)` overrides continue
+to work. The auxiliary request assembler and Responses adapter honor the same
+effort declaration as the primary transport, including the empty tuple meaning
+that reasoning fields must be omitted. Direct OpenAI API wire constraints retain
+precedence over a custom route's declarations.
+
+`request_compression(base_url)` may return `"zstd"` for a verified endpoint that
+accepts compressed Responses requests; the default is `None`. The shared encoder
+still gates POST `/responses`, leaves existing encodings intact, and falls back
+to raw JSON when the codec is unavailable. This does not opt image-generation or
+compaction requests into compression.
+
+`fallback_model_metadata(model)` returns an optional models.dev-shaped dictionary
+(`limit`, `modalities`, `tool_call`, `reasoning`, etc.) without I/O. It only fills a
+catalog miss; live catalog entries and explicit user overrides win. Use existing
+`model_capabilities` for intentional patches to catalog data instead. Runtime
+context selection still gives explicit user configuration priority over the
+provider's live context declaration.
+
+`responses_backend(base_url)` may return `"codex"` to apply existing Codex request
+shape, session-header, tool and compaction eligibility rules to a claimed endpoint.
+It never changes the credential/provider identity or enables a model's otherwise
+ineligible native compaction. The default is `None`.
+
+Catalog declarations may accept optional `headers` and `api_mode` keywords.
+`fetch_api_models` returns `None` when live discovery is unavailable; curated hints
+belong to the picker fallback path and must not become successful validation.
+Declaration exceptions raise `ProviderDeclarationError` with the provider and
+method name; they do not silently substitute a context bound or effort level.
+
 ## Related pages
 
 - [Provider Runtime](./provider-runtime.md) — resolution precedence + where each layer reads the profile

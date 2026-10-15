@@ -20,8 +20,8 @@ from typing import Optional, Sequence
 _KIMI_K3_SLUG_RE = re.compile(r"(?:^|[^a-z0-9])k3(?:[^a-z0-9]|$)")
 
 # Canonical low→high ordering for nearest-level clamping. Includes "none" so an explicit
-# disable can be clamped when a provider publishes it as a level. ``ultra`` is Hermes-internal
-# (the Codex product tier): no wire accepts it, every declared set stops at ``max``.
+# disable can be clamped when a provider publishes it. Core sets stop at ``max``;
+# ``ultra`` reaches a wire only when its provider declares it (or via the app-server harness).
 EFFORT_LADDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 #: Widest OpenAI-compatible wire vocabulary (OpenRouter, Nous Portal).
@@ -159,27 +159,30 @@ def clamp_effort(
 
 def route_supported_efforts(
     provider: Optional[str], model: Optional[str], api_mode: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> tuple[str, ...]:
     """Levels the (provider, model) route's ENTRY clamp accepts: the Codex/OpenAI Responses set per
     model generation, else the widest OpenAI-compatible vocabulary (narrower providers clamp again
     downstream, never upward). On the Codex app-server runtime ``ultra`` is codex's own harness mode,
     accepted wherever the model's ladder reaches ``max`` (codex runs it at ``max``; a model without
     ``max`` rejects it), so it is sent verbatim there."""
-    if (provider or "").strip().lower() == "openai-codex":
-        supported = codex_supported_efforts(model)
-        return (*supported, "ultra") if api_mode == "codex_app_server" and "max" in supported else supported
-    return OPENAI_COMPAT_WIRE_EFFORTS
+    from agent.transports.codex import _profile_declared_efforts
+    declared = _profile_declared_efforts(provider, model, base_url)
+    native = (provider or "").strip().lower() == "openai-codex"
+    supported = declared if declared is not None else codex_supported_efforts(model) if native else OPENAI_COMPAT_WIRE_EFFORTS
+    return (*supported, "ultra") if native and api_mode == "codex_app_server" and "max" in supported and "ultra" not in supported else supported
 
 
 def effort_display_label(
     effort: Optional[str], provider: Optional[str] = None, model: Optional[str] = None,
     api_mode: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> str:
     """Picker / ``/reasoning`` status label for a ladder level: the level itself when the route sends
     it verbatim, else ``"<level> (sends <clamped> on this route)"`` so a Hermes-internal step such as
     ``ultra`` (#61634) is never presented as a distinct wire level the route does not have."""
     requested = str(effort or "").strip().lower()
-    clamped = clamp_effort(requested, route_supported_efforts(provider, model, api_mode))
+    clamped = clamp_effort(requested, route_supported_efforts(provider, model, api_mode, base_url))
     return requested if not requested or clamped == requested else f"{requested} (sends {clamped} on this route)"
 
 
@@ -216,8 +219,8 @@ def clamp_reasoning_config(reasoning_config: Optional[dict], supported: Sequence
     configs without an effort pass through untouched).
 
     The entry clamp for an OpenAI-compatible chat-completions request builder: Hermes-internal
-    ``ultra`` never reaches a wire (#89503 main transport, #112010 aux/MoA), while provider
-    profiles with narrower vocabularies clamp again downstream. Unset stays unset.
+    ``ultra`` requires a provider declaration; profiles with narrower vocabularies
+    clamp again downstream. Unset stays unset.
     """
     if not isinstance(reasoning_config, dict):
         return reasoning_config

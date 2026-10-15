@@ -809,10 +809,12 @@ def _rewind_active_session_history(
                 session_key, user_ordinal, warm_history=history, require_retryable=require_retryable,
                 adopt_row_ids=True)
         installed, live_view, rewound_count = outcome.prefix, outcome.live_view, outcome.rewound_count
+        rewound_uids = outcome.rewound_message_uids
     else:
         target_index = user_indices[user_ordinal]
         installed, live_view = history_before_user_originated_turn(history, target_index)
         rewound_count = len(history) - target_index
+        rewound_uids = tuple(m["message_uid"] for m in history[target_index:] if m.get("message_uid"))
         if require_retryable:
             retryable_user_text(live_view.get("content"))
 
@@ -826,6 +828,23 @@ def _rewind_active_session_history(
             agent._last_flushed_db_idx = len(installed) if session_key else 0
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = installed[:] if session_key else None
+        # Every rewind entry point (session.undo, command.dispatch /undo and
+        # /retry, rollback) must invalidate the same agent-owned state.
+        memory_manager = getattr(agent, "_memory_manager", None)
+        memory_session_id = session_key or getattr(agent, "session_id", "")
+        with contextlib.suppress(Exception):
+            if memory_manager is not None and memory_session_id:
+                memory_manager.queue_session_switch(
+                    memory_session_id,
+                    parent_session_id="",
+                    reset=False,
+                    rewound=True,
+                    rewound_turns=len(user_indices) - user_ordinal,
+                    rewound_message_uids=rewound_uids,
+                )
+        with contextlib.suppress(Exception):
+            if hasattr(agent, "_invalidate_system_prompt"):
+                agent._invalidate_system_prompt()
     return installed, live_view, rewound_count
 
 

@@ -48,7 +48,7 @@ def approval_input_words(input_key: str) -> tuple[str, ...]:
 logger = logging.getLogger("gateway.run")
 
 
-def _strip_slot(text: str, slot: str) -> Optional[str]:
+def _strip_slot(text: str, slot: str) -> str | None:
     """Remainder after ``slot`` when ``text`` starts with it as a WHOLE slot, else None.
 
     The ``:``-delimited slot layout is ``build_session_key``'s: an id that merely starts with another
@@ -68,8 +68,8 @@ def _tail_has_slot(tail: str, slot: str) -> bool:
 
 
 def _same_chat_key_slots(
-    key: str, *, prefix: str, chat_id: str, scope_id: Optional[str],
-) -> Optional[tuple[str, str]]:
+    key: str, *, prefix: str, chat_id: str, scope_id: str | None,
+) -> tuple[str, str] | None:
     """``(chat_type, tail)`` when ``key`` names the SAME chat as ``prefix`` + ``chat_id``, else None.
 
     ``prefix`` is the key's fixed-shape head, ``agent:<profile>:<platform>:``. Everything after it is
@@ -92,7 +92,7 @@ def _same_chat_key_slots(
 class GatewayBusySessionMixin:
     """Busy-session queueing, slot claims, slash dispatch tables, destructive-slash confirmation."""
 
-    def _queue_during_drain_enabled(self, busy_input_mode: Optional[str] = None) -> bool:
+    def _queue_during_drain_enabled(self, busy_input_mode: str | None = None) -> bool:
         # "queue"/"steer" mean messages survive a restart (queued for the new process); "interrupt" drops.
         mode = busy_input_mode or self._busy_input_mode
         return self._restart_requested and mode in {"queue", "steer"}
@@ -114,8 +114,8 @@ class GatewayBusySessionMixin:
         queued_event._gateway_accepted = True
 
     def _promote_queued_event(
-        self, session_key: str, adapter: Any, pending_event: Optional[MessageEvent]
-    ) -> Optional[MessageEvent]:
+        self, session_key: str, adapter: Any, pending_event: MessageEvent | None
+    ) -> MessageEvent | None:
         """Promote the next overflow item after the slot drained.
 
         ``pending_event`` None → the overflow head becomes the pending event; otherwise the head is
@@ -138,7 +138,7 @@ class GatewayBusySessionMixin:
             depth += 1
         return depth
 
-    def _rescue_orphaned_overflow(self, session_key: str, adapter: Any) -> Optional[MessageEvent]:
+    def _rescue_orphaned_overflow(self, session_key: str, adapter: Any) -> MessageEvent | None:
         """Pop the oldest orphaned FIFO overflow event for an idle session (None if nothing to rescue).
 
         ``queued_events`` drains only at the post-turn promotion site; a busy window ending without
@@ -210,7 +210,7 @@ class GatewayBusySessionMixin:
             logger.debug("goal continuation: active-state recheck failed: %s", exc)
             return False
 
-    def _get_max_concurrent_sessions(self) -> Optional[int]:
+    def _get_max_concurrent_sessions(self) -> int | None:
         """Return the configured active chat session cap, if enabled."""
         try:
             from hermes_cli.active_sessions import resolve_max_concurrent_sessions
@@ -218,7 +218,7 @@ class GatewayBusySessionMixin:
         except Exception:
             return None
 
-    def _active_session_limit_message(self, session_key: str) -> Optional[str]:
+    def _active_session_limit_message(self, session_key: str) -> str | None:
         """Return a user-facing rejection when starting a new session exceeds the cap."""
         max_sessions = self._get_max_concurrent_sessions()
         if max_sessions is None or self._is_session_running(session_key):
@@ -231,7 +231,7 @@ class GatewayBusySessionMixin:
 
     def _claim_active_session_slot(
         self, session_key: str, source: SessionSource
-    ) -> tuple[Any, Optional[str]]:
+    ) -> tuple[Any, str | None]:
         """Claim a cross-process active-session slot for a new gateway turn."""
         if self._is_session_running(session_key):
             return None, None
@@ -369,6 +369,7 @@ class GatewayBusySessionMixin:
     _SECURITY_METADATA_KEYS = (
         "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
         "gateway_session_id", "gateway_session_strict", "gateway_proven_session_id",
+        "gateway_session_message_route",
         "notification_category",
     )
 
@@ -640,7 +641,7 @@ class GatewayBusySessionMixin:
         return "queue"
 
     def _try_agent_verb(
-        self, running_agent, verb: str, text: str, session_key: str, *, event: Optional[MessageEvent] = None
+        self, running_agent, verb: str, text: str, session_key: str, *, event: MessageEvent | None = None
     ) -> bool:
         """Call ``running_agent.<verb>(text)`` (steer/redirect); False + warning on failure."""
         try:
@@ -1114,7 +1115,7 @@ class GatewayBusySessionMixin:
             return await self._handle_loop_command(event)
         return t("gateway.busy.reject_loop")
 
-    def _check_slash_access(self, source: SessionSource, canonical_cmd: str) -> Optional[str]:
+    def _check_slash_access(self, source: SessionSource, canonical_cmd: str) -> str | None:
         """Denial message if ``source`` cannot run ``canonical_cmd``, else None (both dispatch paths
         use it so an in-flight agent can't bypass admin gating; no ``allow_admin_from`` → None)."""
         from gateway.slash_access import policy_for_runner_source
@@ -1354,7 +1355,7 @@ class GatewayBusySessionMixin:
 
     async def _request_slash_confirm(
         self, *, event: MessageEvent, command: str, title: str, message: str, handler
-    ) -> Optional[str]:
+    ) -> str | None:
         """Ask the user to confirm a slash command; ``handler(choice)`` runs on "once"/"always"/
         "cancel" and its return is sent as a message. Returns None if buttons rendered, else the
         text-fallback message (which IS the ack)."""

@@ -2099,12 +2099,18 @@ def _resolve_custom_endpoint_context_length(model: str, base_url: str, api_key: 
 
 def _resolve_custom_codex_route_context_length(model: str, base_url: str, api_key: str, provider: str) -> int:
     """Step 2 for a custom ``api_mode: codex_responses`` route — a Codex proxy on a generic URL.
-    The Codex OAuth table (with the opted-in ``-900k`` bump) answers first: the proxy's own /models
-    and the direct-API catalog both advertise the 1.05M direct window that Codex does not honour.
-    The proxy's context_window is never trusted; only an opted-in ``-900k`` variant asks the route's own
-    catalog (with the route's own key), and only for its max_context_window cap. Slugs the table does
-    not know take the ordinary endpoint probes."""
-    ctx, _source = _resolve_codex_oauth_context_length_with_source(model)
+    A Codex-shaped route catalog (``{"models": [{"slug", "context_window", ...}]}``, e.g. codex-lb
+    mirroring chatgpt.com) is followed live with the route's own key, exactly as the native provider
+    follows chatgpt.com's — so a raised Codex default is picked up without a code change. Its
+    context_window is clamped to its own max_context_window. OpenAI-shaped /models (``{"data": ...}``,
+    advertising the 1.05M direct-API window Codex does not honour) is ignored by the parser and the
+    Codex OAuth table (with the opted-in ``-900k`` bump) answers instead. Slugs neither knows take
+    the ordinary endpoint probes."""
+    ctx, _source = _resolve_codex_oauth_context_length_with_source(model, access_token=api_key or "", base_url=base_url)
+    if ctx and api_key and not is_codex_context_variant(model):
+        cap = _cached_codex_catalog_max(api_key, base_url, _bare_codex_slug(model))
+        if cap and cap < ctx:
+            ctx = cap
     if ctx and api_key and is_codex_context_variant(model):
         # The -900k bump is an account-level assumption; a gateway whose own catalog publishes a
         # Codex-shaped max_context_window caps it, as the native provider's live catalog does.
@@ -2275,8 +2281,10 @@ def get_model_context_length(
     # A profile that qualifies its own bound (external processes have no /models probe) wins
     # over the generic caches below; explicit user/endpoint overrides above still take precedence.
     from providers import get_provider_profile
-    profile = get_provider_profile(provider)
-    context = profile.get_model_context_length(model) if profile else None
+    from providers.routes import call_model_declaration, endpoint_profile
+    profile = endpoint_profile(base_url) or get_provider_profile(provider)
+    context = call_model_declaration(profile, "get_model_context_length", model,
+                                     base_url=base_url, api_key=api_key) if profile else None
     if type(context) is int and context > 0:
         return context
     is_bedrock_context = _is_bedrock_context(base_url, provider)

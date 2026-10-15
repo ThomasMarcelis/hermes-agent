@@ -13,7 +13,7 @@ from agent.agent_init import _GATEWAY_IDENTITY_PARAMS, _memory_provider_init_kwa
 def _fake_agent():
     """The attribute surface ``_memory_provider_init_kwargs`` reads."""
     return SimpleNamespace(
-        session_id="sess-80646", _session_db=None, _emit_warning=None, _emit_status=None,
+        session_id="sess-80646", _parent_session_id="", _session_db=None, _emit_warning=None, _emit_status=None,
         session_cwd=None, **{f"_{name}": None for name in _GATEWAY_IDENTITY_PARAMS},
     )
 

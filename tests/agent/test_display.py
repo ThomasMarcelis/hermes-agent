@@ -12,6 +12,7 @@ from agent.display import (
     prepare_tool_preview,
     redact_tool_args_for_display,
     set_tool_preview_max_len,
+    truncate_tool_preview,
     _summarize_rendered_diff_sections,
     render_edit_diff_with_delta,
 )
@@ -54,7 +55,7 @@ class TestBuildToolPreview:
 
     def test_memory_patch_preview_shows_the_span_being_edited(self):
         args = {"action": "patch", "target": "memory", "old_text": "port 8080", "content": "port 9090"}
-        assert build_tool_preview("memory", args) == '~memory: "port 8080"'
+        assert build_tool_preview("memory", args, max_len=0) == '~memory: "port 8080" → "port 9090"'
         assert '~memory: "port 8080"' in get_cute_tool_message("memory", args, 0.1)
 
     def test_browser_type_preview_redacts_api_key(self):
@@ -101,6 +102,38 @@ class TestBuildToolPreview:
         )
         assert result is not None and len(result) <= 30
 
+    def test_long_read_path_preserves_meaningful_tail(self):
+        path = (
+            "/home/example/.hermes/skills/research/references/"
+            "important-target-file.md"
+        )
+
+        result = build_tool_preview("read_file", {"path": path}, max_len=40)
+
+        assert result is not None
+        assert len(result) == 40
+        assert result.startswith("...")
+        assert result.endswith("important-target-file.md")
+        assert "/home/example" not in result
+
+    def test_path_cap_preserves_tail_for_file_tools(self):
+        path = "/home/example/workspace/project/deep/path/final-report.md"
+
+        result = truncate_tool_preview("write_file", path, 36)
+
+        assert len(result) == 36
+        assert result.startswith("...")
+        assert result.endswith("final-report.md")
+
+    def test_non_path_cap_keeps_command_front(self):
+        command = "python scripts/really-long-command-name.py --with --many --flags"
+
+        result = truncate_tool_preview("terminal", command, 40)
+
+        assert result.startswith("python scripts/")
+        assert result.endswith("...")
+        assert "--many --flags" not in result
+
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""
         assert build_tool_preview("terminal", 0) is None
@@ -124,6 +157,49 @@ class TestBuildToolPreview:
 
 
 class TestPrepareToolPreview:
+    def test_zero_cap_keeps_complete_multiline_shell_and_code(self):
+        command = "python -m pytest tests/example.py && printf done\nprintf final-line"
+        for tool, key in (("terminal", "command"), ("execute_code", "code")):
+            preview = prepare_tool_preview(tool, {key: command}, fallback="", max_len=0)
+            assert preview.text == command
+            assert preview.truncated is False
+
+    def test_zero_cap_preserves_full_paths_goals_and_memory_operations(self):
+        path = "/home/example/workspace/project/deep/path/final-report.md"
+        assert prepare_tool_preview("read_file", {"path": path}, fallback="", max_len=0).text == path
+        goals = [{"goal": "first goal " + "a" * 90}, {"goal": "second goal " + "b" * 90}]
+        delegate = prepare_tool_preview("delegate_task", {"tasks": goals}, fallback="", max_len=0)
+        assert all(goal["goal"] in delegate.text for goal in goals)
+        operations = [{"action": "add", "content": "complete memory entry " + "c" * 90},
+                      {"action": "remove", "old_text": "old entry " + "d" * 90}]
+        memory = prepare_tool_preview("memory", {"target": "user", "operations": operations}, fallback="", max_len=0)
+        assert operations[0]["content"] in memory.text and operations[1]["old_text"] in memory.text
+
+    def test_patch_preview_lists_all_touched_paths_without_payload(self):
+        patch = "*** Begin Patch\n*** Update File: first.py\n@@\n-old\n+new\n*** Update File: second.py\n@@\n-a\n+b\n*** End Patch"
+        preview = prepare_tool_preview("patch", {"mode": "patch", "patch": patch}, fallback="", max_len=0)
+        assert "first.py" in preview.text and "second.py" in preview.text
+        assert "new" not in preview.text
+
+    def test_file_path_preserves_filename_tail(self):
+        path = "/home/example/workspace/project/deep/path/final-report.md"
+
+        preview = prepare_tool_preview(
+            "write_file", {"path": path}, fallback=path, max_len=36,
+        )
+
+        assert preview.text.startswith("...")
+        assert preview.text.endswith("final-report.md")
+        assert preview.truncated is True
+        assert preview.url is None
+
+    def test_redacts_before_positive_cap_splits_credential(self):
+        secret = "abcdefghijklmnopqrstuvwxyz0123456789"
+        text = "request Authorization: Bearer " + secret
+        preview = prepare_tool_preview("web_search", {"query": text}, fallback=text, max_len=45)
+        assert secret[:12] not in preview.text
+        assert preview.url is None
+
     def test_recovers_and_describes_truncated_url(self):
         url = "https://example.com/a/very/long/path/to/a/page"
         set_tool_preview_max_len(20)

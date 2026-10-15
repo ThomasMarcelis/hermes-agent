@@ -9,7 +9,7 @@ passthrough.
 """
 
 import os
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -134,7 +134,7 @@ class TestInboundCacheUsesSniffer:
             async def __aexit__(self, *exc):
                 return False
 
-        async def _fake_read(response, media_type):
+        async def _fake_read(response, media_type, max_bytes=None):
             return MP3_ID3  # server sent MP3 bytes despite the .ogg claim
 
         monkeypatch.setattr(base, "_read_httpx_body_with_limit", _fake_read)
@@ -142,7 +142,9 @@ class TestInboundCacheUsesSniffer:
             "tools.url_safety.create_ssrf_safe_async_client",
             lambda **k: _FakeClient(),
         )
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: True)
+        monkeypatch.setattr(
+            "tools.url_safety.async_is_safe_url", AsyncMock(return_value=True)
+        )
 
         result = await base.cache_audio_from_url("https://example.com/voice.ogg", ext=".ogg")
         assert result.endswith(".mp3")

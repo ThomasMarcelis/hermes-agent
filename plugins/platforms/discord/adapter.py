@@ -307,6 +307,7 @@ from gateway.platforms.helpers import (
 from gateway.platforms.helpers import cancel_task
 from utils import atomic_json_write, env_float
 from gateway.platforms.base import (
+    DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS, download_media_bytes_from_url, get_inbound_media_max_bytes,
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
@@ -326,6 +327,14 @@ def _unauthorized() -> str:
     """Every refusal (slash command, approval button, picker, prompt) says the same thing — resolved
     per click so the active language applies (never bound at import)."""
     return unauthorized_action_notice(Platform.DISCORD)
+
+
+def _remaining_attachment_timeout(deadline: float) -> float:
+    """Return the positive remainder of one attachment operation deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Discord attachment download deadline expired")
+    return remaining
 
 
 async def _read_url_image_with_redirect_guard(
@@ -601,6 +610,11 @@ def _clean_discord_id(entry: str) -> str:
 _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_THREAD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_REQUIRE_MENTION",
+    "DISCORD_THREAD_REQUIRE_MENTION",
+    "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
+    "DISCORD_AUTO_THREAD",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
@@ -2413,13 +2427,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 logger.info("[%s] Skipping Discord slash command sync: %s", self.name, skip_reason)
                 return
             self._record_command_sync_attempt(app_id, fingerprint)
-            http = getattr(self._client, "http", None)
-            has_ratelimit_timeout = http is not None and hasattr(http, "max_ratelimit_timeout")
-            previous_ratelimit_timeout = getattr(http, "max_ratelimit_timeout", None) if has_ratelimit_timeout else None
-            if has_ratelimit_timeout:
-                http.max_ratelimit_timeout = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
             try:
-                # The command-management bucket is small and discord.py may sleep long on a 429: bound it.
+                # Bound maintenance sync without changing the shared HTTP client
+                # rate-limit policy used by concurrent messages and thread creation.
                 summary = await asyncio.wait_for(self._safe_sync_slash_commands(), timeout=600)
             except Exception as e:
                 if not self._is_discord_rate_limit(e):
@@ -2434,9 +2444,6 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     retry_after,
                 )
                 return
-            finally:
-                if has_ratelimit_timeout:
-                    http.max_ratelimit_timeout = previous_ratelimit_timeout
             self._record_command_sync_success(app_id, fingerprint, summary)
             logger.info(
                 "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
@@ -4964,11 +4971,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return resolve_channel_prompt(self.config.extra, channel_id, parent_id)
 
     def _extra_or_env_flag(self, key: str, env_key: str, env_default: str, *, truthy: bool) -> bool:
-        """Boolean: explicit scoped ``env_key`` → ``config.extra[key]`` (str parsed permissively) →
-        ``env_default``. ``truthy=True`` values must be in {true,1,yes,on}; ``truthy=False`` values are
-        on unless in {false,0,no,off} — matching each flag's historical default shape."""
-        extra = getattr(self.config, "extra", None)
-        configured = _extra_or_secret(extra if isinstance(extra, dict) else None, key, env_key, None)
+        """Boolean: adapter-scoped ``env_key`` → ``config.extra[key]`` → ``env_default``.
+
+        The adapter snapshot is authoritative after ``connect()`` so multiplexed profiles never
+        re-read another profile's process-scoped bridge value.
+        """
+        configured = self._gate_raw(key, env_key)
         if configured is None:
             configured = env_default
         if isinstance(configured, bool):
@@ -4981,9 +4989,14 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return self._extra_or_env_flag("require_mention", "DISCORD_REQUIRE_MENTION", "true", truthy=False)
 
     def _discord_free_response_auto_thread(self) -> bool:
-        """Free-response channels also auto-thread when opted in; default replies inline."""
+        """Free-response channels reply inline unless explicitly opted into threading."""
         return self._extra_or_env_flag(
             "free_response_auto_thread", "DISCORD_FREE_RESPONSE_AUTO_THREAD", "false", truthy=True,
+        )
+
+    def _discord_auto_thread(self) -> bool:
+        return self._extra_or_env_flag(
+            "auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True,
         )
 
     def _discord_max_attachment_bytes(self) -> int:
@@ -5170,6 +5183,14 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
             raw = self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS")
+        return self._gate_csv_set(raw)
+
+
+    def _discord_thread_free_response_channels(self) -> set:
+        """Parent-only legacy exemption; native free channels also exempt child threads."""
+        raw = self.config.extra.get("thread_free_response_channels")
+        if raw is None:
+            raw = self._gate_env("DISCORD_THREAD_FREE_RESPONSE_CHANNELS")
         return self._gate_csv_set(raw)
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
@@ -5526,38 +5547,87 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return thread
 
     async def _auto_create_thread(self, message: DiscordMessage) -> Optional[Any]:
-        """Create an auto-thread from a user message; returns the thread or ``None``.
-        Primary path and seed-message fallback each retry once after a short backoff (transient errors).
+        """Create a thread from a user message for auto-threading.
 
-        ``Cannot connect to host discord.com:443``) don't immediately burn through to the caller's failure
-        path (#20243).
+        Returns the created thread object, or ``None`` on failure. Retry the
+        side-effect-free direct path before posting a single fallback seed.
+        Discord rate limits are waited out on the direct path rather than
+        branching into a fallback that shares the same thread-create bucket.
         """
         thread_name = self._derive_auto_thread_name(message.content or "")
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
         reason = f"Auto-threaded from mention by {display_name}"
+
         last_direct_error: Exception | None = None
-        last_fallback_error: Exception | None = None
         for attempt in range(2):
             try:
                 thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
                 return self._stamp_auto_thread_name(thread, thread_name)
             except Exception as direct_error:
                 last_direct_error = direct_error
-                try:
-                    seed_msg = await message.channel.send(t("platform.discord.thread.seed_message", name=thread_name))
-                    thread = await seed_msg.create_thread(name=thread_name, auto_archive_duration=1440, reason=reason)
-                    return self._stamp_auto_thread_name(thread, thread_name)
-                except Exception as fallback_error:
-                    last_fallback_error = fallback_error
-                    if attempt == 0:
-                        # Brief backoff: most failures here are transient connect errors.
+                if attempt == 0:
+                    if self._is_discord_rate_limit(direct_error):
+                        retry_after = self._extract_discord_retry_after(direct_error)
+                        if retry_after is None:
+                            logger.warning(
+                                "[%s] Discord rate-limited auto-thread creation without retry-after: %s",
+                                self.name,
+                                direct_error,
+                            )
+                            return None
+                        logger.info(
+                            "[%s] Discord rate-limited auto-thread creation; retrying direct path after %.2fs",
+                            self.name,
+                            retry_after,
+                        )
+                        await asyncio.sleep(retry_after)
+                    else:
+                        # Give short-lived connect failures one side-effect-free
+                        # retry before resorting to the seed-message fallback.
                         await asyncio.sleep(0.75)
-                        continue
-        logger.warning(
-            "[%s] Auto-thread creation failed after retry. Direct error: %s. Fallback error: %s",
-            self.name, last_direct_error, last_fallback_error,
-        )
-        return None
+                    continue
+
+                # A second rate-limit means the bucket still is not available.
+                # The seed fallback uses that same bucket, so it cannot help and
+                # would only leave a misleading parent-channel message.
+                if self._is_discord_rate_limit(direct_error):
+                    logger.warning(
+                        "[%s] Discord auto-thread creation remained rate-limited after retry: %s",
+                        self.name,
+                        direct_error,
+                    )
+                    return None
+
+        seed_msg = None
+        try:
+            seed_msg = await message.channel.send(
+                t("platform.discord.thread.seed_message", name=thread_name)
+            )
+            thread = await seed_msg.create_thread(
+                name=thread_name,
+                auto_archive_duration=1440,
+                reason=reason,
+            )
+            return self._stamp_auto_thread_name(thread, thread_name)
+        except Exception as fallback_error:
+            if seed_msg is not None:
+                try:
+                    await seed_msg.delete()
+                except Exception as cleanup_error:
+                    logger.debug(
+                        "[%s] Could not delete orphaned auto-thread seed message: %s",
+                        self.name,
+                        cleanup_error,
+                    )
+
+            logger.warning(
+                "[%s] Auto-thread creation failed after direct retry and one fallback. "
+                "Direct error: %s. Fallback error: %s",
+                self.name,
+                last_direct_error,
+                fallback_error,
+            )
+            return None
 
     async def rename_thread(
         self, thread_id: str, name: str, *, only_if_current_name: Optional[str] = None,
@@ -5612,24 +5682,46 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             logger.debug("[%s] Failed to rename Discord thread %s", self.name, thread_id, exc_info=True)
             return False
 
-    async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
-        """Create a handoff thread under a text channel; returns the thread id or ``None``.
-        Falls back to seed-message + ``message.create_thread``; DMs/voice/threads can't host threads."""
+    async def create_handoff_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+        *,
+        auto_archive_duration: int = 1440,
+    ) -> Optional[str]:
+        """Create a visible Discord thread under a text-channel message.
+
+        Discord can create an unanchored thread directly on a text channel, but
+        that thread does not produce a starter message in the parent timeline.
+        Users who were not auto-joined can therefore miss the handoff entirely
+        even though delivery into the thread succeeds. Always post the visible
+        parent seed first and create the public thread from that message.
+
+        Returns the new thread id as a string, or ``None`` on failure or when
+        the parent cannot host a message-backed thread (DMs, voice channels,
+        and threads themselves). Returning ``None`` lets the caller fall back
+        to ordinary channel/DM delivery instead of hiding content in an
+        unanchored thread.
+        """
         if not self._client or not DISCORD_AVAILABLE:
             return None
+
         try:
             parent_id = int(parent_chat_id)
         except (TypeError, ValueError):
             return None
+
         try:
             parent = self._client.get_channel(parent_id)
             if parent is None:
                 parent = await self._client.fetch_channel(parent_id)
         except Exception as exc:
             logger.warning(
-                "[%s] Handoff thread: cannot resolve parent %s: %s", self.name, parent_chat_id, exc,
+                "[%s] Handoff thread: cannot resolve parent %s: %s",
+                self.name, parent_chat_id, exc,
             )
             return None
+
         # DMs, voice channels, and existing threads can't host child threads.
         if isinstance(parent, getattr(discord, "DMChannel", ())):
             logger.info(
@@ -5637,31 +5729,31 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 self.name, parent_chat_id,
             )
             return None
+
         thread_name = (name or "handoff").strip()[:80] or "handoff"
         reason = "Hermes session handoff"
-        try:
-            create = getattr(parent, "create_thread", None)
-            if create is not None:
-                thread = await create(name=thread_name, auto_archive_duration=1440, reason=reason)
-                return str(thread.id)
-        except Exception as direct_error:
-            logger.debug(
-                "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
-                self.name, direct_error,
-            )
+        seed_msg = None
+
         try:
             send = getattr(parent, "send", None)
             if send is None:
                 return None
             seed_msg = await send(t("platform.discord.thread.handoff_seed", name=thread_name))
             thread = await seed_msg.create_thread(
-                name=thread_name, auto_archive_duration=1440, reason=reason,
+                name=thread_name,
+                auto_archive_duration=auto_archive_duration,
+                reason=reason,
             )
             return str(thread.id)
-        except Exception as fallback_error:
+        except Exception as exc:
+            if seed_msg is not None:
+                try:
+                    await seed_msg.delete()
+                except Exception:
+                    logger.warning("[%s] Handoff thread: orphan starter cleanup failed", self.name, exc_info=True)
             logger.warning(
-                "[%s] Handoff thread: both create paths failed for parent %s: %s",
-                self.name, parent_chat_id, fallback_error,
+                "[%s] Handoff thread: visible seed/thread creation failed for parent %s: %s",
+                self.name, parent_chat_id, exc,
             )
             return None
 
@@ -5952,77 +6044,184 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     # is missing or fails, fall back to the SSRF-gated URL downloaders (defense-in-depth).
     # ------------------------------------------------------------------
 
-    async def _read_attachment_bytes(self, att, *, media_type: str = "media") -> Optional[bytes]:
-        """Read an attachment via the authenticated bot session; ``None`` (no callable ``read()``
-        or read failure) means fall back to the URL downloaders. Raises ``ValueError`` for oversized
-        attachments BEFORE pulling bytes when Discord reports the size, so a hostile upload can't OOM."""
+    async def _read_attachment_bytes(
+        self,
+        att,
+        *,
+        media_type: str = "media",
+        max_bytes: int | None = None,
+        timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+    ) -> Optional[bytes]:
+        """Read an attachment via discord.py's authenticated bot session.
+
+        Returns the raw bytes on success, or ``None`` if ``att`` doesn't
+        expose a callable ``read()`` or the read itself fails. Callers
+        should treat ``None`` as a signal to fall back to the URL-based
+        downloaders.
+
+        Oversized attachments (per ``gateway.max_inbound_media_bytes``) raise
+        ``ValueError`` BEFORE the bytes are pulled into memory when Discord
+        reports the size up front, so a hostile upload can't OOM the gateway.
+        """
         attachment_size = getattr(att, "size", None)
-        if attachment_size:
-            validate_inbound_media_size(int(attachment_size), media_type=media_type)
+        try:
+            declared_size = int(attachment_size) if attachment_size is not None else 0
+        except (TypeError, ValueError):
+            declared_size = 0
+        if declared_size <= 0:
+            logger.warning(
+                "[Discord] Attachment %s has no trustworthy size metadata; "
+                "using bounded URL streaming instead of att.read()",
+                getattr(att, "filename", None) or getattr(att, "url", "<unknown>"),
+            )
+            return None
+        validate_inbound_media_size(
+            declared_size, media_type=media_type, max_bytes=max_bytes
+        )
+
         reader = getattr(att, "read", None)
         if reader is None or not callable(reader):
             return None
+        read_deadline = time.monotonic() + timeout
         try:
-            raw_bytes = await reader()
+            async with asyncio.timeout(timeout):
+                raw_bytes = await reader()
+        except TimeoutError as e:
+            # discord.py/aiohttp can raise TimeoutError itself before our
+            # operation budget is spent.  That is an authenticated-read
+            # failure and may use the URL fallback; only an exhausted budget
+            # aborts the complete attachment operation.
+            if time.monotonic() >= read_deadline:
+                raise
+            logger.warning(
+                "[Discord] Authenticated attachment read failed for %s: %s",
+                getattr(att, "filename", None) or getattr(att, "url", "<unknown>"),
+                e,
+            )
+            return None
         except Exception as e:
             logger.warning(
                 "[Discord] Authenticated attachment read failed for %s: %s",
-                getattr(att, "filename", None) or getattr(att, "url", "<unknown>"), e,
+                getattr(att, "filename", None) or getattr(att, "url", "<unknown>"),
+                e,
             )
             return None
-        validate_inbound_media_size(len(raw_bytes), media_type=media_type)
+        validate_inbound_media_size(
+            len(raw_bytes), media_type=media_type, max_bytes=max_bytes
+        )
         return raw_bytes
 
-    async def _cache_discord_image(self, att, ext: str) -> str:
-        """Cache an image attachment locally: ``att.read()`` first, SSRF-gated URL fallback."""
-        raw_bytes = await self._read_attachment_bytes(att, media_type="image")
-        if raw_bytes is not None:
-            try:
-                return await cache_image_from_bytes_async(raw_bytes, ext=ext)
-            except Exception as e:
-                logger.debug(
-                    "[Discord] cache_image_from_bytes rejected att.read() data; falling back to URL: %s",
-                    e,
-                )
-        return await cache_image_from_url(att.url, ext=ext)
 
-    async def _cache_discord_audio(self, att, ext: str) -> str:
-        """Cache an audio attachment locally: ``att.read()`` first, SSRF-gated URL fallback."""
-        raw_bytes = await self._read_attachment_bytes(att, media_type="audio")
-        if raw_bytes is not None:
-            try:
-                return await cache_audio_from_bytes_async(raw_bytes, ext=ext)
-            except Exception as e:
-                logger.debug("[Discord] cache_audio_from_bytes failed; falling back to URL: %s", e)
-        return await cache_audio_from_url(att.url, ext=ext)
+    def _discord_attachment_limit(self) -> int:
+        """Return the strictest non-zero shared/Discord attachment limit."""
+        limits = [
+            limit
+            for limit in (
+                get_inbound_media_max_bytes(),
+                self._discord_max_attachment_bytes(),
+            )
+            if limit and limit > 0
+        ]
+        return min(limits) if limits else 0
 
-    async def _cache_discord_document(self, att, ext: str) -> bytes:
-        """Download a document attachment: ``att.read()`` first, SSRF-gated aiohttp fallback.
-        Caller passes the bytes to ``cache_document_from_bytes`` (and injects text if applicable).
+    async def _cache_discord_image(
+        self, att, ext: str, *, timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+    ) -> str:
+        """Cache a Discord image attachment to local disk.
 
-        This closes the gap where the old document path made raw ``aiohttp.ClientSession`` requests with no
-        safety check (#11345). The caller is responsible for passing the returned bytes to
-        ``cache_document_from_bytes`` (and, where applicable, for injecting text content).
+        Primary path: ``att.read()`` + ``cache_image_from_bytes``
+        (authenticated, no SSRF gate).
+
+        Fallback: ``cache_image_from_url`` (plain httpx, SSRF-gated).
         """
-        raw_bytes = await self._read_attachment_bytes(att, media_type="document")
-        if raw_bytes is not None:
-            return raw_bytes
-        if not is_safe_url(att.url):
-            raise ValueError(f"Blocked unsafe attachment URL (SSRF protection): {att.url}")
-        import aiohttp
-        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
-        _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
-        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-        async with aiohttp.ClientSession(**_sess_kw) as session:
-            async with session.get(
-                att.url, timeout=aiohttp.ClientTimeout(total=30), **_req_kw,
-            ) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-                return await resp.read()
+        deadline = time.monotonic() + timeout
+        async with asyncio.timeout(timeout):
+            limit = self._discord_attachment_limit()
+            raw_bytes = await self._read_attachment_bytes(
+                att, media_type="image", max_bytes=limit,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
+            if raw_bytes is not None:
+                try:
+                    return await cache_image_from_bytes_async(raw_bytes, ext=ext)
+                except Exception as e:
+                    logger.debug(
+                        "[Discord] cache_image_from_bytes rejected att.read() data; falling back to URL: %s",
+                        e,
+                    )
+            return await cache_image_from_url(
+                att.url, ext=ext, max_bytes=limit,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
 
-    async def _cache_simple_media(self, att: Any, content_type: str, kind: str, exts: set, default_ext: str) -> str:
-        """Cache an image/audio attachment locally (CDN URLs expire); fall back to the CDN URL."""
+    async def _cache_discord_audio(
+        self, att, ext: str, *, timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+    ) -> str:
+        """Cache a Discord audio attachment to local disk.
+
+        Primary path: ``att.read()`` + ``cache_audio_from_bytes``
+        (authenticated, no SSRF gate).
+
+        Fallback: ``cache_audio_from_url`` (plain httpx, SSRF-gated).
+        """
+        deadline = time.monotonic() + timeout
+        async with asyncio.timeout(timeout):
+            limit = self._discord_attachment_limit()
+            raw_bytes = await self._read_attachment_bytes(
+                att, media_type="audio", max_bytes=limit,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
+            if raw_bytes is not None:
+                try:
+                    return await cache_audio_from_bytes_async(raw_bytes, ext=ext)
+                except Exception as e:
+                    logger.debug(
+                        "[Discord] cache_audio_from_bytes failed; falling back to URL: %s",
+                        e,
+                    )
+            return await cache_audio_from_url(
+                att.url, ext=ext, max_bytes=limit,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
+
+    async def _cache_discord_document(
+        self, att, ext: str, *, timeout: float = DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+    ) -> bytes:
+        """Download a Discord document attachment and return the raw bytes.
+
+        Primary path: ``att.read()`` (authenticated, no SSRF gate).
+
+        Fallback: the shared bounded HTTP downloader, which validates the
+        initial URL and every redirect target before streaming under the
+        configured inbound-media byte ceiling.
+        """
+        deadline = time.monotonic() + timeout
+        async with asyncio.timeout(timeout):
+            local_max = self._discord_attachment_limit()
+            raw_bytes = await self._read_attachment_bytes(
+                att, media_type="document", max_bytes=local_max,
+                timeout=_remaining_attachment_timeout(deadline),
+            )
+            if raw_bytes is not None:
+                return raw_bytes
+
+            from gateway.platforms.base import resolve_proxy_url
+
+            proxy_url = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+            return await download_media_bytes_from_url(
+                att.url,
+                media_type="document",
+                timeout=_remaining_attachment_timeout(deadline),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                    "Accept": "*/*",
+                },
+                proxy_url=proxy_url,
+                max_bytes=local_max or None,
+            )
+
+    async def _cache_simple_media(self, att: Any, content_type: str, kind: str, exts: set, default_ext: str) -> Optional[str]:
+        """Cache attachments; images that fail validation never reach model input as remote URLs."""
         try:
             ext = "." + content_type.split("/")[-1].split(";")[0]
             if ext not in exts:
@@ -6033,7 +6232,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             return cached_path
         except Exception as e:
             print(f"[Discord] Failed to cache {kind} attachment: {e}", flush=True)
-            return att.url
+            return None if kind == "image" else att.url
 
     async def _collect_attachment_media(self, all_attachments: list) -> tuple:
         """Cache every attachment and return ``(media_urls, media_types, media_text_inlined,
@@ -6046,10 +6245,18 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         for att in all_attachments:
             content_type = att.content_type or "unknown"
             if content_type.startswith("image/"):
-                media_urls.append(await self._cache_simple_media(
-                    att, content_type, "image", {".jpg", ".jpeg", ".png", ".gif", ".webp"}, ".jpg"))
-                media_types.append(content_type)
-                media_text_inlined.append(False)
+                cached_path = await self._cache_simple_media(
+                    att, content_type, "image", {".jpg", ".jpeg", ".png", ".gif", ".webp"}, ".jpg")
+                if cached_path is not None:
+                    media_urls.append(cached_path)
+                    media_types.append(content_type)
+                    media_text_inlined.append(False)
+                else:
+                    note = (
+                        "[Image attachment could not be decoded or downloaded. "
+                        "Ask the user to re-upload it as a fresh screenshot or JPEG.]"
+                    )
+                    pending_text_injection = f"{pending_text_injection}\n\n{note}" if pending_text_injection else note
             elif content_type.startswith("audio/"):
                 media_urls.append(await self._cache_simple_media(
                     att, content_type, "audio", {".ogg", ".mp3", ".wav", ".webm", ".m4a"}, ".ogg"))
@@ -6160,6 +6367,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         raw_content = message.content.strip()
         normalized_content = raw_content
         mention_prefix = False
+        channel_keys: set[str] = set()
+        is_free_channel = False
+        is_thread_free_parent_channel = False
         snapshot_attachments = []
         if hasattr(message, "message_snapshots") and message.message_snapshots:
             snapshot_text_parts = []
@@ -6191,14 +6401,20 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
                 return False
             free_channels = self._discord_free_response_channels()
+            thread_free_channels = self._discord_thread_free_response_channels()
             require_mention = self._discord_require_mention()
             # Voice-linked text channel is free-response while voice is active (exact channel only).
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
             current_channel_id = str(message.channel.id)
             is_voice_linked_channel = current_channel_id in voice_linked_ids
+            is_thread_free_parent_channel = (
+                not is_thread
+                and ("*" in thread_free_channels or bool(channel_keys & thread_free_channels))
+            )
             is_free_channel = (
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
+                or is_thread_free_parent_channel
                 or is_voice_linked_channel
             )
             in_bot_thread = self._in_bot_thread(message)
@@ -6213,11 +6429,13 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            # Voice-linked and reply exclusions live in the auto-thread gate below, not in skip_thread.
+            # Keep the explicit no-thread and voice/reply exclusions; legacy free-response
+            # channels can opt in, while thread-free-response channels thread by design.
             skip_thread = bool(channel_keys & no_thread_channels) or (
-                is_free_channel and not self._discord_free_response_auto_thread()
+                is_free_channel and not is_thread_free_parent_channel
+                and not self._discord_free_response_auto_thread()
             )
-            auto_thread = self._extra_or_env_flag("auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True)
+            auto_thread = self._discord_auto_thread()
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
@@ -7038,10 +7256,16 @@ def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:
 def _derive_forum_thread_name(message: str) -> str:
     """Derive a thread name from the first line of the message, capped at 100 chars."""
     first_line = message.strip().split("\n", 1)[0].strip()
+    # Strip common markdown heading prefixes
     first_line = first_line.lstrip("#").strip()
-    if not first_line:
-        first_line = t("platform.discord.forum.default_title")
-    return first_line[:100]
+    return _sanitize_discord_standalone_thread_name(first_line)
+
+
+
+def _sanitize_discord_standalone_thread_name(name: str) -> str:
+    """Return a non-empty Discord thread name within the 100-char limit."""
+    clean = re.sub(r"\s+", " ", str(name or "")).strip().lstrip("#").strip()
+    return (clean or t("platform.discord.forum.default_title"))[:100]
 
 
 def _standalone_close_response(resp: Any) -> None:
@@ -7154,9 +7378,20 @@ async def _standalone_is_forum(aiohttp, chat_id: str, json_headers: dict, sess_k
     return is_forum
 
 
+async def _standalone_remove_thread_seed(session, seed_url, seed_id, headers, req_kw) -> None:
+    """Best-effort cleanup when the parent seed could not become a thread."""
+    try:
+        async with session.delete(f"{seed_url}/{seed_id}", headers=headers, **req_kw) as resp:
+            if resp.status not in {200, 204, 404}:
+                logger.warning("Discord orphan thread starter cleanup failed (%s)", resp.status)
+    except Exception:
+        logger.warning("Discord orphan thread starter cleanup failed", exc_info=True)
+
+
 async def _standalone_send(
     pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
     media_files: Optional[list] = None, force_document: bool = False, caption: Optional[str] = None,
+    thread_name: Optional[str] = None, thread_auto_archive_duration: int = 1440,
 ) -> dict[str, Any]:
     """Send via Discord REST without a live gateway adapter (token: ``pconfig.token`` then env var).
     Forum channels (type 15) reject ``POST /messages``, so a thread post is created via
@@ -7182,12 +7417,20 @@ async def _standalone_send(
         media_files = media_files or []
         last_data = None
         warnings = []
+        created_thread_id = str(thread_id) if thread_id else None
+        requested_thread_name = _sanitize_discord_standalone_thread_name(thread_name) if thread_name else None
+        try:
+            archive_duration = int(thread_auto_archive_duration or 1440)
+        except (TypeError, ValueError):
+            archive_duration = 1440
+        if archive_duration not in {60, 1440, 4320, 10080}:
+            archive_duration = 1440
         if thread_id:
             url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
         else:
             # Forum channels (type 15) reject POST /messages — create a thread post.
             if await _standalone_is_forum(aiohttp, chat_id, json_headers, _sess_kw, _req_kw):
-                thread_name = _derive_forum_thread_name(message)
+                thread_name = requested_thread_name or _derive_forum_thread_name(message)
                 thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
                 # Filter readable media first to pick JSON vs multipart before opening a session.
                 valid_media = []
@@ -7204,7 +7447,8 @@ async def _standalone_send(
                             for idx, path in enumerate(valid_media)
                         ]
                         starter_message = {"content": (caption or message), "attachments": attachments_meta}
-                        payload_json = json.dumps({"name": thread_name, "message": starter_message})
+                        payload_json = json.dumps({"name": thread_name, "auto_archive_duration": archive_duration,
+                                                   "message": starter_message})
                         form = aiohttp.FormData()
                         form.add_field("payload_json", payload_json, content_type="application/json")
                         try:
@@ -7223,7 +7467,8 @@ async def _standalone_send(
                         # No media: JSON POST creates the thread with the text starter.
                         async with session.post(
                             thread_url, headers=json_headers,
-                            json={"name": thread_name, "message": {"content": message}}, **_req_kw,
+                            json={"name": thread_name, "auto_archive_duration": archive_duration,
+                                  "message": {"content": message}}, **_req_kw,
                         ) as resp:
                             data, err = await _standalone_response_json_or_error(resp, "Discord forum thread creation error")
                             if err:
@@ -7237,7 +7482,43 @@ async def _standalone_send(
                 if warnings:
                     result["warnings"] = warnings
                 return result
-            url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
+            if requested_thread_name:
+                # The parent starter makes the cron run visible even to users who
+                # were not joined to the new thread. Never create an unanchored fallback.
+                seed_url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as thread_session:
+                    async with thread_session.post(
+                        seed_url, headers=json_headers,
+                        json={"content": f"🧵 **{requested_thread_name}**"}, **_req_kw,
+                    ) as resp:
+                        seed, err = await _standalone_response_json_or_error(resp, "Discord thread starter error")
+                        if err:
+                            return err
+                    seed_id = str(seed.get("id") or "")
+                    if not seed_id:
+                        return {"error": "Discord thread starter response omitted the message id"}
+                    thread_url = f"{seed_url}/{seed_id}/threads"
+                    try:
+                        async with thread_session.post(
+                            thread_url, headers=json_headers,
+                            json={"name": requested_thread_name,
+                                  "auto_archive_duration": archive_duration}, **_req_kw,
+                        ) as resp:
+                            data, err = await _standalone_response_json_or_error(resp, "Discord thread creation error")
+                        if not err and not data.get("id"):
+                            err = {"error": "Discord thread creation response omitted the thread id"}
+                    except Exception:
+                        await _standalone_remove_thread_seed(thread_session, seed_url, seed_id, auth_headers, _req_kw)
+                        raise
+                    if err:
+                        await _standalone_remove_thread_seed(thread_session, seed_url, seed_id, auth_headers, _req_kw)
+                        return err
+                created_thread_id = str(data.get("id") or "")
+                if not created_thread_id:
+                    return {"error": "Discord thread creation response omitted the thread id"}
+                url = f"https://discord.com/api/v10/channels/{created_thread_id}/messages"
+            else:
+                url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             if message.strip() or not media_files:
                 async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
@@ -7290,6 +7571,8 @@ async def _standalone_send(
             error = "No deliverable text or media remained after processing"
             return {**send_error(error), **({"warnings": warnings} if warnings else {})}
         result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
+        if created_thread_id:
+            result["thread_id"] = created_thread_id
         if warnings:
             result["warnings"] = warnings
         return result
@@ -7306,6 +7589,7 @@ _YAML_BOOL_ENV_KEYS = (
     ("require_mention", "DISCORD_REQUIRE_MENTION"),
     ("thread_require_mention", "DISCORD_THREAD_REQUIRE_MENTION"),
     ("bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION"),
+    ("auto_thread", "DISCORD_AUTO_THREAD"),
 )
 # (public websocket_* key, legacy liveness_* alias, env bridge var)
 _YAML_WEBSOCKET_LIVENESS_KEYS = (
@@ -7334,10 +7618,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
     seeded_extra = {}
-    for key, env_key in _YAML_BOOL_ENV_KEYS:
-        if key in discord_cfg:
-            seeded_extra[key] = discord_cfg[key]  # original type: the shared-key loop seeds bools as bools
-            _env_default(env_key, str(discord_cfg[key]).lower())
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
     if isinstance(platforms_cfg, dict):
@@ -7355,6 +7635,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra[key] = text
         _env_default(env_key, text)
 
+    for key, env_key in _YAML_BOOL_ENV_KEYS:
+        _gate(key, env_key, from_platform_extra=True, lower=True)
     _gate("allow_from", "DISCORD_ALLOWED_USERS", from_platform_extra=True)
     _gate("allowed_roles", "DISCORD_ALLOWED_ROLES", from_platform_extra=True)
     _gate("allow_all_users", "DISCORD_ALLOW_ALL_USERS", from_platform_extra=True, lower=True)
@@ -7367,14 +7649,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["approval_mentions"] = approval_mentions_cfg
         _env_default("DISCORD_APPROVAL_MENTIONS", str(approval_mentions_cfg).lower())
     _gate("free_response_channels", "DISCORD_FREE_RESPONSE_CHANNELS", from_platform_extra=False)
-    for key, env_key in (
-        ("auto_thread", "DISCORD_AUTO_THREAD"),
-        ("free_response_auto_thread", "DISCORD_FREE_RESPONSE_AUTO_THREAD"),
-        ("reactions", "DISCORD_REACTIONS"),
-    ):
-        if key in discord_cfg:
-            seeded_extra[key] = discord_cfg[key]
-            _env_default(env_key, str(discord_cfg[key]).lower())
+    _gate("thread_free_response_channels", "DISCORD_THREAD_FREE_RESPONSE_CHANNELS", from_platform_extra=False)
+    _gate("auto_thread", "DISCORD_AUTO_THREAD", from_platform_extra=True, lower=True)
+    _gate("free_response_auto_thread", "DISCORD_FREE_RESPONSE_AUTO_THREAD",
+          from_platform_extra=True, lower=True)
+    if "reactions" in discord_cfg:
+        seeded_extra["reactions"] = discord_cfg["reactions"]
+        _env_default("DISCORD_REACTIONS", str(discord_cfg["reactions"]).lower())
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)

@@ -24,6 +24,7 @@ class RewindOutcome:
     live_text: str  # lossless retry text when ``require_retryable``, else the display flattening (prefill)
     rewound_count: int
     turns_undone: int
+    rewound_message_uids: tuple[str, ...] = ()
 
 
 def _user_indices(messages: list[dict[str, Any]]) -> list[int]:
@@ -132,4 +133,9 @@ class SessionRewindMixin:
         return RewindOutcome(
             prefix=prefix, live_view=live_view,
             live_text=live_text if live_text is not None else flatten_message_text(live_view.get("content")),
-            rewound_count=int(result.get("rewound_count", 0)), turns_undone=len(durable_user) - user_ordinal)
+            rewound_count=int(result.get("rewound_count", 0)), turns_undone=len(durable_user) - user_ordinal,
+            rewound_message_uids=tuple(
+                uid for message in stored
+                if message.get("_row_id", -1) >= target_row_id
+                if (uid := message_uid_or_none(message))
+            ))

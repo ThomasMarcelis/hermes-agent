@@ -1162,7 +1162,7 @@ def suppress_credential_source(provider_id: str, source: str) -> None:
 
 
 def is_source_suppressed(provider_id: str, source: str) -> bool:
-    """Check if a credential source has been suppressed by the user."""
+    """Public profile-scoped credential-source suppression lookup (see plugin authoring guide)."""
     try:
         return source in _load_auth_store().get("suppressed_sources", {}).get(provider_id, [])
     except Exception:

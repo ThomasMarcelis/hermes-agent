@@ -82,14 +82,17 @@ def codex_account_headers(access_token: str) -> dict[str, str]:
 
 
 def codex_request_compression_hooks(base_url: str, *, async_mode: bool = False) -> dict[str, list] | None:
-    """httpx ``event_hooks`` that zstd-compress Responses request bodies for the official Codex backend.
+    """Lossless zstd request hooks for official Codex or a provider-declared endpoint.
 
     Parity with the official Codex client (zstd on ``/responses`` with ChatGPT auth, default since
     openai/codex#10102). Lossless transport encoding: tokens and prompt caching are unchanged. Uses the
-    stdlib codec (Python 3.14+); without it, or for any other endpoint/proxy, bodies stay raw JSON.
+    stdlib codec (Python 3.14+); without it, or without an endpoint opt-in, bodies stay raw JSON.
     """
     if not is_official_codex_base_url(base_url):
-        return None
+        from providers.routes import call_model_declaration, endpoint_profile
+        profile = endpoint_profile(base_url)
+        if profile is None or call_model_declaration(profile, "request_compression", base_url) != "zstd":
+            return None
     try:
         from compression import zstd
         import httpx

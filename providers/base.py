@@ -130,6 +130,7 @@ class ProviderProfile:
     # hostname: base hostname for URL→provider reverse-mapping in model_metadata.py
     # e.g. "api.gmi-serving.com". Derived from base_url when empty.
     hostname: str = ""
+    infer_from_hostname: bool = True  # False for endpoints sharing a host with unrelated services.
 
     # ── Client-level quirks (set once at client construction) ─
     default_headers: dict[str, str] = field(default_factory=dict)
@@ -179,12 +180,33 @@ class ProviderProfile:
         """
         return ""
 
+    def matches_endpoint(self, base_url: str) -> bool:
+        """Opt into policy for an exact endpoint, including native/custom aliases.
+
+        Must be cheap and credential-free. Default: no endpoint claim. The
+        selected credential and provider identity remain owned by the route.
+        """
+        return False
+
+    def request_compression(self, base_url: str) -> str | None:
+        """Optional Responses request encoding for a verified endpoint (currently zstd)."""
+        return None
+
+    def responses_backend(self, base_url: str) -> str | None:
+        """Opt a claimed endpoint into backend wire semantics (currently ``codex``).
+
+        Changes request shape only; never provider, credential or pool identity.
+        """
+        return None
+
     def get_hostname(self) -> str:
         """Return the provider's base hostname for URL-based detection.
 
         Uses self.hostname if set explicitly, otherwise derives it from base_url.
         e.g. 'https://api.gmi-serving.com/v1' → 'api.gmi-serving.com'
         """
+        if not self.infer_from_hostname:
+            return ""
         if self.hostname:
             return self.hostname
         if self.base_url:
@@ -257,6 +279,13 @@ class ProviderProfile:
 
         Default: None (no provider-specific vision model — the caller falls
         back to the user's chat model or the aggregator chain).
+        """
+        return None
+
+    def fallback_model_metadata(self, model: str) -> dict[str, Any] | None:
+        """Offline models.dev-shaped metadata; live catalogs and user overrides win.
+
+        Unlike model_capabilities, this only fills a catalog miss. Must not do I/O.
         """
         return None
 

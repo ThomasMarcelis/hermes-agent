@@ -33,6 +33,7 @@ _PUBLIC = frozenset({
     "agent.web_search_provider", "cli", "gateway.config", "gateway.platform_registry",
     "gateway.platforms._shared", "gateway.platforms.base", "gateway.platforms.event",
     "gateway.platforms.helpers", "gateway.status", "hermes_cli.auth_oauth_pkce_plugin",
+    "hermes_cli.auth:is_source_suppressed",
     "hermes_cli.config", "hermes_cli.plugin_events", "hermes_cli.plugin_provider_requests",
     "hermes_constants", "hermes_platform", "hermes_state", "plugins.plugin_storage", "plugins.plugin_utils", "pm",
     "providers", "providers.base", "tools.browser_supervisor", "tools.browser_supervisor_capture",

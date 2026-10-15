@@ -483,6 +483,8 @@ class CLISessionMixin:
             CLI_CONFIG, _parse_service_tier_config,
             _sync_process_session_id, datetime)
         from hermes_cli.cli_model_switch_mixin import _resolve_cli_reasoning
+        from hermes_cli.cli_session_messages import close_cli_session_route, register_cli_session_route
+        close_cli_session_route(self)
         old_session_id = self.session_id
         _boundary_snapshot = None
         if self.agent:
@@ -560,7 +562,7 @@ class CLISessionMixin:
             # Tell memory providers the session_id rotated (reset=True flushes per-session
             # state) BEFORE the plugin on_session_reset hook. With old history, end-of-session
             # extraction and this switch are queued as ONE task on the serialized worker —
-            # end strictly before switch, without blocking /new. No history → switch inline.
+            # end strictly before switch, without blocking /new. No history → queue the switch behind prior writes.
             _mm = getattr(self.agent, "_memory_manager", None)
             with contextlib.suppress(Exception):
                 if _mm is not None and _boundary_snapshot:
@@ -568,10 +570,12 @@ class CLISessionMixin:
                         _boundary_snapshot, new_session_id=self.session_id,
                         parent_session_id=old_session_id or "", reason="new_session")
                 elif _mm is not None:
-                    _mm.on_session_switch(
+                    _mm.queue_session_switch(
                         self.session_id, parent_session_id=old_session_id or "",
                         reset=True, reason="new_session")
             self._notify_session_boundary("on_session_reset")
+
+        register_cli_session_route(self)
 
         if not silent:
             if title:
@@ -739,17 +743,30 @@ class CLISessionMixin:
             print(t("cli.session.retry_unsafe", error=exc))
             return None
 
+        rewound_uids = tuple(m["message_uid"] for m in warm_history[user_indices[-1]:] if m.get("message_uid"))
         # Persist the rewind before publishing the shorter in-memory view: the DB owns the
         # physical carrier split so archived original + retained scaffold commit atomically.
         if self._session_db is not None and self.session_id:
             try:
-                truncated = self._session_db.rewind_user_turn(
-                    self.session_id, -1, warm_history=warm_history, require_retryable=True).prefix
+                outcome = self._session_db.rewind_user_turn(
+                    self.session_id, -1, warm_history=warm_history, require_retryable=True)
+                truncated = outcome.prefix
+                rewound_uids = outcome.rewound_message_uids
             except Exception as exc:
                 print(t("cli.session.retry_rewind_failed", error=exc))
                 return None
 
         self._publish_truncated_history(truncated, invalidate_prompt=False)
+        # Keep memory providers aligned with the durable rewind before the same
+        # user text is queued again.  Without this, Hindsight retains the failed
+        # exchange and appends the retry as an additional turn.
+        _mm = getattr(self.agent, "_memory_manager", None)
+        if _mm is not None and self.session_id:
+            with contextlib.suppress(Exception):
+                _mm.queue_session_switch(
+                    self.session_id, parent_session_id="", reset=False,
+                    rewound=True, rewound_turns=1, rewound_message_uids=rewound_uids,
+                )
         print(t("cli.session.retrying", preview=f"{last_message[:60]}{'...' if len(last_message) > 60 else ''}"))
         return last_message
 
@@ -784,6 +801,7 @@ class CLISessionMixin:
         truncated, live_view = history_before_user_originated_turn(warm_history, cut_idx)
         removed_text = self._undo_content_to_text(live_view.get("content"))
 
+        rewound_uids = tuple(m["message_uid"] for m in warm_history[cut_idx:] if m.get("message_uid"))
         rewound_rows = 0
         if self._session_db is not None and self.session_id:
             try:
@@ -793,6 +811,7 @@ class CLISessionMixin:
                 # Canonical editable prefill: the raw carrier holds the reference-summary wrapper.
                 removed_text = outcome.live_text or removed_text
                 rewound_rows = outcome.rewound_count
+                rewound_uids = outcome.rewound_message_uids
             except Exception as e:
                 logger.debug("undo: durable rewind failed: %s", e)
                 print(t("cli.session.undo_failed", error=e))
@@ -805,7 +824,10 @@ class CLISessionMixin:
         # See #21910, #6672.
         if _mm is not None and self.session_id:
             with contextlib.suppress(Exception):
-                _mm.on_session_switch(self.session_id, parent_session_id="", reset=False, rewound=True)
+                _mm.queue_session_switch(
+                    self.session_id, parent_session_id="", reset=False,
+                    rewound=True, rewound_turns=turns_undone, rewound_message_uids=rewound_uids,
+                )
 
         key = "cli.session.undo_ok_one" if turns_undone == 1 else "cli.session.undo_ok_other"
         print(t(key, count=turns_undone, messages=rewound_rows or removed_count,

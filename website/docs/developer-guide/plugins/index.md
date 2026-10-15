@@ -1254,6 +1254,49 @@ The same grant also gates `deregister()`: without it, a plugin cannot
 remove a tool it does not own (which would otherwise be a way around the
 override check).
 
+### Address a live conversation
+
+Native plugins can address an exact live CLI, messaging gateway, or Desktop/TUI conversation:
+
+```python
+route = ctx.session_message_route(session_id)
+receipt = ctx.inject_session_message(
+    session_id, "[External peer message] ...", message_id="unique-delivery-id", busy_mode="steer",
+    expected_route_id=route["route_id"],
+)
+```
+
+The session ID is the durable `session_id` supplied to tool handlers, not their `task_id`.
+`session_message_route` returns `{route_id, session_id}` or `None` when no live host owns it.
+The opaque `route_id` stays stable across compression and runtime-agent replacement; the
+returned session ID follows the compression tip. Old compression IDs remain valid aliases.
+`/new`, branching, replacement with another conversation, or actual host closure retires the
+route and every alias. A retired address never follows the current chat or focused tab.
+For delayed callbacks, pass the original `expected_route_id` so admission rejects a
+replacement host even if it reuses the same durable session ID.
+
+The owner is the profile that loaded this plugin, even when a background callback runs while
+another profile is active. On **every surface**, message injection requires the existing
+`plugins.entries.<plugin-id>.allow_gateway_injection: true` permission. It does not change
+legacy `ctx.inject_message` behavior. Busy mode `steer` uses a safe model/tool boundary,
+falling back to that conversation's next-turn queue; `queue` always waits until idle.
+Idle hosts start a turn through their original interface. Classic CLI admission reports
+`queued` because its ordinary input worker starts the turn asynchronously.
+
+Receipts have `accepted: bool` and `status`: `steered`, `queued`, `started`, `duplicate`,
+`offline`, `stale_session`, or `denied`. Acceptance means host admission, not model
+consumption or completed work. Failed admission may be retried with the same `message_id`;
+the most recent 2,048 accepted IDs are deduplicated for the lifetime of a route.
+
+Register `ctx.register_hook("on_session_message_route_closed", callback)` to retire private
+external inboxes. The callback receives `route_id` under the owning profile scope. Do not
+close inboxes from `on_session_end`, which fires after every turn. Routes are process-local;
+this API does not provide an offline mailbox. One-shot `-q`/`-Q` hosts accept messages
+while running and drain accepted replies before retiring their route at exit; they do not
+add an idle linger. External steering is labeled as plugin-delivered text and never uses
+the marker that grants direct human steering its user authority. Plugins should label external text as peer
+communication, retain existing user authority, and clean up their resources on unload.
+
 ### Register multiple hooks
 
 ```python
@@ -1282,6 +1325,7 @@ Each hook is documented in full on the **[Event Hooks reference](../../user-guid
 | `post_auxiliary_call` | After that attempt returns or raises | `pre_auxiliary_call` fields plus `api_duration: float, finish_reason, response_model, usage: dict \| None, response: dict \| None, error: str \| None, error_type: str \| None` | ignored |
 | [`on_session_start`](../../user-guide/features/hooks.md#on_session_start) | New session created (first turn only) | `session_id: str, model: str, platform: str` | ignored |
 | [`on_session_end`](../../user-guide/features/hooks.md#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
+| `on_session_message_route_closed` | A live conversation route retires, not each turn | `route_id: str` | ignored |
 | [`on_session_finalize`](../../user-guide/features/hooks.md#on_session_finalize) | CLI/gateway tears down an active session | `session_id: str \| None, platform: str` | ignored |
 | [`on_session_reset`](../../user-guide/features/hooks.md#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`) | `session_id: str, platform: str` | ignored |
 | [`gateway_platform_event`](../../user-guide/features/hooks.md#gateway_platform_event) | An authorized platform-native event is normalized at the gateway boundary (Telegram reactions currently) | `platform: str, event_type: str, payload: dict` | ignored |
@@ -2165,6 +2209,49 @@ hermes skills install myorg/skills-repo/my-workflow
 Publishing your own tap is just a GitHub repo with `skills/<skill-name>/SKILL.md` directories — no server or registry signup needed.
 
 **Full guides:** [Skills Hub](../../user-guide/features/skills.md#skills-hub) · [Publishing a custom tap](../../user-guide/features/skills.md#publishing-a-custom-skill-tap) (repo layout, minimal example, non-default paths, trust levels).
+
+### Native STT audio policy
+
+`agent.transcription_provider.TranscriptionProvider` exposes optional properties:
+
+- `max_upload_bytes`: positive integer, inclusive per-request byte cap. Default
+  `25 * 1024 * 1024` preserves existing plugins. Oversized recordings use the host's
+  existing re-encoding and silence-aligned chunking pipeline.
+- `cloud_preprocessing`: boolean, default `False`. Opting in uses the same best-effort
+  silence trimming as built-in cloud providers, honouring `stt.cloud_trim_silence` and
+  its tuning settings. This runs after input/CAF conversion, before the cap check,
+  once-per-recording `pre_transcription` hook, re-encoding/chunking and upload.
+
+- `language_config_aliases`: tuple of additional provider-stanza language keys, default
+  `()`. Precedence is hook override, provider `language`, these aliases in order, global
+  `stt.language`, then `HERMES_LOCAL_STT_LANGUAGE`. Existing plugins keep their defaults.
+
+Audio policy properties are read per recording and must not perform network I/O. Invalid values
+fail the recording before preprocessing/upload. Built-ins and same-name command
+providers retain precedence and their existing policies. One provider instance is bound
+for policy and every upload in a recording; a discovery failure cannot recover mid-request
+with unchecked policy. Native plugin host isolation has not been exercised for these
+capabilities. This additive API is absent from vanilla v0.22.2;
+plugins requiring it must feature-detect it and refuse unsupported hosts.
+
+### Credential source suppression
+
+`hermes_cli.auth.is_source_suppressed(provider_id, source)` is a public read-only
+lookup of suppression markers in the currently bound Hermes profile. Pair it with
+`agent.secret_scope.get_secret` when using a provider's environment credential:
+
+```python
+from agent.secret_scope import get_secret
+from hermes_cli.auth import is_source_suppressed
+
+key = "" if is_source_suppressed("example", "env:EXAMPLE_API_KEY") else get_secret("EXAMPLE_API_KEY", "")
+```
+
+This helper does not bind a profile, resolve credentials, or override secret-scope
+rules. Call it under the owning profile context, including in background work.
+An absent or unreadable suppression store returns `False`, matching existing core
+credential resolution. Other names in the auth module remain internal. Plugins
+using a credential pool must preserve its suppression and scope policies as well.
 
 ### TTS / STT via command templates
 

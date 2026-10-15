@@ -30,9 +30,12 @@ import shutil
 import logging
 import socket
 import ssl
+import stat
+import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import suppress
 from dataclasses import dataclass
@@ -192,6 +195,21 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _local_artifact_path(url: str) -> Path | None:
+    if not url.startswith("file:"):
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    decoded = urllib.parse.unquote(parsed.path)
+    if (not url.startswith("file://") or parsed.netloc.lower() not in ("", "localhost")
+            or parsed.query or parsed.fragment
+            or not decoded.startswith("/") or decoded.replace("\\", "/").startswith("//")):
+        raise ValueError(f"expected an absolute local file URL without query or fragment: {url}")
+    path = Path(urllib.request.url2pathname(parsed.path))
+    if not path.is_absolute():
+        raise ValueError(f"expected an absolute local file path: {url}")
+    return path
+
+
 # How long a finished download may wait for another process to let go of it before the
 # publication is reported as failed.
 _RELEASE_WAIT_SECONDS = 60.0
@@ -291,7 +309,10 @@ class Download:
             if source.fallbacks and not re.fullmatch(r"[a-f0-9]{64}", source.sha256):
                 raise ValueError("mirror fallback requires a full lowercase SHA256")
             for url in (source.url, *source.fallbacks):
-                if not (url.startswith("https://") or url.startswith(_LOOPBACK)):
+                if _local_artifact_path(url) is not None:
+                    if not re.fullmatch(r"[a-f0-9]{64}", source.sha256):
+                        raise ValueError("local file artifacts require a full lowercase SHA256")
+                elif not (url.startswith("https://") or url.startswith(_LOOPBACK)):
                     raise ValueError(f"refusing non-https url: {url}")
 
         # Probe the whole plan before reporting a denominator. A missing
@@ -372,6 +393,9 @@ class Download:
             # Recheck identity after waiting for another process's partial.
             remote = self._probe(source.url)
             tick(self._partial_ranges(source, remote) if remote.ranged else [], remote.total)
+            local = _local_artifact_path(source.url)
+            if local is not None:
+                return self._copy_local(source, local, tick)
 
             def report(written: _Ranges) -> None:
                 tick(written, remote.total)
@@ -396,6 +420,25 @@ class Download:
                            self.partials_dir / f"{partial_key}.ranges")
             return size
 
+    def _copy_local(self, source: Source, local: Path, tick) -> int:
+        # Never hand the original artifact to _finalize: it owns and removes
+        # its input. Unique staging also permits a source inside the cache.
+        with tempfile.TemporaryDirectory(prefix="local-", dir=self.partials_dir) as temporary:
+            part = Path(temporary) / "artifact.part"
+            size = 0
+            with local.open("rb") as incoming, part.open("wb") as target:
+                total = os.fstat(incoming.fileno()).st_size
+                while True:
+                    self._check_pause()
+                    chunk = incoming.read(_CHUNK)
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    size += len(chunk)
+                    tick([(0, size)], total)
+            self._finalize(source, part, part.with_suffix(".ranges"))
+            return size
+
     # ── internals ─────────────────────────────────────────────
 
     def _check_pause(self) -> None:
@@ -407,6 +450,13 @@ class Download:
             raise DownloadPaused("download paused during retry backoff")
 
     def _probe(self, url: str) -> _Remote:
+        local = _local_artifact_path(url)
+        if local is not None:
+            details = local.stat()
+            if not stat.S_ISREG(details.st_mode):
+                raise DownloadError(f"local artifact is not a regular file: {local}")
+            return _Remote(details.st_size, False)
+
         def request():
             self._check_pause()
             req = urllib.request.Request(url, headers={**_UA, "Range": "bytes=0-0"})
@@ -643,8 +693,6 @@ class Download:
                 raise HashError(
                     f"sha256 mismatch for {source.url}: pinned "
                     f"{source.sha256}, got {actual}")
-        import tempfile
-
         self._check_pause()
         source.dest.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix=f".{source.dest.name}-", suffix=".download", dir=source.dest.parent)

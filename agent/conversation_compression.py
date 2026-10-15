@@ -1634,6 +1634,9 @@ def _adopt_live_compression_child(
     agent.session_id = child_session_id
     _rebind_session_context(child_session_id)
     _hand_off_metrics_segment(parent_session_id, child_session_id)
+    from hermes_cli.session_messages import alias_session_route
+    from hermes_constants import get_hermes_home
+    alias_session_route(get_hermes_home(), parent_session_id, child_session_id)
     agent._session_db_created = True
     # The turn skips restore/rebuild while this slot is set, so it may hold only the child's own
     # prompt, and only when that prompt matches the current runtime (otherwise None -> rebuild).
@@ -1661,7 +1664,7 @@ def _adopt_live_compression_child(
                 bind_state(session_db=session_db, session_id=child_session_id)
     with _swallow('memory manager compression-child adoption failed: %s'):
         if agent._memory_manager:
-            agent._memory_manager.on_session_switch(
+            agent._memory_manager.queue_session_switch(
                 child_session_id, parent_session_id=parent_session_id, reset=False, reason="compression"
             )
     return recovered
@@ -3356,6 +3359,9 @@ def _publish_rotated_compaction(
     agent.session_id = new_session_id
     agent._db_flush_scan_prefix = None
     _rebind_session_context(agent.session_id)
+    from hermes_cli.session_messages import alias_session_route
+    from hermes_constants import get_hermes_home
+    alias_session_route(get_hermes_home(), old_session_id, new_session_id)
     agent._session_db_created = True
     _carry_session_state_to_child(agent, old_session_id, old_title)
 
@@ -3439,7 +3445,7 @@ def _finish_compaction_boundary(
     # Fires in BOTH modes so buffers don't double-count dropped turns in-place.
     with _swallow('memory manager on_session_switch (compression): %s'):
         if (bool(_old_sid) or in_place) and agent._memory_manager:
-            agent._memory_manager.on_session_switch(
+            agent._memory_manager.queue_session_switch(
                 agent.session_id or "", parent_session_id=_boundary_parent, reset=False, reason="compression"
             )
 

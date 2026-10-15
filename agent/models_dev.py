@@ -793,8 +793,16 @@ def _builtin_model_metadata(
     provider: str, model: str, *, config: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Built-in metadata for a provider/model pair, if Hermes has a vendor-specific entry."""
-    provider_key = _models_dev_id(provider, config=config) or (provider or "").strip()
-    return _BUILTIN_MODEL_METADATA.get((provider_key, (model or "").strip().lower()))
+    from providers import get_provider_profile
+    profile = get_provider_profile(provider)
+    from providers.routes import call_model_declaration
+    declared = call_model_declaration(profile, "fallback_model_metadata", model) if profile else None
+    if declared is not None:
+        return declared
+    provider_key = (provider or "").strip().lower()
+    model_key = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return (_BUILTIN_MODEL_METADATA.get((provider_key, model_key))
+            or _BUILTIN_MODEL_METADATA.get((_models_dev_id(provider, config=config) or provider_key, model_key)))
 
 
 def _relay_vision_marker_metadata(provider: str, model: str) -> Optional[dict[str, Any]]:

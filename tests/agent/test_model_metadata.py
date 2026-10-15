@@ -480,7 +480,8 @@ class TestCodexOAuthContextLength:
             for key in mm._codex_oauth_context_cache
         )
 
-    def test_probe_failure_falls_back_to_hardcoded(self):
+    @pytest.mark.parametrize("model", ["gpt-5.5", "gpt-6-astra"])
+    def test_probe_failure_falls_back_to_hardcoded(self, model):
         """If the probe fails (non-200 / network error), we still return
         the hardcoded 272k rather than leaking through to models.dev 1.05M."""
         from agent.model_metadata import get_model_context_length
@@ -493,7 +494,7 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             ctx = get_model_context_length(
-                model="gpt-5.5",
+                model=model,
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key=_codex_jwt("expired-token"),
                 provider="openai-codex",
@@ -586,7 +587,7 @@ class TestCodexOAuthContextLength:
         assert remaining.get(other_key) == 128_000
 
 
-    @pytest.mark.parametrize("slug", ["gpt-5.6-sol"])
+    @pytest.mark.parametrize("slug", ["gpt-5.6-sol", "gpt-6-astra"])
     def test_base_slug_keeps_advertised_272k(self, slug):
         """Base slugs (no ``-900k`` suffix) keep the advertised 272K — the
         cheaper default limit. The verified-above bump is opt-in only."""
@@ -1254,8 +1255,8 @@ class TestGetModelContextLength:
 
     def test_codex_proxy_route_caps_an_opted_in_variant_by_its_own_catalog_max(self):
         """On a custom codex_responses route the -900k bump is capped by the gateway's own Codex-shaped
-        max_context_window, asked once with the route's key at the route's URL; its context_window is not
-        trusted, the base slug keeps the Codex table value, and a gateway without a Codex catalog is not
+        max_context_window, asked once with the route's key at the route's URL; the base slug follows the
+        catalog's context_window clamped to that max, and a gateway without a Codex catalog is not
         re-probed on every resolution."""
         from agent import model_metadata as mm
 
@@ -1269,7 +1270,7 @@ class TestGetModelContextLength:
              patch.object(mm, "get_cached_context_length", return_value=None), patch.object(mm, "save_context_length"):
             with patch("agent.model_metadata.model_metadata_http.get", return_value=codex_shaped) as get:
                 assert get_model_context_length("gpt-6-sol-900k", **route) == 600_000
-                assert get_model_context_length("gpt-6-sol", **route) == mm._CODEX_OAUTH_CONTEXT_FALLBACK["gpt-6-sol"]
+                assert get_model_context_length("gpt-6-sol", **route) == 600_000  # live 1.05M clamped to its max
                 assert get.call_args_list and all(c.args[0].startswith("http://127.0.0.1:8317/v1/") for c in get.call_args_list)
             mm._codex_oauth_context_cache.clear()
             mm._codex_oauth_max_context_cache.clear()
@@ -1278,6 +1279,27 @@ class TestGetModelContextLength:
                     assert get_model_context_length("gpt-6-sol-900k", **route) == 900_000
                 probes = get.call_count
             assert 0 < probes <= 2  # one probe (both client_version URLs at most), not one per resolution
+
+    def test_codex_proxy_route_follows_a_raised_catalog_default(self):
+        """A Codex-shaped route catalog (codex-lb) is followed live: when Codex raises a model's default
+        window, the base slug picks it up with no code change; an unchanged 272K stays 272K (no silent
+        -900k bump), and the window never exceeds the catalog's own max_context_window."""
+        from agent import model_metadata as mm
+
+        custom = [{"name": "codex-lb", "base_url": "http://127.0.0.1:2455/backend-api/codex", "api_mode": "codex_responses"}]
+        route = dict(base_url="http://127.0.0.1:2455/backend-api/codex", api_key="lb-key", provider="custom:codex-lb", custom_providers=custom)
+        catalog = MagicMock(status_code=200)
+        catalog.json.return_value = {"models": [
+            {"slug": "gpt-6.1-sol", "context_window": 600_000, "max_context_window": 872_000},
+            {"slug": "gpt-6-luna", "context_window": 272_000, "max_context_window": 872_000},
+            {"slug": "gpt-6-astra", "context_window": 1_000_000, "max_context_window": 872_000},
+        ]}
+        with patch.object(mm, "_codex_oauth_context_cache", {}), patch.object(mm, "_codex_oauth_max_context_cache", {}), \
+             patch.object(mm, "get_cached_context_length", return_value=None), patch.object(mm, "save_context_length"), \
+             patch("agent.model_metadata.model_metadata_http.get", return_value=catalog):
+            assert get_model_context_length("gpt-6.1-sol", **route) == 600_000
+            assert get_model_context_length("gpt-6-luna", **route) == 272_000
+            assert get_model_context_length("gpt-6-astra", **route) == 872_000
 
     def test_codex_proxy_route_explicit_context_length_override_still_wins(self):
         """providers.<name>.models[].context_length beats the Codex table on a codex_responses route (#102644)."""

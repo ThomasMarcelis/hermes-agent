@@ -1843,6 +1843,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         ctx.started_at = time.monotonic()
         self._running = False
         self._clear_plugin_message_injector()
+        from gateway.run_session_messages import close_session_message_routes
+        close_session_message_routes(self)
         self._draining = True
         self._mark_api_runs_shutdown_requested()
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.

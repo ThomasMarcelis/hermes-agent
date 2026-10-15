@@ -47,7 +47,7 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
-def _security_scan_skill(skill_dir: Path) -> Optional[str]:
+def _security_scan_skill(skill_dir: Path) -> str | None:
     """Post-write scan (opt-in); error string if blocked, else None. An "ask" verdict
     (dangerous findings) is surfaced as an error so the agent can retry without them."""
     if not _guard_agent_created_enabled():
@@ -117,20 +117,20 @@ _NAME_RULE = "Use lowercase letters, numbers, hyphens, dots, and underscores."
 
 # --- Validation helpers -------------------------------------------------------
 
-def _check_identifier(value: str, label: str, invalid: str) -> Optional[str]:
+def _check_identifier(value: str, label: str, invalid: str) -> str | None:
     if len(value) > MAX_NAME_LENGTH:
         return f"{label} exceeds {MAX_NAME_LENGTH} characters."
     return None if VALID_NAME_RE.match(value) else invalid
 
 
-def _validate_name(name: str) -> Optional[str]:
+def _validate_name(name: str) -> str | None:
     if not name:
         return "Skill name is required."
     return _check_identifier(
         name, "Skill name", f"Invalid skill name '{name}'. {_NAME_RULE} Must start with a letter or digit.")
 
 
-def _validate_category(category: Optional[str]) -> Optional[str]:
+def _validate_category(category: str | None) -> str | None:
     if category is None or (isinstance(category, str) and not category.strip()):
         return None
     if not isinstance(category, str):
@@ -143,7 +143,7 @@ def _validate_category(category: Optional[str]) -> Optional[str]:
     return _check_identifier(category, "Category", invalid)
 
 
-def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[str]:
+def _validate_frontmatter(content: str, *, new_skill: bool = False) -> str | None:
     """Validate frontmatter (name + description) and a non-empty body. ``new_skill`` (create
     only) also enforces SKILL_PROMPT_DESC_LIMIT so new skills never lose routing signal to
     index truncation; edit/patch skip it so existing over-limit skills stay maintainable."""
@@ -179,7 +179,7 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     return None
 
 
-def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
+def _validate_content_size(content: str, label: str = "SKILL.md") -> str | None:
     if len(content) > MAX_SKILL_CONTENT_CHARS:
         return (
             f"{label} content is {len(content):,} characters (limit: {MAX_SKILL_CONTENT_CHARS:,}). "
@@ -215,7 +215,7 @@ def _iter_skill_dirs(root: Path):
             yield skill_md.parent
 
 
-def _read_frontmatter_name(skill_md: Path) -> Optional[str]:
+def _read_frontmatter_name(skill_md: Path) -> str | None:
     """Read a SKILL.md's frontmatter ``name:`` — the name skills_list displays.
 
     Fail-quiet on unreadable files: the fallback lookup in ``_find_skill``
@@ -237,7 +237,7 @@ def _read_frontmatter_name(skill_md: Path) -> Optional[str]:
     return None
 
 
-def _find_skill(name: str) -> Optional[dict[str, Any]]:
+def _find_skill(name: str) -> dict[str, Any] | None:
     """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
 
     Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
@@ -352,18 +352,15 @@ def _skill_not_found_error(name: str, suffix: str = "") -> str:
     return base + suffix
 
 
-def _validate_file_path(file_path: str) -> Optional[str]:
+def _validate_file_path(file_path: str) -> str | None:
     """Validate a write_file/remove_file path: under an allowed subdir, no escape."""
     from tools.path_security import has_traversal_component
     if not file_path:
         return "file_path is required."
     parts = Path(file_path).parts
-    # Traversal first, so the SKILL.md exception is unreachable by a traversal-laden path.
+    # Supporting-file actions cannot bypass primary-document validation.
     if has_traversal_component(file_path):
         return "Path traversal ('..') is not allowed."
-    # SKILL.md lives at the skill root; accept 'SKILL.md' and '<skill>/SKILL.md'.
-    if parts and parts[-1] == "SKILL.md" and len(parts) in (1, 2):
-        return None
     if not parts or parts[0] not in ALLOWED_SUBDIRS:
         allowed = ", ".join(sorted(ALLOWED_SUBDIRS))
         return f"File must be under one of: {allowed}. Got: '{file_path}'"
@@ -390,10 +387,37 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = ""):
     skill_dir = existing["path"]
     guard = _background_review_delete_guard(name, skill_dir) if action == "delete" else None
     return (None, guard) if guard else (skill_dir, None)
+def _normalize_patch_file_path(
+    file_path: str | None,
+    skill_name: str,
+) -> str | None:
+    """Normalize explicit aliases for the primary ``SKILL.md`` document.
+
+    Supporting-file actions stay constrained to their allowlisted
+    subdirectories. Only ``patch`` accepts these aliases, routing them through
+    the primary-document validation path rather than treating them as files
+    that may be created or removed independently.
+    """
+    if not isinstance(file_path, str):
+        return file_path
+    normalized = file_path.strip()
+    path = Path(normalized)
+    if normalized in {"SKILL.md", "./SKILL.md"} or (
+        len(path.parts) == 2
+        and path.parts[0] == skill_name
+        and path.parts[1] == "SKILL.md"
+    ):
+        return None
+    return normalized
+
+
+# =============================================================================
+# Core actions
+# =============================================================================
 
 
 def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label: str,
-                   content: str) -> Optional[dict[str, Any]]:
+                   content: str) -> dict[str, Any] | None:
     """Read-before-write guard (existing targets only), atomic write, then the security scan;
     a blocked scan restores the original (or unlinks a new file). Error dict or None."""
     original = None
@@ -423,7 +447,7 @@ def _add_description_prompt_preview(result: dict[str, Any], content: str) -> dic
     return result
 
 
-def _attach_lint_findings(result: dict[str, Any], skill_md: Path, before: Optional[str] = None) -> None:
+def _attach_lint_findings(result: dict[str, Any], skill_md: Path, before: str | None = None) -> None:
     """Attach ADVISORY authoring findings (hard rejects already ran in _validate_frontmatter).
     With ``before`` (the pre-write content) only rules the write INTRODUCED are attached, so a
     patch reports the line it crossed rather than re-listing the skill's standing findings."""
@@ -514,9 +538,12 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
         return _err(_PATCH_NEEDS_NEW_STRING)
     # No old_string == new_string guard here: fuzzy_find_and_replace rejects that with a
     # richer error (file_preview) this layer cannot produce.
+    if isinstance(file_path, str) and not file_path.strip():
+        return _err("file_path cannot be blank when explicitly provided for 'patch'.")
     skill_dir, guard = _locate_for_write(name, "patch")
     if guard:
         return guard
+    file_path = _normalize_patch_file_path(file_path, name)
     target_label = file_path or "SKILL.md"
     if file_path:
         target, err = _resolve_supporting_file(skill_dir, file_path)
@@ -559,7 +586,7 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
     return result
 
 
-def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> dict[str, Any]:
+def _delete_skill(name: str, absorbed_into: str | None = None) -> dict[str, Any]:
     """Delete a skill. ``absorbed_into``: None = undeclared (legacy, accepted); "" = explicit prune;
     "<skill>" = absorbed into that umbrella, which must exist (so the model can't claim one)."""
     skill_dir, guard = _locate_for_write(name, "delete")

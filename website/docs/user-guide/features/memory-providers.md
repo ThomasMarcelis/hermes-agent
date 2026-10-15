@@ -484,68 +484,31 @@ Mem0 used to ship inside the Hermes tree (and as the `hermes-agent[mem0]` pip ex
 
 ### Hindsight
 
-:::info Plugin catalog
-Hindsight is maintained by [vectorize-io](https://github.com/vectorize-io/hindsight) and installed from the [plugin catalog](./plugins.md) rather than bundled with Hermes. Setup details live in the upstream docs: [hindsight.vectorize.io/sdks/integrations/hermes](https://hindsight.vectorize.io/sdks/integrations/hermes).
-:::
+This distribution uses the separately packaged **durable Hindsight** integration.
+It is distinct from the Vectorize catalog provider with the same `hindsight` name.
+Install a reviewed commit of the durable repository's `hindsight` subdirectory through
+native plugin installation, separately for every Hermes profile, then run
+`hermes memory setup hindsight`. The plugin's packaged README is the authoritative
+installation and configuration reference. The host deliberately refuses automatic
+catalog substitution for an existing durable Hindsight configuration.
 
-Long-term memory with knowledge graph, entity resolution, and multi-strategy retrieval. The `hindsight_reflect` tool provides cross-memory synthesis that no other provider offers. Automatically retains full conversation turns (including tool calls) with session-level document tracking.
+The durable provider requires memory lifecycle API 1, exported by the paired host.
+Stock v0.22.2 alone is insufficient. PM admits its pinned `hindsight-client==0.6.1`;
+embedded server packages must be provisioned separately and are never installed on
+first use by this provider.
 
-| | |
-|---|---|
-| **Best for** | Knowledge graph-based recall with entity relationships |
-| **Requires** | `hermes plugins install hindsight`. Cloud: API key from [ui.hindsight.vectorize.io](https://ui.hindsight.vectorize.io). Local: LLM API key (OpenAI, Groq, OpenRouter, etc.) |
-| **Data storage** | Hindsight Cloud, local embedded PostgreSQL, or an external local Hindsight server |
-| **Cost** | Hindsight pricing (cloud) or free (local) |
+Configuration comes from `$HERMES_HOME/hindsight/config.json`, then the shared legacy
+`$HOME/.hindsight/config.json`, with documented environment fallbacks. The host's
+`memory.hindsight` block is not read. Existing bank contents require no migration.
+Automatic retention sends user and final assistant text; built-in memory writes are
+not mirrored. Tools provide explicit retain, recall and reflect, subject to the
+plugin's mode and `expose_retain_tool` settings.
 
-**Tools:** `hindsight_retain` (store with entity extraction), `hindsight_recall` (multi-strategy search), `hindsight_reflect` (cross-memory synthesis)
-
-**Setup:**
-```bash
-hermes plugins install hindsight   # from the plugin catalog; answer "Use 'hindsight' as the memory provider now?"
-hermes memory setup                # select "hindsight"
-# Or manually:
-hermes config set memory.provider hindsight
-echo "HINDSIGHT_API_KEY=your-key" >> ~/.hermes/.env
-```
-
-The plugin lands in `~/.hermes/plugins/hindsight/` (per profile home). A memory provider is activated by `memory.provider` in `config.yaml`, not `plugins.enabled`: accepting the install prompt (or passing `--enable`) sets it, and declining leaves it unchanged so `hermes memory setup` can pick it later. `hermes plugins enable hindsight` does not activate a memory provider. `hermes memory setup`, `hermes memory status`, `hermes plugins list` and the dashboard Memory settings all work with the catalog-installed plugin. In local embedded mode the plugin installs `hindsight-all` on first use through Hermes' lazy-install path, which honours `security.allow_lazy_installs`.
-
-**Local mode UI:** `hindsight-embed -p hermes ui start`
-
-**Config:** `$HERMES_HOME/hindsight/config.json`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `mode` | `cloud` | `cloud`, `local_embedded`, or `local_external` |
-| `bank_id` | `hermes` | Memory bank identifier |
-| `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
-| `memory_mode` | `hybrid` | `hybrid` (context + tools), `context` (auto-inject only), `tools` (tools only) |
-| `auto_retain` | `true` | Automatically retain conversation turns |
-| `auto_recall` | `true` | Automatically recall memories before each turn |
-| `retain_async` | `true` | Process retain asynchronously on the server |
-| `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
-| `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
-| `retain_source` | — | Optional `metadata.source` attached to retained memories |
-| `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
-| `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
-| `recall_tags` | — | Tags to filter on recall |
-
-See the [upstream Hermes integration docs](https://hindsight.vectorize.io/sdks/integrations/hermes) for the full configuration reference.
-
-#### Migrating from bundled Hindsight
-
-Hindsight used to ship inside the Hermes tree (and as the `hermes-agent[hindsight]` pip extra). If your `config.yaml` already has `memory.provider: hindsight`, there is nothing to do for most users:
-
-- `hermes update` installs the catalog plugin into every profile home that names the provider. Each line names the profile it is about. In a terminal it asks before preparing the plugin's Python dependencies; when several profiles use the provider, the questions are asked once and the answers apply to all of them. Without a terminal (the Desktop app, a script, a service) nobody can answer, so each profile prepares them unattended when its `security.allow_lazy_installs` is on (the default); a profile with it off gets the exact `hermes -p <profile> plugins install hindsight` command instead, and the other profiles still migrate.
-- If the plugin is still missing on the first agent start (`hermes chat`, Desktop, the gateway, …), Hermes installs it, dependencies included, and shows ``✓ Memory provider 'hindsight' moved out of core — installed its plugin from the catalog (memory.provider and your stored memories are unchanged; check its settings with `hermes memory status`).`` Messaging platforms get the line with the first reply.
-- When the agent-start install cannot happen, you see why instead of silently running without external memory: with `security.allow_lazy_installs: false` the warning names the install command for that profile; offline or declined installs show the error and the same command. After a failed attempt, agent starts in the next hour skip the install and only repeat the command; `hermes update` always retries.
-- Agent start never asks a question (the chat prompt owns the terminal). A catalog provider that never shipped with Hermes (for example `mnemosyne`) is therefore not installed on agent start: the warning names `hermes plugins install <name>` for that profile, or install it from the dashboard/Desktop Plugins page.
-
-What changes on disk: the plugin appears in `~/.hermes/plugins/hindsight/` and `config.yaml` gains `plugins.enabled: [hindsight]`. `memory.provider`, `$HERMES_HOME/hindsight/config.json`, `HINDSIGHT_API_KEY` in `.env` and your memory bank data are untouched. Verify with `hermes memory status` (provider active) and `hermes plugins list` (plugin installed and enabled).
-
-:::warning Where the plugin reads its config
-Hindsight reads `$HERMES_HOME/hindsight/config.json` (per profile home), `~/.hindsight/config.json` (legacy shared), and the `HINDSIGHT_*` variables in `.env`. It does not read a `memory.hindsight` section of `config.yaml`: a `memory.hindsight.*` key there is ignored. Edit the plugin's own `config.json` (key table above) or use `hermes memory setup`.
-:::
+CLI/TUI rewind identifies removed messages, including sessions without SQLite. It
+can cancel undispatched removed turns, but shared append documents are never replaced
+or deleted: already dispatched turns remain retained to protect older memories.
+Messaging-gateway undo/retry does not notify the provider and does not revoke retained
+memory. The plugin guide details unique-document repair and timeout limitations.
 
 ---
 

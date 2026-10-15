@@ -2,7 +2,9 @@
 import tomllib
 from pathlib import Path
 
+from packaging.markers import Marker
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +53,38 @@ def test_starlette_server_pins_and_lock_exclude_cve_2026_48710():
     assert len(pins) == 1 and pins[0].operator == "==" and Version(pins[0].version) >= floor
     versions = [Version(row["version"]) for row in lock["package"] if row["name"] == "starlette"]
     assert versions and all(version >= floor for version in versions)
+
+
+def test_cryptography_override_respects_declared_markers_and_locked_pin():
+    """Retain marker and manifest/lock coherence beyond upstream's exact-pin guard."""
+    manifest = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    direct = [req for req in map(Requirement, manifest["project"]["dependencies"])
+              if req.name == "cryptography"]
+    overrides = [req for req in map(Requirement, manifest["tool"]["uv"]["override-dependencies"])
+                 if req.name == "cryptography"]
+    assert direct and overrides
+    locked_overrides = [row for row in lock["manifest"]["overrides"] if row["name"] == "cryptography"]
+    assert {str(req.specifier) for req in overrides} == {row["specifier"] for row in locked_overrides}
+    hermes = next(row for row in lock["package"] if row["name"] == manifest["project"]["name"])
+    locked_direct = [row for row in hermes["metadata"]["requires-dist"] if row["name"] == "cryptography"]
+    assert {SpecifierSet(row["specifier"]) for row in locked_direct} == {
+        req.specifier for req in direct
+    }
+    for python_version in ("3.11", "3.12", "3.13", "3.14", "3.15"):
+        environment = {"python_version": python_version, "python_full_version": python_version + ".0"}
+        # uv normalizes python_version markers to python_full_version in the lock.
+        # Compare which requirements apply, retaining coverage of the version boundary.
+        declared_active = {req.specifier for req in direct
+                           if not req.marker or req.marker.evaluate(environment)}
+        locked_active = {SpecifierSet(row["specifier"]) for row in locked_direct
+                         if not row.get("marker") or Marker(row["marker"]).evaluate(environment)}
+        assert declared_active == locked_active
+        for requirement in direct:
+            if requirement.marker and not requirement.marker.evaluate(environment):
+                continue
+            active = [req for req in overrides if not req.marker or req.marker.evaluate(environment)]
+            assert active and all(req.specifier == requirement.specifier for req in active)
 
 
 def test_every_dependency_is_held_to_one_three_day_release_age():

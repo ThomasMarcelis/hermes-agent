@@ -935,7 +935,7 @@ def _cmd_undo(rid, params, session, name, arg):
         return _err(rid, 4001, "no active session to undo")
     if busy := _busy_error(rid, session, "undo"):
         return busy
-    if not (session_key := session.get("session_key", "")):
+    if not session.get("session_key", ""):
         return _err(rid, 4001, "no session key for undo")
     arg_str = (arg or "").strip()
     try:
@@ -950,21 +950,8 @@ def _cmd_undo(rid, params, session, name, arg):
         rewound, err = _rewind_or_err(rid, session, len(user_indices) - turns_undone, (4004, "undo: "), "undo: ")
         if err:
             return err
-        active, live_view, rewound_count = rewound
+        _active, live_view, rewound_count = rewound
         target_text = _tools_mod("agent.message_content").flatten_message_text(live_view.get("content"))
-    # Notify memory providers (same hook /branch fires) with rewound=True so cached per-turn state invalidates.
-    agent = session.get("agent")
-    if agent is not None:
-        # See #6672 + #21910.
-        mm = getattr(agent, "_memory_manager", None)
-        for step in (
-            lambda: mm is not None and mm.on_session_switch(
-                session_key, parent_session_id="", reset=False, rewound=True),
-            lambda: hasattr(agent, "_invalidate_system_prompt") and agent._invalidate_system_prompt(),
-            lambda: hasattr(agent, "_last_flushed_db_idx") and setattr(agent, "_last_flushed_db_idx", len(active)),
-        ):
-            with contextlib.suppress(Exception):
-                step()
     _tui_model_friction("undo", session, turns_undone)
     turn_word = "turn" if turns_undone == 1 else "turns"
     notice = f"↶ Undid {turns_undone} {turn_word} ({rewound_count} message(s)). Edit and resubmit, or send a new message."

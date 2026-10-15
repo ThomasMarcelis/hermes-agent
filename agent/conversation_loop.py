@@ -1734,12 +1734,14 @@ def run_conversation(
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
 
-    # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
+    from agent.interrupt_control import _ic_lock
     agent._turn_user_intervened = False
-    # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
-    # it does not embed the same pixels a second time into the same request (#76411).
-    with native_turn_images(user_message):
-        try:
+    result = None
+    with _ic_lock(agent, "_pending_steer_lock"):
+        agent._session_message_steer_active = True
+    try:
+        # Keep native images available to vision tools without embedding them twice.
+        with native_turn_images(user_message):
             result = _run_conversation_turn(
                 agent,
                 user_message,
@@ -1757,8 +1759,18 @@ def run_conversation(
                 title_user_message=title_user_message,
                 prelude=prelude,
             )
-        finally:
-            end_voice_turn_route(agent)
+    finally:
+        end_voice_turn_route(agent)
+        # Includes early return paths which bypass finalize_turn. Close admission and
+        # drain atomically so no accepted plugin message disappears at turn teardown.
+        with _ic_lock(agent, "_pending_steer_lock"):
+            agent._session_message_steer_active = False
+            leftover = getattr(agent, "_pending_steer", None)
+            if isinstance(result, dict) and leftover:
+                existing = result.get("pending_steer")
+                from agent.steer_messages import combine_steer
+                result["pending_steer"] = combine_steer(existing, leftover)
+                agent._pending_steer = None
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

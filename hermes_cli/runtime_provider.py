@@ -340,7 +340,13 @@ def is_foreign_provider_endpoint(provider: Optional[str], base_url: Optional[str
     url = str(base_url or "").strip().rstrip("/")
     if pconfig is None or not url or url == (pconfig.inference_base_url or "").rstrip("/"):
         return False
-    return any(url == (other.inference_base_url or "").rstrip("/") for other in PROVIDER_REGISTRY.values())
+    from providers import get_provider_profile
+    for name, other in PROVIDER_REGISTRY.items():
+        if url == (other.inference_base_url or "").rstrip("/"):
+            profile = get_provider_profile(name)
+            if profile is None or profile.infer_from_hostname:
+                return True
+    return False
 
 
 def _anthropic_base_url_override_ok(base_url: str) -> bool:

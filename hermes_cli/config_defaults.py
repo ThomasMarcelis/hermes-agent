@@ -131,6 +131,8 @@ DEFAULT_CONFIG = {
         # whole call; the OpenAI SDK also retries transient errors (max_retries=2). Set 1 for fast
         # failover to fallback providers; raise to tolerate longer provider hiccups.
         "api_max_retries": 3,
+        # Timeout for the sync-to-async tool bridge inside an event loop.
+        "async_tool_timeout_seconds": 300,
         # Once api_max_retries AND the fallback chain are spent on a transient outage (5xx,
         # overloaded/529, connect/read timeouts) with nothing delivered yet, wait and retry this many
         # more cycles (jittered 15/30/60/60/60s; a provider Retry-After wins up to 120s) with a
@@ -1316,6 +1318,9 @@ DEFAULT_CONFIG = {
         # true = foreground writes prompt inline; background writes are staged (/memory
         # pending|approve <id>|reject <id>). To disable memory: memory_enabled.
         "write_approval": False,
+        # Opt-in: let unattended background review apply patch/remove directly instead of
+        # staging them in /memory pending (adds are always applied; bulk deletion stays staged).
+        "background_review_allow_destructive": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
@@ -1328,6 +1333,9 @@ DEFAULT_CONFIG = {
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
     # every configured provider is supported.
     "delegation": {
+        # Root calls join all child outcomes for one synthesis. Explicit detach delivers
+        # later completions; nested orchestrators always join their own workers.
+        "top_level_completion": "join",
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
         # Fallback chain for delegated children (same entry format as the top-level list).
@@ -2204,6 +2212,13 @@ DEFAULT_CONFIG = {
         # huge remote URLs can OOM-kill constrained deployments. Enforced in
         # gateway/platforms/base.py for every adapter. 0 = no cap. Default 128 MiB.
         "max_inbound_media_bytes": 134217728,
+        # Decode limits for inbound images. These complement the byte cap:
+        # compressed images and animations can expand far beyond wire size.
+        # Non-positive values fall back to these safe defaults.
+        "max_inbound_image_pixels": 40000000,
+        "max_inbound_image_total_pixels": 100000000,
+        "max_inbound_image_frames": 256,
+
         # Let adapters read HTTP_PROXY/HTTPS_PROXY/NO_PROXY/SSL_CERT_FILE from the environment and
         # auto-detect generic/macOS system proxies. False when the gateway inherits a proxy it must
         # not use (e.g. a scheduled task picking up a Clash/V2Ray HTTP_PROXY -> "Cannot connect to

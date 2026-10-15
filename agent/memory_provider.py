@@ -36,6 +36,11 @@ def spawn_context_thread(target: Callable[..., Any], *, name: str, daemon: bool 
 # checkpoint (normalized evidence handoff + strict-mode failure propagation).
 PRE_COMPRESS_CHECKPOINT_API_VERSION = 2
 
+# Host contract: FIFO session switches fence foreground access; flush_pending drains provider
+# work; completed syncs carry final-assistant identities even without SQLite; CLI/TUI rewinds
+# report removed message identities (an explicitly empty set never means a turn-count fallback).
+MEMORY_LIFECYCLE_API_VERSION = 1
+
 # Default glyph for recall indicators; providers may use their own brand mark.
 INDICATOR_GLYPH = "🧠"
 

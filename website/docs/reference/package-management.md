@@ -26,6 +26,15 @@ Each file has a separate role:
 A lockfile entry does not prove that a package is installed. `hermes pm doctor`
 compares the installed state with the lock and checks the realized bytes.
 Startup uses a cheaper check. It does not query upstream versions on every launch.
+
+Managed-tool pins can also use an absolute `file://` URL for a local artifact,
+with a full lowercase SHA-256 digest. Only an empty authority or `localhost`
+is accepted; network shares, directories, query strings and fragments are
+rejected. PM copies and verifies the artifact before atomically publishing
+it, leaving any previous destination intact on failure. Keep the artifact
+at its pinned path for subsequent installs and repairs. Remote sources still
+require HTTPS, and remote redirects cannot switch to a local file.
+
 For self-managed source installs, the pre-import launcher compares PM's recorded
 successful dependency stamp with the current inputs. Missing or stale completion
 state triggers a sync, then the same command restarts on the managed Python before

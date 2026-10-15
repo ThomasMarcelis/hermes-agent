@@ -33,7 +33,7 @@ _attempted: set[tuple[str, str]] = set()
 # Providers that shipped bundled in core. Unattended consent covers only these: their users already
 # accepted the deps when they picked the built-in. Any other catalog plugin named in memory.provider
 # (a synced config, a cloned profile) still needs an explicit install.
-_LEFT_CORE = frozenset({"hindsight", "honcho", "mem0", "supermemory", "openviking", "retaindb", "byterover", "holographic"})
+_LEFT_CORE = frozenset({"honcho", "mem0", "supermemory", "openviking", "retaindb", "byterover", "holographic"})
 
 # The startup retry window doubles with each consecutive failure, up to a week: a flat window had a
 # home whose install can never succeed (a version gate, a root-owned plugins dir, no route to GitHub)
@@ -115,6 +115,10 @@ def catalog_install_hint(name: str, *, category: Optional[str] = None) -> Option
     failed migration): doctor, ``memory status``, ``memory setup <name>`` and the CLI's unknown-command
     error point at the one command that fixes it. In-tree catalog only, never the network — these run
     offline and on error paths."""
+    if name == "hindsight":
+        # This fork's durable provider is a separate distribution. The catalog
+        # lineage has different delivery semantics and is not an automatic replacement.
+        return None
     try:
         from hermes_cli.plugin_catalog import get_catalog_entry
         entry = get_catalog_entry(name) if name else None
@@ -132,6 +136,11 @@ def _pending_provider(home: Path, *, say: Callable[[str], None]) -> Optional[str
     name = configured_provider(home)
     from agent.memory_provider import is_core_memory_provider
     if is_core_memory_provider(name) or provider_present(name, home):
+        return None
+    if name == "hindsight":
+        say("  ⚠ Durable Hindsight is configured but not installed. Install the reviewed "
+            "hermes-hindsight-durable provider into this profile's plugins/hindsight directory "
+            "before starting memory; the catalog provider is not an automatic replacement.")
         return None
     if catalog_source(name) is None:
         say(f"  ⚠ Memory provider '{name}' is configured but not installed and not in the plugin catalog. "

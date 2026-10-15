@@ -23,14 +23,15 @@ from typing import Optional, Dict, Any
 
 from utils import is_truthy_value
 from tools.transcription_common import (
-    BUILTIN_STT_PROVIDERS, CLOUD_STT_PROVIDERS, DEFAULT_ELEVENLABS_STT_MODEL,
+    BUILTIN_STT_PROVIDERS, DEFAULT_ELEVENLABS_STT_MODEL,
     DEFAULT_GROQ_STT_MODEL, DEFAULT_LOCAL_MODEL, DEFAULT_MISTRAL_STT_MODEL, DEFAULT_PROVIDER,
     DEFAULT_STT_MODEL, LOCAL_STT_COMMAND_ENV, LOCAL_STT_LANGUAGE_ENV,
     normalize_xai_stt_model, _error_result, _get_stt_section, _ok_result)
 from tools.transcription_audio import (
     _convert_caf_to_wav, _prepare_audio_for_transcription, _trim_silence_for_cloud_stt,
     _validate_audio_file, _validate_audio_source_file)
-from tools.transcription_chunking import exceeds_upload_limit, transcribe_oversized, upload_limit
+from tools.transcription_chunking import exceeds_upload_limit, transcribe_oversized
+from tools.transcription_policy import provider_audio_policy
 from tools.transcription_local import (
     _get_idle_unload_seconds, _has_local_command, _join_confident_segments,
     _load_local_whisper_model, _looks_like_cuda_lib_error, _normalize_local_model,
@@ -42,7 +43,8 @@ from tools.transcription_cloud import (
     _transcribe_elevenlabs, _transcribe_groq, _transcribe_mistral, _transcribe_openai,
     _transcribe_xai)
 from tools.transcription_command import (
-    _apply_pre_transcription_hook, _dispatch_to_plugin_provider, _enforce_prompt_length_limit,
+    _UNRESOLVED_PROVIDER, _apply_pre_transcription_hook, _dispatch_to_plugin_provider,
+    _enforce_prompt_length_limit, _get_plugin_provider,
     _resolve_command_stt_provider_config, _transcribe_command_stt, _unregistered_stt_provider_error)
 
 logger = logging.getLogger(__name__)
@@ -445,6 +447,12 @@ def _transcribe_prepared_audio(
         return _error_result("STT is disabled in config.yaml (stt.enabled: false).")
     provider = _get_provider(stt_config)
     remote = not _is_local_stt_provider(provider, stt_config)
+    plugin_provider = _get_plugin_provider(provider, stt_config)
+    try:
+        limit, cloud_preprocessing = provider_audio_policy(
+            provider, _limit_model_name(provider, stt_config, model), plugin_provider)
+    except ValueError as exc:
+        return _error_result(str(exc), provider=provider)
     with ExitStack() as cleanup:
         # Never overwrite a neighboring WAV or leave converted voice notes behind.
         if remote and Path(file_path).suffix.lower() == ".caf":
@@ -452,20 +460,20 @@ def _transcribe_prepared_audio(
             file_path = _convert_caf_to_wav(file_path, work_dir)
             if not file_path:
                 return _error_result("CAF audio could not be converted to WAV.")
-        # Best-effort pre-upload silence trim for built-in cloud providers.
-        if provider in CLOUD_STT_PROVIDERS:
+        # Best-effort pre-upload silence trim for cloud providers that opt in.
+        if cloud_preprocessing:
             trimmed = _trim_silence_for_cloud_stt(file_path, stt_config)
             if trimmed:
                 file_path = trimmed
                 cleanup.callback(shutil.rmtree, os.path.dirname(trimmed), ignore_errors=True)
         if remote:
-            limit = upload_limit(provider, _limit_model_name(provider, stt_config, model))
             if exceeds_upload_limit(file_path, limit):
                 # Hints are resolved once for the whole recording, not once per segment.
                 hints = _resolve_dispatch_hints(file_path, provider, stt_config, model, source)
                 return transcribe_oversized(
-                    file_path, limit, lambda part: _route_stt_provider(part, provider, stt_config, *hints))
-        return _dispatch_stt_provider(file_path, provider, stt_config, model, source)
+                    file_path, limit, lambda part: _route_stt_provider(
+                        part, provider, stt_config, *hints, plugin_provider=plugin_provider))
+        return _dispatch_stt_provider(file_path, provider, stt_config, model, source, plugin_provider)
 
 
 def _limit_model_name(provider: str, stt_config: dict[str, Any], model: Optional[str]) -> Optional[str]:
@@ -513,15 +521,16 @@ def _resolve_dispatch_hints(
 
 def _dispatch_stt_provider(
     file_path: str, provider: str, stt_config: dict[str, Any], model: Optional[str] = None,
-    source: Optional[str] = None) -> dict[str, Any]:
+    source: Optional[str] = None, plugin_provider=_UNRESOLVED_PROVIDER) -> dict[str, Any]:
     """Route *file_path* to the handler for *provider* (built-in > command > plugin)."""
     return _route_stt_provider(
-        file_path, provider, stt_config, *_resolve_dispatch_hints(file_path, provider, stt_config, model, source))
+        file_path, provider, stt_config, *_resolve_dispatch_hints(file_path, provider, stt_config, model, source),
+        plugin_provider=plugin_provider)
 
 
 def _route_stt_provider(
     file_path: str, provider: str, stt_config: dict[str, Any], model: Optional[str],
-    language: Optional[str], prompt: Optional[str]) -> dict[str, Any]:
+    language: Optional[str], prompt: Optional[str], *, plugin_provider=_UNRESOLVED_PROVIDER) -> dict[str, Any]:
     if provider in BUILTIN_STT_PROVIDERS:
         # Looked up in this module at call time so tests may patch ``_transcribe_*``.
         handler = globals()[f"_transcribe_{provider}"]
@@ -536,10 +545,16 @@ def _route_stt_provider(
     if command_provider_config is not None:
         return _transcribe_command_stt(file_path, provider, command_provider_config, stt_config,
                                        model_override=model, language_override=language, prompt=prompt)
-    # Plugin backend: reads ``stt.<provider>`` like built-ins; the ``model`` argument overrides it.
+    if plugin_provider is _UNRESOLVED_PROVIDER:
+        plugin_provider = _get_plugin_provider(provider, stt_config)
+    if plugin_provider is None:
+        return _no_provider_error(provider, stt_config)
+    # Aliases precede global/env fallback, while explicit hook hints still win.
     plugin_result = _dispatch_to_plugin_provider(
         file_path, provider, stt_config, model=model or _get_stt_section(stt_config, provider).get("model"),
-        language=language or _resolve_stt_language(provider, stt_config), prompt=prompt)
+        language=language or _resolve_stt_language(
+            provider, stt_config, extra_keys=plugin_provider.language_config_aliases),
+        prompt=prompt, plugin_provider=plugin_provider)
     return plugin_result if plugin_result is not None else _no_provider_error(provider, stt_config)
 
 

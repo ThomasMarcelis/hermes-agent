@@ -662,6 +662,17 @@ The shell command runs under the same user as Hermes with full filesystem access
 
 For STT engines that aren't built-in AND can't be expressed as a shell command (need a Python SDK, OAuth-refreshing auth, streaming chunks, etc.), register a Python plugin via `ctx.register_transcription_provider()`. The plugin **coexists with** the 8 built-in providers (`local`, `local_command`, `groq`, `openai`, `mistral`, `xai`, `elevenlabs`, `deepinfra`) and the `stt.providers.<name>: type: command` registry — built-ins keep their native implementations and always win on name collision; command providers win over plugins of the same name (config is more local than plugin install).
 
+#### Migrating extended ElevenLabs Scribe controls
+
+The standalone `elevenlabs-scribe` plugin preserves keyterms, file vocabulary,
+`no_verbatim`, logging, the original upload cap and cloud preprocessing. It requires
+this host's public audio-policy and language-alias capabilities; vanilla v0.22.2 is
+unsupported. Prepare a candidate with the new host interpreter in an isolated profile
+before a coordinated host/plugin/config cutover. The helper preserves the old stanza,
+refuses active streaming and requires explicit consent to Desktop gateway relay.
+The publisher must supply the public host integration reference and plugin README
+before publication; no live configuration is migrated automatically.
+
 #### When to pick which (STT)
 
 | Backend has…                                                 | Use                                                              |

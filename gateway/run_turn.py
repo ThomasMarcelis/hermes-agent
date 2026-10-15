@@ -434,6 +434,10 @@ class GatewayTurnMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
+            from gateway.run_session_messages import session_message_event_is_current
+            if not session_message_event_is_current(self, event, session_entry):
+                return
+            pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
             if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
                 logger.warning(
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
@@ -1132,6 +1136,8 @@ class GatewayTurnMixin:
                 _hyg_in_place = False
             else:
                 session_entry.session_id = _hyg_new_sid
+                from gateway.run_session_messages import alias_session_message_route
+                alias_session_message_route(self, session_entry.session_key, _hyg_new_sid)
                 # The held turn lease follows the rotation (alias keys still serialize on this turn).
                 self._rebind_turn_lease(_quick_key, run_generation, _hyg_new_sid)
                 await self.async_session_store._save()
@@ -1571,6 +1577,8 @@ class GatewayTurnMixin:
         if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
             if session_entry.session_id == _run_start_session_id:
                 session_entry.session_id = agent_result["session_id"]
+                from gateway.run_session_messages import alias_session_message_route
+                alias_session_message_route(self, session_key, session_entry.session_id)
                 # The held turn lease follows the rotation (persistence writes to the NEW id).
                 self._rebind_turn_lease(_quick_key, run_generation, session_entry.session_id)
                 await self.async_session_store._save()
@@ -2671,8 +2679,11 @@ class GatewayTurnMixin:
     ) -> tuple[Any, Optional[Callable[[], None]]]:
         """Build the shared ``StreamConsumerConfig`` and optional Telegram pause-typing closure.
         For non-editing adapters ``on_missing_cursor="fallback"`` streams with an empty cursor;
-        ``"raise"`` raises ``RuntimeError`` so the caller skips streaming entirely."""
+        ``"raise"`` raises ``RuntimeError`` so the caller skips streaming entirely.
+        Final-only adapters reject both modes: each preview would be a permanent delivery."""
         from gateway.stream_consumer import StreamConsumerConfig
+        if getattr(adapter, "FINAL_ONLY_DELIVERY", False) is True:
+            raise RuntimeError("skip streaming for final-only delivery adapter")
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
             def _pause_typing_before_finalize(_adapter=adapter, _chat_id=source.chat_id) -> None:
@@ -2931,6 +2942,10 @@ class GatewayTurnMixin:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
         with self._profile_scope_for_source(source):
+            from gateway.run_session_messages import ensure_session_message_route
+            session_key, generation = turn_kwargs.get("session_key"), turn_kwargs.get("run_generation")
+            if generation is None or self._is_session_run_current(session_key, generation):
+                ensure_session_message_route(self, source, session_key, session_id)
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> GatewayRunner._RunAgentDisplay:
@@ -2944,17 +2959,17 @@ class GatewayTurnMixin:
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        tool_preview_max_len = max(0, int(resolve_display_setting(
+            user_config, platform_key, "tool_preview_length", 40)))
         enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
         adapter = self._delivery_adapter_for(source)
-        # Tool preview length (0 = no limit) and friendly tool labels (default on), per-platform.
-        for _setter, _setting, _default, _cast in (
-            ("set_tool_preview_max_len", "tool_preview_length", 0, lambda v: int(v) if v else 0),
-            ("set_friendly_tool_labels", "friendly_tool_labels", True, bool),
-        ):
-            with suppress(Exception):
-                from agent import display as _agent_display
-                _val = resolve_display_setting(user_config, platform_key, _setting, _default)
-                getattr(_agent_display, _setter)(_cast(_val))
+        # The agent producer must not pre-cap previews in a process-global
+        # setting: concurrent profile turns can have different budgets. The
+        # final gateway renderer uses the turn-local value above exactly once.
+        from agent import display as _agent_display
+        _agent_display.set_tool_preview_max_len(0)
+        _agent_display.set_friendly_tool_labels(bool(resolve_display_setting(
+            user_config, platform_key, "friendly_tool_labels", True)))
 
         # Resolve the mode and its provenance together: null inherits, tier off is not intent.
         # A raw os.getenv here reads whichever profile's env loaded last under multiplexing
@@ -2997,13 +3012,14 @@ class GatewayTurnMixin:
                         if kind in {"heartbeat", "waiting", "long_running", "status"}
                         else t("gateway.progress.status_fallback_short"))
 
-        # Webhooks can't edit messages, so tool progress / log mode are off there.
+        # Immutable delivery targets must emit only the completed response.
         is_webhook = source.platform == Platform.WEBHOOK
-        tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook
+        final_only = getattr(adapter, "FINAL_ONLY_DELIVERY", False) is True
+        tool_progress_enabled = progress_mode not in {"off", "log"} and not final_only
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
         _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
         _live_status_adapter = (
-            adapter if getattr(adapter, "supports_status_text", False) and _live_status_mode != "off" else None
+            adapter if not final_only and getattr(adapter, "supports_status_text", False) and _live_status_mode != "off" else None
         )
         # "log" mode: tool calls go to ~/.hermes/logs/tool_calls.log instead of the chat. Gateway-only.
         log_mode_enabled = progress_mode == "log" and not is_webhook
@@ -3012,8 +3028,8 @@ class GatewayTurnMixin:
         interim_assistant_messages_mode = _display_surface_mode(
             "interim_assistant_messages", default=True, require_platform_override_for={Platform.MATTERMOST},
         )
-        interim_assistant_messages_enabled = not is_webhook and interim_assistant_messages_mode != "off"
-        _thinking_enabled = _display_surface_mode(
+        interim_assistant_messages_enabled = not final_only and interim_assistant_messages_mode != "off"
+        _thinking_enabled = not final_only and _display_surface_mode(
             "thinking_progress", default=False, require_platform_override_for={Platform.MATTERMOST},
         ) != "off"
         # Slack-native task cards need the progress queue even with text tool_progress off.
@@ -3039,6 +3055,7 @@ class GatewayTurnMixin:
             user_config=user_config, platform_key=platform_key, enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets, resolve_display_setting=resolve_display_setting,
             progress_mode=progress_mode, progress_grouping=progress_grouping,
+            tool_preview_max_len=tool_preview_max_len,
             _display_surface_mode=_display_surface_mode,
             tool_progress_enabled=tool_progress_enabled, _live_status_mode=_live_status_mode,
             _live_status_adapter=_live_status_adapter, log_mode_enabled=log_mode_enabled,
@@ -3052,7 +3069,7 @@ class GatewayTurnMixin:
     # _RunAgentDisplay fields copied verbatim onto the TurnContext.
     _DISPLAY_TO_TURN_CTX = (
         "_live_status_adapter", "_live_status_mode", "_thinking_enabled", "progress_mode",
-        "progress_grouping", "tool_progress_enabled", "log_queue", "resolve_display_setting",
+        "progress_grouping", "tool_preview_max_len", "tool_progress_enabled", "log_queue", "resolve_display_setting",
         "user_config", "enabled_toolsets", "disabled_toolsets", "log_mode_enabled",
         "interim_assistant_messages_enabled", "needs_progress_queue", "_native_slack_task_cards",
     )
@@ -3499,7 +3516,7 @@ class GatewayTurnMixin:
         """Staged one-shot warning before the inactivity timeout escalates."""
         from gateway.run import _interim_metadata
         _warn_adapter = self._delivery_adapter_for(source)
-        if not _warn_adapter:
+        if not _warn_adapter or getattr(_warn_adapter, "FINAL_ONLY_DELIVERY", False) is True:
             return
         try:
             await _warn_adapter.emit_warning(
@@ -3636,6 +3653,15 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         if result and adapter and session_key:
+            if result.get("pending_steer"):
+                from agent.steer_messages import split_steer
+                from gateway.run_session_messages import queue_leftover_steer
+                human, peer = split_steer(result["pending_steer"])
+                if peer and queue_leftover_steer(self, adapter, source, session_key, peer):
+                    if human:
+                        result["pending_steer"] = human
+                    else:
+                        result.pop("pending_steer")
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
@@ -3859,6 +3885,12 @@ class GatewayTurnMixin:
         next_reply_expected = pending_event.reply_expected if pending_event is not None else None
         # See #60671.
         if pending_event is not None:
+            if (getattr(pending_event, "metadata", None) or {}).get("gateway_session_message_route"):
+                from gateway.run_session_messages import session_message_event_is_current
+                entry = self.session_store._entries.get(session_key)
+                if not session_message_event_is_current(self, pending_event, entry):
+                    logger.info("Discarding session message after conversation replacement: %s", session_key)
+                    return result
             next_source = getattr(pending_event, "source", None) or source
             if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                 logger.info(
@@ -4181,7 +4213,10 @@ class GatewayTurnMixin:
         turn_ctx._step_callback_sync = turn_runner._step_callback_sync
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
-        turn_ctx._status_adapter = self._delivery_adapter_for(source)
+        status_adapter = self._delivery_adapter_for(source)
+        turn_ctx._status_adapter = (
+            None if getattr(status_adapter, "FINAL_ONLY_DELIVERY", False) is True else status_adapter
+        )
         turn_ctx._status_chat_id = source.chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
         return _status_thread_metadata
@@ -4204,7 +4239,7 @@ class GatewayTurnMixin:
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
         _status_thread_metadata = turn_ctx._status_thread_metadata
         _notify_adapter = self._delivery_adapter_for(source)
-        if not _notify_adapter:
+        if not _notify_adapter or getattr(_notify_adapter, "FINAL_ONLY_DELIVERY", False) is True:
             return
         _heartbeat_msg_id: Optional[str] = None
         while True:

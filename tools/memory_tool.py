@@ -176,6 +176,38 @@ def destructive_ops(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [op for op in ops if (op or {}).get("action") in _BG_DELETE_ACTIONS]
 
 
+def _background_destructive_allowed() -> bool:
+    """Opt-in ``memory.background_review_allow_destructive``: let unattended background review
+    apply patch/remove directly instead of staging them. Default off; any read error → off."""
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        from utils import is_truthy_value
+        return is_truthy_value(
+            cfg_get(load_config(), "memory", "background_review_allow_destructive", default=False),
+            default=False)
+    except Exception:
+        return False
+
+
+def _targets_bulk_entry(store, payload: dict[str, Any], target: str) -> bool:
+    """Guard bulk destruction of undelimited or oversized memory text.
+
+    Upstream's span patch keeps sibling facts, so judge the span it replaces;
+    remove and legacy staged replace still affect the whole matched entry.
+    Resolution errors flow to the normal write path.
+    """
+    probe = copy.deepcopy(payload)
+    try:
+        if _pin_matched_entries(store, probe) is not None:
+            return False
+    except Exception:
+        return False
+    half = store._char_limit(target) // 2
+    return any("\n\n" in text or len(text) > half
+               for text in (str(op.get("old_text") or "") if op.get("action") == "patch"
+                            else op.get("matched_entry") or "" for op in destructive_ops(probe)))
+
+
 def _background_delete_gate(store, action, operations, target="memory", content=None,
                             old_text=None) -> Optional[str]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
@@ -192,6 +224,8 @@ def _background_delete_gate(store, action, operations, target="memory", content=
                if operations is not None else
                {"action": action, "target": target, "content": content, "old_text": old_text})
     if not destructive_ops(payload):
+        return None
+    if _background_destructive_allowed() and not _targets_bulk_entry(store, payload, target):
         return None
     detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
               else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
